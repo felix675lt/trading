@@ -16,18 +16,28 @@ class PaperPosition:
     stop_loss: float = 0.0
     take_profit: float = 0.0
     unrealized_pnl: float = 0.0
+    highest_price: float = 0.0   # 진입 후 최고가 (롱)
+    lowest_price: float = 0.0    # 진입 후 최저가 (숏)
+    trailing_activated: bool = False  # 트레일링 스탑 활성화 여부
 
 
 class PaperTrader:
     """실거래 없이 시뮬레이션하는 페이퍼 트레이딩 엔진"""
 
-    def __init__(self, initial_capital: float = 10000.0, commission: float = 0.0004):
+    def __init__(self, initial_capital: float = 10000.0, commission: float = 0.0004,
+                 trailing_config: dict | None = None):
         self.initial_capital = initial_capital
         self.equity = initial_capital
         self.commission = commission
         self.positions: dict[str, PaperPosition] = {}
         self.trade_history: list[dict] = []
         self.equity_history: list[dict] = []
+
+        # 트레일링 스탑 설정
+        tc = trailing_config or {}
+        self.trailing_activate_pct = tc.get("activate_pct", 0.02)   # 2% 수익 시 트레일링 활성화
+        self.trailing_distance_pct = tc.get("distance_pct", 0.015)  # 최고점에서 1.5% 하락 시 청산
+        self.trailing_step_pct = tc.get("step_pct", 0.005)          # SL을 0.5% 단위로 끌어올림
 
     def open_position(self, symbol: str, side: str, size_usdt: float,
                       price: float, leverage: int = 5, sl_pct: float = 0.02,
@@ -51,6 +61,7 @@ class PaperTrader:
             symbol=symbol, side=side, size=amount,
             entry_price=price, leverage=leverage,
             stop_loss=sl, take_profit=tp,
+            highest_price=price, lowest_price=price,
         )
         self.positions[symbol] = pos
         logger.info(f"[Paper] 포지션 개시: {side} {amount:.6f} {symbol} @ {price:.2f}")
@@ -88,25 +99,70 @@ class PaperTrader:
         return trade
 
     def update_prices(self, prices: dict[str, float]):
-        """현재가 업데이트 + SL/TP 체크"""
+        """현재가 업데이트 + 트레일링 스탑 + SL/TP 체크"""
         for symbol, price in prices.items():
             if symbol not in self.positions:
                 continue
             pos = self.positions[symbol]
 
-            # 미실현 PnL 업데이트
             if pos.side == "long":
                 pos.unrealized_pnl = (price - pos.entry_price) / pos.entry_price * pos.leverage
+                pos.highest_price = max(pos.highest_price, price)
+                profit_pct = (price - pos.entry_price) / pos.entry_price
+
+                # 트레일링 스탑 로직
+                if profit_pct >= self.trailing_activate_pct and not pos.trailing_activated:
+                    pos.trailing_activated = True
+                    new_sl = pos.highest_price * (1 - self.trailing_distance_pct)
+                    pos.stop_loss = max(pos.stop_loss, new_sl)
+                    logger.info(f"[Trailing] {symbol} 트레일링 활성화 | 수익 {profit_pct:.2%} | SL → {pos.stop_loss:.2f}")
+
+                if pos.trailing_activated:
+                    # 신고가 갱신될 때마다 SL을 끌어올림
+                    new_sl = pos.highest_price * (1 - self.trailing_distance_pct)
+                    if new_sl > pos.stop_loss + (pos.entry_price * self.trailing_step_pct):
+                        old_sl = pos.stop_loss
+                        pos.stop_loss = new_sl
+                        logger.info(f"[Trailing] {symbol} SL 상향 | {old_sl:.2f} → {pos.stop_loss:.2f} | 최고가: {pos.highest_price:.2f}")
+
+                # SL/TP 체크
                 if price <= pos.stop_loss:
-                    self.close_position(symbol, pos.stop_loss, "SL 도달")
-                elif price >= pos.take_profit:
-                    self.close_position(symbol, pos.take_profit, "TP 도달")
-            else:
+                    reason = "트레일링 SL 도달" if pos.trailing_activated else "SL 도달"
+                    self.close_position(symbol, pos.stop_loss, reason)
+                elif price >= pos.take_profit and not pos.trailing_activated:
+                    # TP 도달 시 → 바로 청산하지 않고 트레일링으로 전환
+                    pos.trailing_activated = True
+                    pos.stop_loss = pos.entry_price * (1 + self.trailing_activate_pct)  # 최소 수익 확보
+                    pos.take_profit = float("inf")  # TP 해제, 트레일링으로 추세 끝까지
+                    logger.info(f"[Trailing] {symbol} TP 도달 → 트레일링 전환 | 수익 확보선: {pos.stop_loss:.2f}")
+
+            else:  # short
                 pos.unrealized_pnl = (pos.entry_price - price) / pos.entry_price * pos.leverage
+                pos.lowest_price = min(pos.lowest_price, price) if pos.lowest_price > 0 else price
+                profit_pct = (pos.entry_price - price) / pos.entry_price
+
+                # 트레일링 스탑 로직 (숏은 반대)
+                if profit_pct >= self.trailing_activate_pct and not pos.trailing_activated:
+                    pos.trailing_activated = True
+                    new_sl = pos.lowest_price * (1 + self.trailing_distance_pct)
+                    pos.stop_loss = min(pos.stop_loss, new_sl)
+                    logger.info(f"[Trailing] {symbol} 숏 트레일링 활성화 | 수익 {profit_pct:.2%} | SL → {pos.stop_loss:.2f}")
+
+                if pos.trailing_activated:
+                    new_sl = pos.lowest_price * (1 + self.trailing_distance_pct)
+                    if new_sl < pos.stop_loss - (pos.entry_price * self.trailing_step_pct):
+                        old_sl = pos.stop_loss
+                        pos.stop_loss = new_sl
+                        logger.info(f"[Trailing] {symbol} 숏 SL 하향 | {old_sl:.2f} → {pos.stop_loss:.2f} | 최저가: {pos.lowest_price:.2f}")
+
                 if price >= pos.stop_loss:
-                    self.close_position(symbol, pos.stop_loss, "SL 도달")
-                elif price <= pos.take_profit:
-                    self.close_position(symbol, pos.take_profit, "TP 도달")
+                    reason = "트레일링 SL 도달" if pos.trailing_activated else "SL 도달"
+                    self.close_position(symbol, pos.stop_loss, reason)
+                elif price <= pos.take_profit and not pos.trailing_activated:
+                    pos.trailing_activated = True
+                    pos.stop_loss = pos.entry_price * (1 - self.trailing_activate_pct)
+                    pos.take_profit = 0.0
+                    logger.info(f"[Trailing] {symbol} 숏 TP 도달 → 트레일링 전환 | 수익 확보선: {pos.stop_loss:.2f}")
 
         self.equity_history.append({
             "timestamp": str(datetime.utcnow()),

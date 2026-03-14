@@ -33,6 +33,11 @@ risk:
   take_profit_pct: 0.04
   max_open_positions: 3
 
+trailing_stop:
+  activate_pct: 0.02    # 2% 수익 도달 시 트레일링 활성화
+  distance_pct: 0.015   # 최고점에서 1.5% 하락 시 청산
+  step_pct: 0.005        # SL을 0.5% 단위로 끌어올림
+
 ml:
   retrain_interval_hours: 24
   lookback_days: 90

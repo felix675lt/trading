@@ -58,6 +58,7 @@ class AutoTrader:
         self.paper_trader = PaperTrader(
             initial_capital=self.config.get("backtest", {}).get("initial_capital", 10000),
             commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
+            trailing_config=self.config.get("trailing_stop", {}),
         )
         self.exchange_clients: dict[str, ExchangeClient] = {}
         self.order_managers: dict[str, OrderManager] = {}
