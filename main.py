@@ -21,6 +21,7 @@ from core.data.storage import Storage
 from core.execution.exchange import ExchangeClient
 from core.execution.order_manager import OrderManager
 from core.execution.paper_trader import PaperTrader
+from core.external.external_manager import ExternalDataManager
 from core.learning.trainer import SelfLearningTrainer
 from core.models.ensemble import EnsembleSignalGenerator
 from core.rl.agent import RLAgent
@@ -57,6 +58,9 @@ class AutoTrader:
         self.feedback = TradeFeedbackAnalyzer()
         self.anomaly_detector = AnomalyDetector()
 
+        # 외부 데이터 매니저 (뉴스/센티먼트/온체인/매크로/공포탐욕)
+        self.external_manager = ExternalDataManager(self.config.get("external", {}))
+
         # 페이퍼/실거래 트레이더
         self.paper_trader = PaperTrader(
             initial_capital=self.config.get("backtest", {}).get("initial_capital", 10000),
@@ -71,6 +75,7 @@ class AutoTrader:
         self.initial_capital = self.equity
         self.total_pnl = 0.0
         self.last_signals = {}
+        self.last_external = {}
         self.is_running = False
 
     def _load_config(self, path: str) -> dict:
@@ -105,6 +110,19 @@ class AutoTrader:
             logger.info("기존 ML 모델 로드 성공")
         if self.rl_agent.load():
             logger.info("기존 RL 모델 로드 성공")
+
+        # 외부 데이터 초기 수집
+        if self.external_manager.enabled:
+            logger.info("외부 데이터 초기 수집 시작...")
+            await self.external_manager.update()
+            logger.info("외부 데이터 초기 수집 완료")
+
+        # NLTK VADER 데이터 다운로드 (첫 실행 시)
+        try:
+            import nltk
+            nltk.download("vader_lexicon", quiet=True)
+        except Exception:
+            pass
 
         self.risk_manager.initialize(self.equity)
         logger.info("AutoTrader 초기화 완료")
@@ -169,6 +187,8 @@ class AutoTrader:
             for symbol in symbols:
                 await trainer.train_cycle(exchange_name, symbol, timeframe)
 
+        loop_count = 0
+
         while self.is_running:
             try:
                 # 재학습 체크
@@ -176,8 +196,29 @@ class AutoTrader:
                     for symbol in symbols:
                         await trainer.train_cycle(exchange_name, symbol, timeframe)
 
+                # 외부 데이터 업데이트 (매 루프마다, 내부에서 interval 체크)
+                if self.external_manager.enabled:
+                    for symbol in symbols:
+                        ext_signal = await self.external_manager.update(symbol)
+                        self.last_external = self.external_manager.get_report()
+
+                        # 외부 피처를 FeatureEngineer에 주입
+                        ext_features = self.external_manager.get_all_features()
+                        self.feature_engineer.set_external_features(ext_features)
+
                 for symbol in symbols:
                     await self._process_symbol(exchange_name, symbol, timeframe)
+
+                loop_count += 1
+                if loop_count % 10 == 0:
+                    ext_report = self.external_manager.get_report()
+                    cs = ext_report.get("composite_signal", {})
+                    logger.info(
+                        f"[Loop {loop_count}] 외부신호: {cs.get('score', 0):.2f} ({cs.get('direction', 'neutral')}) | "
+                        f"공포탐욕: {ext_report.get('fear_greed', {}).get('value', '?')} | "
+                        f"뉴스: {ext_report.get('news_count', 0)}개 | "
+                        f"소셜: {ext_report.get('social_posts', 0)}개"
+                    )
 
                 # 대기
                 await asyncio.sleep(30)
@@ -216,12 +257,16 @@ class AutoTrader:
 
         rl_action, rl_confidence = self.rl_agent.predict(obs)
 
-        # 5. 전략 결정
+        # 4.5. 외부 신호 가져오기
+        ext_signal = self.external_manager.get_signal_for_strategy()
+
+        # 5. 전략 결정 (ML + RL + 외부 요인 통합)
         current_position = 0.0
         if self.mode == "paper":
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
         decision = self.strategy_manager.decide(
-            ml_signal, rl_action, rl_confidence, current_position, adaptive_params["regime"],
+            ml_signal, rl_action, rl_confidence, current_position,
+            adaptive_params["regime"], external_signal=ext_signal,
         )
 
         self.last_signals = {
@@ -231,6 +276,11 @@ class AutoTrader:
             "signal": ml_signal.get("signal", 0),
             "regime": adaptive_params["regime"],
             "reason": decision.reason,
+            "external": {
+                "score": ext_signal.get("score", 0),
+                "direction": ext_signal.get("direction", "neutral"),
+                "strength": ext_signal.get("strength", "weak"),
+            },
         }
 
         # 5.5. 이상 시장 감지
@@ -301,13 +351,15 @@ class AutoTrader:
                         "price": price, "amount": result["size"], "pnl": result["pnl"],
                         "fee": result["fee"], "strategy": "hybrid",
                     })
-                    # 피드백 기록 → 자기학습
+                    # 피드백 기록 → 자기학습 (외부 신호 정보 포함)
                     volatility = df["returns_1"].std() if "returns_1" in df.columns else 0
                     self.feedback.record_trade(result, {
                         "regime": adaptive_params["regime"],
                         "signal": ml_signal.get("signal", 0),
                         "confidence": decision.confidence,
                         "volatility": volatility,
+                        "external_score": ext_signal.get("score", 0),
+                        "external_direction": ext_signal.get("direction", "neutral"),
                     })
             elif self.mode == "live":
                 om = self.order_managers.get(exchange_name)

@@ -95,3 +95,15 @@ async def get_feedback():
     if fb:
         return fb.get_report()
     return {}
+
+
+@app.get("/api/external")
+async def get_external():
+    """외부 데이터 분석 정보"""
+    trader = _state.get("trader")
+    if not trader:
+        return {}
+    ext = getattr(trader, "external_manager", None)
+    if ext:
+        return ext.get_report()
+    return {}

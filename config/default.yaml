@@ -66,6 +66,25 @@ backtest:
   start_date: "2024-01-01"
   end_date: "2025-01-01"
 
+external:
+  enabled: true
+  weight: 0.3              # 외부 요인이 최종 결정에 미치는 가중치 (0~1)
+  update_interval_min: 15   # 외부 데이터 업데이트 주기 (분)
+  sources:
+    fear_greed: true
+    news: true
+    sentiment: true
+    onchain: true
+    macro: true
+    social: true
+  sentiment:
+    method: "vader"         # vader (경량) / keyword (초경량)
+    crypto_lexicon: true    # 크립토 특화 사전 사용
+  signal_thresholds:
+    strong_bullish: 0.3     # 강한 매수 신호
+    strong_bearish: -0.3    # 강한 매도 신호
+    event_override: true    # 고임팩트 이벤트 시 기술적 분석 오버라이드
+
 dashboard:
   host: "0.0.0.0"
   port: 8888

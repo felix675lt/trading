@@ -44,6 +44,7 @@ class TradeFeedbackAnalyzer:
             "symbol_performance": {},    # 종목별 승률
             "direction_performance": {}, # 롱/숏별 승률
             "signal_accuracy": {},       # 시그널 강도별 적중률
+            "external_accuracy": {},     # 외부 신호별 적중률
             "lessons": [],               # 학습된 교훈 (규칙)
             "adjustments": {},           # 자동 조정된 파라미터
             "total_analyzed": 0,
@@ -67,6 +68,8 @@ class TradeFeedbackAnalyzer:
             "confidence": market_context.get("confidence", 0),
             "hour": datetime.utcnow().hour,
             "volatility": market_context.get("volatility", 0),
+            "external_score": market_context.get("external_score", 0),
+            "external_direction": market_context.get("external_direction", "neutral"),
             "analyzed_at": str(datetime.utcnow()),
         }
         self.recent_trades.append(enriched)
@@ -89,6 +92,7 @@ class TradeFeedbackAnalyzer:
         self._update_symbol(enriched)
         self._update_direction(enriched)
         self._update_signal_accuracy(enriched)
+        self._update_external_accuracy(enriched)
 
         # 패턴 분석 및 교훈 도출
         self._detect_patterns()
@@ -161,6 +165,58 @@ class TradeFeedbackAnalyzer:
             s["wins"] += 1
         else:
             s["losses"] += 1
+
+    def _update_external_accuracy(self, trade: dict):
+        """외부 신호 방향별 적중률 추적"""
+        ext_dir = trade.get("external_direction", "neutral")
+        ext_score = trade.get("external_score", 0)
+        side = trade.get("side", "unknown")
+        is_win = trade.get("pnl", 0) > 0
+
+        if ext_dir == "neutral":
+            return
+
+        # 외부 신호가 거래 방향과 일치했는지
+        ext_agreed = (
+            (ext_dir == "bullish" and side == "long") or
+            (ext_dir == "bearish" and side == "short")
+        )
+        agreement_key = "agreed" if ext_agreed else "disagreed"
+
+        if "external_accuracy" not in self.feedback:
+            self.feedback["external_accuracy"] = {}
+
+        # 방향별 적중률
+        if ext_dir not in self.feedback["external_accuracy"]:
+            self.feedback["external_accuracy"][ext_dir] = {"wins": 0, "losses": 0, "total_pnl": 0}
+        d = self.feedback["external_accuracy"][ext_dir]
+        if is_win:
+            d["wins"] += 1
+        else:
+            d["losses"] += 1
+        d["total_pnl"] += trade.get("pnl", 0)
+
+        # 합의/불일치별 적중률
+        if agreement_key not in self.feedback["external_accuracy"]:
+            self.feedback["external_accuracy"][agreement_key] = {"wins": 0, "losses": 0, "total_pnl": 0}
+        a = self.feedback["external_accuracy"][agreement_key]
+        if is_win:
+            a["wins"] += 1
+        else:
+            a["losses"] += 1
+        a["total_pnl"] += trade.get("pnl", 0)
+
+        # 강도별 적중률
+        strength_key = "strong" if abs(ext_score) > 0.3 else "moderate" if abs(ext_score) > 0.1 else "weak"
+        ext_strength_key = f"ext_{strength_key}"
+        if ext_strength_key not in self.feedback["external_accuracy"]:
+            self.feedback["external_accuracy"][ext_strength_key] = {"wins": 0, "losses": 0, "total_pnl": 0}
+        s = self.feedback["external_accuracy"][ext_strength_key]
+        if is_win:
+            s["wins"] += 1
+        else:
+            s["losses"] += 1
+        s["total_pnl"] += trade.get("pnl", 0)
 
     def _detect_patterns(self):
         """패턴 감지 및 자동 교훈 생성"""
@@ -241,6 +297,37 @@ class TradeFeedbackAnalyzer:
                     lessons.append(lesson)
                     logger.info(f"[Feedback] {lesson}")
 
+        # 6. 외부 신호 적중률 분석 → 가중치 자동 조정
+        ext_acc = self.feedback.get("external_accuracy", {})
+        agreed = ext_acc.get("agreed", {"wins": 0, "losses": 0})
+        disagreed = ext_acc.get("disagreed", {"wins": 0, "losses": 0})
+        agreed_total = agreed["wins"] + agreed["losses"]
+        disagreed_total = disagreed["wins"] + disagreed["losses"]
+
+        if agreed_total >= 10:
+            agreed_wr = agreed["wins"] / agreed_total
+            if agreed_wr > 0.6:
+                adjustments["external_weight_boost"] = 1.3
+                lesson = f"외부요인 합의 시 승률 {agreed_wr:.0%} → 외부 가중치 30% 증가"
+                if lesson not in lessons:
+                    lessons.append(lesson)
+                    logger.info(f"[Feedback] {lesson}")
+            elif agreed_wr < 0.35:
+                adjustments["external_weight_boost"] = 0.5
+                lesson = f"외부요인 합의 시 승률 {agreed_wr:.0%} → 외부 가중치 50% 감소"
+                if lesson not in lessons:
+                    lessons.append(lesson)
+                    logger.info(f"[Feedback] {lesson}")
+
+        if disagreed_total >= 10:
+            disagreed_wr = disagreed["wins"] / disagreed_total
+            if disagreed_wr < 0.3:
+                adjustments["external_disagree_block"] = True
+                lesson = f"외부요인 반대 시 승률 {disagreed_wr:.0%} → 외부 반대 시 진입 차단"
+                if lesson not in lessons:
+                    lessons.append(lesson)
+                    logger.info(f"[Feedback] {lesson}")
+
         # 최근 50개 교훈만 유지
         self.feedback["lessons"] = lessons[-50:]
 
@@ -316,6 +403,18 @@ class TradeFeedbackAnalyzer:
                     "trades": total,
                 }
         report["regime_performance"] = regime_summary
+
+        # 외부 신호 정확도
+        ext_summary = {}
+        for key, perf in self.feedback.get("external_accuracy", {}).items():
+            total = perf["wins"] + perf["losses"]
+            if total > 0:
+                ext_summary[key] = {
+                    "win_rate": f"{perf['wins'] / total:.0%}",
+                    "total_pnl": f"${perf['total_pnl']:.2f}",
+                    "trades": total,
+                }
+        report["external_signal_accuracy"] = ext_summary
 
         return report
 

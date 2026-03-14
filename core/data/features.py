@@ -13,6 +13,7 @@ class FeatureEngineer:
             "rsi", "macd", "bbands", "atr", "volume_profile",
             "ema", "stoch", "adx", "obv", "vwap",
         ]
+        self.external_features: dict = {}  # 외부 요인 피처 저장
 
     def generate(self, df: pd.DataFrame) -> pd.DataFrame:
         """전체 피처 생성 파이프라인"""
@@ -38,6 +39,11 @@ class FeatureEngineer:
             result = self._add_volume_profile(result)
 
         result = self._add_price_features(result)
+
+        # 외부 요인 피처 추가 (있으면)
+        if self.external_features:
+            result = self._add_external_features(result)
+
         result = self._add_labels(result)
 
         return result.dropna()
@@ -125,6 +131,17 @@ class FeatureEngineer:
         df.loc[future_return > threshold, "label"] = 2   # 상승
         df.loc[future_return < -threshold, "label"] = 0  # 하락
         df["future_return"] = future_return
+        return df
+
+    def set_external_features(self, features: dict):
+        """외부 데이터 매니저에서 받은 피처 설정"""
+        self.external_features = features
+
+    def _add_external_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """외부 요인 피처를 DataFrame에 추가 (모든 행에 동일한 값 적용)"""
+        for key, value in self.external_features.items():
+            if isinstance(value, (int, float)):
+                df[f"ext_{key}"] = float(value)
         return df
 
     def get_feature_columns(self, df: pd.DataFrame) -> list[str]:

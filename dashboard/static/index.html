@@ -15,6 +15,8 @@
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; padding: 20px 30px; }
         .card { background: #141b2d; border-radius: 12px; padding: 20px; border: 1px solid #1e293b; }
         .card h2 { font-size: 15px; color: #94a3b8; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
+        .card.external { border-color: #7c3aed33; }
+        .card.external h2 { color: #a78bfa; }
         .metric { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1e293b; }
         .metric:last-child { border-bottom: none; }
         .metric .label { color: #94a3b8; font-size: 14px; }
@@ -28,6 +30,14 @@
         .wide { grid-column: 1 / -1; }
         .signal-bar { height: 8px; background: #1e293b; border-radius: 4px; overflow: hidden; margin-top: 5px; }
         .signal-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+        .gauge { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+        .gauge-bar { flex: 1; height: 12px; background: linear-gradient(to right, #f87171, #fbbf24, #34d399); border-radius: 6px; position: relative; }
+        .gauge-marker { width: 4px; height: 18px; background: #fff; border-radius: 2px; position: absolute; top: -3px; transition: left 0.3s; }
+        .gauge-label { font-size: 12px; color: #94a3b8; min-width: 40px; }
+        .component-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
+        .component-item { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+        .component-item .name { color: #94a3b8; }
+        .component-item .score { font-weight: 600; }
     </style>
 </head>
 <body>
@@ -68,6 +78,61 @@
             </div>
         </div>
 
+        <!-- 외부 데이터 분석 카드 -->
+        <div class="card external">
+            <h2>External Factors</h2>
+            <div id="external-info">
+                <div class="metric">
+                    <span class="label">Signal</span>
+                    <span class="value" id="ext-direction">-</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Score</span>
+                    <span class="value" id="ext-score">-</span>
+                </div>
+                <div class="gauge">
+                    <span class="gauge-label">Bear</span>
+                    <div class="gauge-bar"><div class="gauge-marker" id="ext-gauge" style="left:50%"></div></div>
+                    <span class="gauge-label">Bull</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Fear & Greed</span>
+                    <span class="value" id="ext-fg">-</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Sentiment Trend</span>
+                    <span class="value" id="ext-sentiment">-</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="card external">
+            <h2>Signal Components</h2>
+            <div class="component-grid" id="ext-components">
+                <div class="component-item"><span class="name">Fear/Greed</span><span class="score" id="comp-fg">-</span></div>
+                <div class="component-item"><span class="name">Sentiment</span><span class="score" id="comp-sent">-</span></div>
+                <div class="component-item"><span class="name">Macro</span><span class="score" id="comp-macro">-</span></div>
+                <div class="component-item"><span class="name">Onchain</span><span class="score" id="comp-onchain">-</span></div>
+                <div class="component-item"><span class="name">Social</span><span class="score" id="comp-social">-</span></div>
+                <div class="component-item"><span class="name">Features</span><span class="score" id="comp-features">-</span></div>
+            </div>
+            <div class="metric" style="margin-top:10px">
+                <span class="label">News</span>
+                <span class="value" id="ext-news-count">-</span>
+            </div>
+            <div class="metric">
+                <span class="label">Social Posts</span>
+                <span class="value" id="ext-social-count">-</span>
+            </div>
+        </div>
+
+        <div class="card external">
+            <h2>External Signal Reason</h2>
+            <div id="ext-reason" style="font-size:13px;color:#94a3b8;line-height:1.6">
+                Waiting for data...
+            </div>
+        </div>
+
         <div class="card wide">
             <h2>Open Positions</h2>
             <table>
@@ -95,6 +160,12 @@
 
         function fmt(n, d=2) { return n != null ? Number(n).toFixed(d) : '-'; }
         function pnlClass(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral'; }
+
+        function scoreClass(v) {
+            if (v > 0.1) return 'positive';
+            if (v < -0.1) return 'negative';
+            return 'neutral';
+        }
 
         async function update() {
             // Status
@@ -142,6 +213,70 @@
                 const pct = (s.signal + 1) / 2 * 100;
                 bar.style.width = `${pct}%`;
                 bar.style.background = s.signal > 0 ? '#34d399' : s.signal < 0 ? '#f87171' : '#fbbf24';
+
+                // 외부 요인 reason 표시
+                if (s.reason) {
+                    document.getElementById('ext-reason').textContent = s.reason;
+                }
+                // 시그널에 포함된 외부 요인 정보
+                if (s.external) {
+                    const ext = s.external;
+                    const dir = document.getElementById('ext-direction');
+                    dir.textContent = (ext.direction || 'neutral').toUpperCase();
+                    dir.className = `value ${ext.direction==='bullish'?'positive':ext.direction==='bearish'?'negative':'neutral'}`;
+                }
+            }
+
+            // External Data
+            const ext = await fetchData('external');
+            if (ext && ext.composite_signal) {
+                const cs = ext.composite_signal;
+                const score = cs.score || 0;
+
+                document.getElementById('ext-score').textContent = fmt(score, 3);
+                document.getElementById('ext-score').className = `value ${scoreClass(score)}`;
+
+                const dir = document.getElementById('ext-direction');
+                dir.textContent = (cs.direction || 'neutral').toUpperCase();
+                dir.className = `value ${cs.direction==='bullish'?'positive':cs.direction==='bearish'?'negative':'neutral'}`;
+
+                // Gauge
+                const gaugePct = (score + 1) / 2 * 100;
+                document.getElementById('ext-gauge').style.left = `${Math.max(0, Math.min(100, gaugePct))}%`;
+
+                // Components
+                const comp = cs.components || {};
+                document.getElementById('comp-fg').textContent = fmt(comp.fear_greed || 0, 2);
+                document.getElementById('comp-fg').className = `score ${scoreClass(comp.fear_greed || 0)}`;
+                document.getElementById('comp-sent').textContent = fmt(comp.sentiment || 0, 2);
+                document.getElementById('comp-sent').className = `score ${scoreClass(comp.sentiment || 0)}`;
+                document.getElementById('comp-macro').textContent = fmt(comp.macro || 0, 2);
+                document.getElementById('comp-macro').className = `score ${scoreClass(comp.macro || 0)}`;
+                document.getElementById('comp-onchain').textContent = fmt(comp.onchain || 0, 2);
+                document.getElementById('comp-onchain').className = `score ${scoreClass(comp.onchain || 0)}`;
+                document.getElementById('comp-social').textContent = fmt(comp.social || 0, 2);
+                document.getElementById('comp-social').className = `score ${scoreClass(comp.social || 0)}`;
+
+                // Fear & Greed
+                if (ext.fear_greed?.value != null) {
+                    const fgVal = ext.fear_greed.value;
+                    const fgText = `${fgVal} (${ext.fear_greed.classification || ''})`;
+                    const fgEl = document.getElementById('ext-fg');
+                    fgEl.textContent = fgText;
+                    fgEl.className = `value ${fgVal < 30 ? 'negative' : fgVal > 70 ? 'positive' : 'neutral'}`;
+                }
+
+                // Sentiment trend
+                if (ext.sentiment_trend != null) {
+                    const st = document.getElementById('ext-sentiment');
+                    st.textContent = fmt(ext.sentiment_trend, 3);
+                    st.className = `value ${scoreClass(ext.sentiment_trend)}`;
+                }
+
+                // Counts
+                document.getElementById('ext-news-count').textContent = `${ext.news_count || 0} articles`;
+                document.getElementById('ext-social-count').textContent = `${ext.social_posts || 0} posts`;
+                document.getElementById('comp-features').textContent = `${ext.feature_count || 0} features`;
             }
 
             // Positions

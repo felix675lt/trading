@@ -24,6 +24,9 @@ jinja2>=3.1.0
 # Async
 aiohttp>=3.9.0
 
+# NLP / Sentiment
+nltk>=3.8.0
+
 # Utils
 python-dotenv>=1.0.0
 loguru>=0.7.0
