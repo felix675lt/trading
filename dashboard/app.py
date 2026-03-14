@@ -84,3 +84,14 @@ async def get_risk():
     if risk_mgr:
         return risk_mgr.get_status()
     return {}
+
+
+@app.get("/api/feedback")
+async def get_feedback():
+    trader = _state.get("trader")
+    if not trader:
+        return {}
+    fb = getattr(trader, "feedback", None)
+    if fb:
+        return fb.get_report()
+    return {}

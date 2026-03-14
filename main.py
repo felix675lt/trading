@@ -25,6 +25,7 @@ from core.learning.trainer import SelfLearningTrainer
 from core.models.ensemble import EnsembleSignalGenerator
 from core.rl.agent import RLAgent
 from core.risk.manager import RiskManager
+from core.learning.feedback import AnomalyDetector, TradeFeedbackAnalyzer
 from core.strategy.adaptive import AdaptiveOptimizer
 from core.strategy.manager import StrategyManager
 from dashboard.app import app as dashboard_app, set_state
@@ -53,6 +54,8 @@ class AutoTrader:
         self.risk_manager = RiskManager(self.config["risk"])
         self.strategy_manager = StrategyManager(self.config.get("trading", {}))
         self.adaptive = AdaptiveOptimizer()
+        self.feedback = TradeFeedbackAnalyzer()
+        self.anomaly_detector = AnomalyDetector()
 
         # 페이퍼/실거래 트레이더
         self.paper_trader = PaperTrader(
@@ -230,6 +233,17 @@ class AutoTrader:
             "reason": decision.reason,
         }
 
+        # 5.5. 이상 시장 감지
+        price = float(df["close"].iloc[-1])
+        volume = float(df["volume"].iloc[-1])
+        alerts = self.anomaly_detector.update(price, volume)
+        if alerts:
+            self.last_signals["anomalies"] = [a["message"] for a in alerts]
+            high_alerts = [a for a in alerts if a["severity"] == "high"]
+            if high_alerts and decision.action in ["long", "short"]:
+                logger.warning(f"[Anomaly] 이상 감지로 진입 보류: {high_alerts[0]['message']}")
+                return
+
         # 6. 리스크 체크
         num_positions = len(self.paper_trader.positions) if self.mode == "paper" else 0
         can_trade, risk_msg = self.risk_manager.check_can_trade(self.equity, num_positions)
@@ -238,11 +252,27 @@ class AutoTrader:
             logger.info(f"{symbol} 거래 차단: {risk_msg}")
             return
 
+        # 6.5. 피드백 필터 (과거 거래 결과 기반)
+        if decision.action in ["long", "short"]:
+            from datetime import datetime as dt
+            fb_ok, fb_reason = self.feedback.should_trade_now(
+                hour=dt.utcnow().hour,
+                regime=adaptive_params["regime"],
+                side=decision.action,
+                signal_strength=ml_signal.get("signal", 0),
+            )
+            if not fb_ok:
+                logger.info(f"[Feedback] {symbol} 거래 차단: {fb_reason}")
+                return
+
         # 7. 주문 실행
         if decision.action in ["long", "short"]:
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
+
+            # 피드백 기반 포지션 크기 조정
+            fb_scale = self.feedback.get_position_scale(adaptive_params["regime"], decision.action)
             size = self.risk_manager.calculate_position_size(
-                self.equity, decision.confidence, volatility, adaptive_params["position_scale"],
+                self.equity, decision.confidence, volatility, adaptive_params["position_scale"] * fb_scale,
             )
             price = float(df["close"].iloc[-1])
 
@@ -270,6 +300,14 @@ class AutoTrader:
                         "exchange": exchange_name, "symbol": symbol, "side": "close",
                         "price": price, "amount": result["size"], "pnl": result["pnl"],
                         "fee": result["fee"], "strategy": "hybrid",
+                    })
+                    # 피드백 기록 → 자기학습
+                    volatility = df["returns_1"].std() if "returns_1" in df.columns else 0
+                    self.feedback.record_trade(result, {
+                        "regime": adaptive_params["regime"],
+                        "signal": ml_signal.get("signal", 0),
+                        "confidence": decision.confidence,
+                        "volatility": volatility,
                     })
             elif self.mode == "live":
                 om = self.order_managers.get(exchange_name)
