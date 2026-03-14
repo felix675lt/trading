@@ -174,7 +174,8 @@ class AutoTrader:
 
         exchange_name = list(self.config["exchanges"].keys())[0]
         symbols = self.config["trading"]["symbols"]
-        timeframe = self.config["trading"]["timeframes"][0]
+        timeframes = self.config["trading"]["timeframes"]  # 멀티타임프레임
+        primary_tf = timeframes[0]  # 메인 타임프레임 (5m)
 
         # 자기학습 트레이너
         trainer = SelfLearningTrainer(
@@ -185,7 +186,7 @@ class AutoTrader:
         if not self.ensemble.load_all():
             logger.info("모델 없음 - 초기 학습 시작")
             for symbol in symbols:
-                await trainer.train_cycle(exchange_name, symbol, timeframe)
+                await trainer.train_cycle(exchange_name, symbol, primary_tf)
 
         loop_count = 0
 
@@ -199,35 +200,52 @@ class AutoTrader:
                         "message": "자기학습 재훈련 시작",
                     })
                     for symbol in symbols:
-                        await trainer.train_cycle(exchange_name, symbol, timeframe)
+                        await trainer.train_cycle(exchange_name, symbol, primary_tf)
                     add_live_log({
                         "time": datetime.utcnow().strftime("%H:%M:%S"),
                         "type": "retrain",
                         "message": "자기학습 재훈련 완료",
                     })
 
-                # 외부 데이터 업데이트 (매 루프마다, 내부에서 interval 체크)
+                # 외부 데이터 업데이트 (뉴스/센티먼트/파생상품/계절 등)
                 if self.external_manager.enabled:
                     for symbol in symbols:
-                        ext_signal = await self.external_manager.update(symbol)
+                        await self.external_manager.update(symbol)
                         self.last_external = self.external_manager.get_report()
 
                         # 외부 피처를 FeatureEngineer에 주입
                         ext_features = self.external_manager.get_all_features()
                         self.feature_engineer.set_external_features(ext_features)
 
+                # 멀티타임프레임 분석 (각 타임프레임 데이터 수집 & 분석)
                 for symbol in symbols:
-                    await self._process_symbol(exchange_name, symbol, timeframe)
+                    for tf in timeframes:
+                        try:
+                            tf_df = await self.collector.fetch_ohlcv(exchange_name, symbol, tf, limit=200)
+                            if len(tf_df) > 50:
+                                self.external_manager.update_multi_timeframe(tf_df, tf)
+                        except Exception as e:
+                            logger.debug(f"MTF {tf} 수집 실패: {e}")
+
+                    # 멀티타임프레임 합류 계산
+                    mtf_result = self.external_manager.get_multi_tf_confluence()
+
+                for symbol in symbols:
+                    await self._process_symbol(exchange_name, symbol, primary_tf)
 
                 loop_count += 1
                 if loop_count % 10 == 0:
                     ext_report = self.external_manager.get_report()
                     cs = ext_report.get("composite_signal", {})
+                    deriv = ext_report.get("derivatives", {}).get("composite", {})
+                    seasonal = ext_report.get("seasonal", {})
+                    mtf = ext_report.get("multi_timeframe", {}).get("confluence", {})
                     logger.info(
-                        f"[Loop {loop_count}] 외부신호: {cs.get('score', 0):.2f} ({cs.get('direction', 'neutral')}) | "
-                        f"공포탐욕: {ext_report.get('fear_greed', {}).get('value', '?')} | "
-                        f"뉴스: {ext_report.get('news_count', 0)}개 | "
-                        f"소셜: {ext_report.get('social_posts', 0)}개"
+                        f"[Loop {loop_count}] 종합: {cs.get('score', 0):.2f}({cs.get('direction', '?')}) | "
+                        f"파생: {deriv.get('score', 0):.2f} | "
+                        f"계절: {seasonal.get('direction', '?')}({seasonal.get('score', 0):.2f}) "
+                        f"[{seasonal.get('halving_phase', '?')}] | "
+                        f"MTF합류: {mtf.get('score', 0):.2f}({mtf.get('agreement', 0):.0%})"
                     )
 
                 # 대기
@@ -270,7 +288,10 @@ class AutoTrader:
         # 4.5. 외부 신호 가져오기
         ext_signal = self.external_manager.get_signal_for_strategy()
 
-        # 5. 전략 결정 (ML + RL + 외부 요인 통합)
+        # 4.6. 멀티타임프레임 합류 시그널
+        mtf_signal = self.external_manager.multi_tf.get_signal_for_strategy()
+
+        # 5. 전략 결정 (ML + RL + 외부 요인 + MTF 통합)
         current_position = 0.0
         if self.mode == "paper":
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
@@ -278,6 +299,29 @@ class AutoTrader:
             ml_signal, rl_action, rl_confidence, current_position,
             adaptive_params["regime"], external_signal=ext_signal,
         )
+
+        # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
+        if decision.action in ["long", "short"] and mtf_signal.get("higher_tf_conflict"):
+            logger.info(f"[MTF] {symbol} 상위 TF 충돌 → 진입 보류")
+            decision = self.strategy_manager.decide(
+                ml_signal, 0, 0, current_position,
+                adaptive_params["regime"], external_signal=ext_signal,
+            )  # hold로 전환
+
+        # 5.2. MTF 합류 확인 시 확신도 부스트
+        if decision.action in ["long", "short"]:
+            mtf_agreement = mtf_signal.get("agreement", 0)
+            mtf_dir = mtf_signal.get("direction", "neutral")
+            action_agrees_mtf = (
+                (decision.action == "long" and mtf_dir == "bullish") or
+                (decision.action == "short" and mtf_dir == "bearish")
+            )
+            if action_agrees_mtf and mtf_agreement > 0.7:
+                decision.confidence = min(decision.confidence * 1.15, 1.0)
+                decision.reason += " + MTF합류"
+            elif not action_agrees_mtf and mtf_dir != "neutral":
+                decision.confidence *= 0.8
+                decision.reason += f" ! MTF반대({mtf_dir})"
 
         self.last_signals = {
             "symbol": symbol,
@@ -291,10 +335,18 @@ class AutoTrader:
                 "direction": ext_signal.get("direction", "neutral"),
                 "strength": ext_signal.get("strength", "weak"),
             },
+            "mtf": {
+                "score": mtf_signal.get("score", 0),
+                "agreement": mtf_signal.get("agreement", 0),
+                "direction": mtf_signal.get("direction", "neutral"),
+            },
         }
 
-        # 실시간 로그 기록
+        # 가격 히스토리 업데이트 (상관관계 계산용)
         price = float(df["close"].iloc[-1])
+        self.risk_manager.update_price_history(symbol, price)
+
+        # 실시간 로그 기록
         add_live_log({
             "time": datetime.utcnow().strftime("%H:%M:%S"),
             "type": "analysis",
@@ -308,6 +360,8 @@ class AutoTrader:
             "rl_conf": round(rl_confidence, 3),
             "ext_score": round(ext_signal.get("score", 0), 3),
             "ext_dir": ext_signal.get("direction", "neutral"),
+            "mtf_score": round(mtf_signal.get("score", 0), 3),
+            "mtf_agree": round(mtf_signal.get("agreement", 0), 2),
             "regime": adaptive_params["regime"],
             "reason": decision.reason,
             "features_count": len(feature_cols),
@@ -349,26 +403,53 @@ class AutoTrader:
         if decision.action in ["long", "short"]:
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
 
-            # 피드백 기반 포지션 크기 조정
+            # 7.1. 포지션 상관관계 체크
+            current_positions = {}
+            if self.mode == "paper":
+                current_positions = {
+                    s: {"side": p.side} for s, p in self.paper_trader.positions.items()
+                }
+            corr_ok, corr_reason, corr_mult = self.risk_manager.check_correlation(
+                symbol, decision.action, current_positions,
+            )
+
+            # 7.2. 동적 레버리지 계산
+            ext_agrees = (
+                (decision.action == "long" and ext_signal.get("direction") == "bullish") or
+                (decision.action == "short" and ext_signal.get("direction") == "bearish")
+            )
+            dynamic_lev = self.risk_manager.calculate_dynamic_leverage(
+                confidence=decision.confidence,
+                volatility=volatility,
+                regime=adaptive_params["regime"],
+                external_agreement=ext_agrees,
+            )
+
+            # 7.3. 피드백 기반 포지션 크기 조정
             fb_scale = self.feedback.get_position_scale(adaptive_params["regime"], decision.action)
             size = self.risk_manager.calculate_position_size(
-                self.equity, decision.confidence, volatility, adaptive_params["position_scale"] * fb_scale,
+                self.equity, decision.confidence, volatility,
+                adaptive_params["position_scale"] * fb_scale * corr_mult,
             )
             price = float(df["close"].iloc[-1])
 
             if self.mode == "paper":
                 self.paper_trader.open_position(
                     symbol, decision.action, size, price,
-                    leverage=self.config["trading"]["leverage"],
+                    leverage=dynamic_lev,
                     sl_pct=self.config["risk"]["stop_loss_pct"] * adaptive_params["stop_loss_mult"],
                     tp_pct=self.config["risk"]["take_profit_pct"],
                 )
             elif self.mode == "live":
                 om = self.order_managers.get(exchange_name)
                 if om:
-                    await om.open_position(symbol, decision.action, size, self.config["trading"]["leverage"])
+                    await om.open_position(symbol, decision.action, size, dynamic_lev)
 
-            logger.info(f"[{self.mode.upper()}] {decision.action.upper()} {symbol} | 크기: ${size:.2f} | 사유: {decision.reason}")
+            logger.info(
+                f"[{self.mode.upper()}] {decision.action.upper()} {symbol} | "
+                f"크기: ${size:.2f} | 레버리지: {dynamic_lev}x | "
+                f"사유: {decision.reason}"
+            )
             add_live_log({
                 "time": datetime.utcnow().strftime("%H:%M:%S"),
                 "type": "trade_open",
@@ -376,6 +457,7 @@ class AutoTrader:
                 "action": decision.action,
                 "size": round(size, 2),
                 "price": price,
+                "leverage": dynamic_lev,
                 "reason": decision.reason,
             })
 

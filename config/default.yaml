@@ -22,6 +22,7 @@ trading:
     - "5m"
     - "15m"
     - "1h"
+    - "4h"
   leverage: 5
   mode: "paper"  # backtest / paper / live
 
@@ -32,6 +33,13 @@ risk:
   stop_loss_pct: 0.02
   take_profit_pct: 0.04
   max_open_positions: 3
+  cooldown_after_losses: 3    # N연패 후 쿨다운 발동
+  cooldown_minutes: 30        # 쿨다운 지속 시간 (분)
+  dynamic_leverage:
+    enabled: true
+    base: 5                   # 기본 레버리지
+    min: 2                    # 최소 (불확실할 때)
+    max: 10                   # 최대 (확실할 때)
 
 trailing_stop:
   activate_pct: 0.02    # 2% 수익 도달 시 트레일링 활성화
@@ -77,6 +85,9 @@ external:
     onchain: true
     macro: true
     social: true
+    seasonal_cycle: true      # 10년 BTC 계절 패턴 (반감기/Dec-Feb 반등)
+    derivatives: true          # 펀딩비/OI/롱숏비율 (Binance)
+    multi_timeframe: true      # 멀티타임프레임 합류 분석
   sentiment:
     method: "vader"         # vader (경량) / keyword (초경량)
     crypto_lexicon: true    # 크립토 특화 사전 사용

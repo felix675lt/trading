@@ -1,4 +1,4 @@
-"""리스크 매니저 - 포지션 크기, 드로다운, 일일 손실 관리"""
+"""리스크 매니저 - 포지션 크기, 드로다운, 일일 손실, 동적 레버리지, 상관관계 관리"""
 
 from datetime import datetime, timedelta
 
@@ -16,12 +16,32 @@ class RiskManager:
         self.max_open_positions = config.get("max_open_positions", 3)
         self.stop_loss_pct = config.get("stop_loss_pct", 0.02)
 
+        # 동적 레버리지 설정
+        lev_cfg = config.get("dynamic_leverage", {})
+        self.dynamic_leverage_enabled = lev_cfg.get("enabled", True)
+        self.base_leverage = lev_cfg.get("base", 5)
+        self.min_leverage = lev_cfg.get("min", 2)
+        self.max_leverage = lev_cfg.get("max", 10)
+
+        # 쿨다운 설정
+        self.cooldown_after_losses = config.get("cooldown_after_losses", 3)
+        self.cooldown_minutes = config.get("cooldown_minutes", 30)
+        self._cooldown_until: datetime | None = None
+
+        # 상관관계 관리
+        self._price_histories: dict[str, list[float]] = {}
+        self._position_sides: dict[str, str] = {}  # symbol → "long"/"short"
+
         self.initial_equity = 0.0
         self.peak_equity = 0.0
         self.daily_pnl = 0.0
         self.daily_reset_time = datetime.utcnow()
         self.is_trading_halted = False
         self.halt_reason = ""
+
+        # 연패 추적 (쿨다운용)
+        self.consecutive_losses = 0
+        self._last_leverage: float = self.base_leverage
 
     def initialize(self, equity: float):
         self.initial_equity = equity
@@ -30,6 +50,11 @@ class RiskManager:
     def check_can_trade(self, equity: float, num_positions: int) -> tuple[bool, str]:
         """거래 가능 여부 확인"""
         self._check_daily_reset()
+
+        # 쿨다운 체크
+        if self._cooldown_until and datetime.utcnow() < self._cooldown_until:
+            remaining = (self._cooldown_until - datetime.utcnow()).seconds // 60
+            return False, f"쿨다운 중: {remaining}분 남음 (연패 {self.consecutive_losses}회 후)"
 
         # 드로다운 체크
         self.peak_equity = max(self.peak_equity, equity)
@@ -56,6 +81,148 @@ class RiskManager:
             return False, self.halt_reason
 
         return True, "OK"
+
+    def calculate_dynamic_leverage(
+        self,
+        confidence: float,
+        volatility: float,
+        regime: str = "normal",
+        external_agreement: bool = True,
+    ) -> int:
+        """동적 레버리지 계산
+
+        규칙:
+        - 확신도 높음 + 변동성 낮음 → 레버리지 상향
+        - 확신도 낮음 + 변동성 높음 → 레버리지 하향
+        - 극심한 변동성 → 최소 레버리지
+        - 외부 요인 불일치 → 레버리지 감소
+        """
+        if not self.dynamic_leverage_enabled:
+            return self.base_leverage
+
+        leverage = float(self.base_leverage)
+
+        # 확신도 기반 (0.5~1.0 → 0.6x~1.4x)
+        conf_factor = 0.6 + (confidence - 0.5) * 1.6
+        conf_factor = max(0.6, min(1.4, conf_factor))
+        leverage *= conf_factor
+
+        # 변동성 기반 (낮을수록 레버리지 높임)
+        if volatility > 0:
+            # 정상 변동성 ~0.01 (1%), 높으면 축소
+            vol_factor = min(1.3, 0.01 / (volatility + 1e-8))
+            vol_factor = max(0.4, vol_factor)
+            leverage *= vol_factor
+
+        # 시장 레짐 기반
+        regime_factors = {
+            "extreme_volatility": 0.4,
+            "high_volume_breakout": 0.8,
+            "ranging": 0.7,
+            "strong_uptrend": 1.2,
+            "strong_downtrend": 1.2,
+            "normal": 1.0,
+        }
+        leverage *= regime_factors.get(regime, 1.0)
+
+        # 외부 요인 불일치 시 감소
+        if not external_agreement:
+            leverage *= 0.7
+
+        # 연패 중이면 감소
+        if self.consecutive_losses >= 2:
+            leverage *= max(0.5, 1.0 - self.consecutive_losses * 0.1)
+
+        # 범위 제한 및 정수화
+        leverage = max(self.min_leverage, min(self.max_leverage, leverage))
+        leverage = int(round(leverage))
+
+        self._last_leverage = leverage
+        return leverage
+
+    def check_correlation(
+        self,
+        symbol: str,
+        side: str,
+        current_positions: dict,
+    ) -> tuple[bool, str, float]:
+        """포지션 간 상관관계 체크
+
+        BTC와 ETH가 같은 방향 포지션이면 사실상 2배 리스크.
+        상관계수 > 0.7이면 포지션 크기를 절반으로.
+
+        Returns:
+            (can_trade, reason, size_multiplier)
+        """
+        if not current_positions or len(self._price_histories) < 2:
+            return True, "OK", 1.0
+
+        # 현재 포지션의 심볼들과 방향
+        active_symbols = []
+        for pos_symbol, pos_info in current_positions.items():
+            pos_side = pos_info.get("side", "") if isinstance(pos_info, dict) else ""
+            if pos_side:
+                active_symbols.append((pos_symbol, pos_side))
+
+        if not active_symbols:
+            return True, "OK", 1.0
+
+        # 상관계수 계산
+        for pos_symbol, pos_side in active_symbols:
+            # 같은 심볼은 skip
+            base_new = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
+            base_pos = pos_symbol.split("/")[0] if "/" in pos_symbol else pos_symbol.replace("USDT", "")
+
+            if base_new == base_pos:
+                continue
+
+            correlation = self._calculate_correlation(symbol, pos_symbol)
+
+            if correlation > 0.7 and side == pos_side:
+                # 높은 상관관계 + 같은 방향 = 중복 리스크
+                logger.info(
+                    f"[상관관계] {symbol}({side}) ↔ {pos_symbol}({pos_side}) "
+                    f"상관계수={correlation:.2f} → 포지션 50% 축소"
+                )
+                return True, f"상관관계 {correlation:.2f} → 크기 축소", 0.5
+
+            elif correlation > 0.7 and side != pos_side:
+                # 높은 상관관계 + 반대 방향 = 헤지 (OK)
+                logger.info(
+                    f"[상관관계] {symbol}({side}) ↔ {pos_symbol}({pos_side}) "
+                    f"상관계수={correlation:.2f} → 헤지 포지션 허용"
+                )
+
+        return True, "OK", 1.0
+
+    def update_price_history(self, symbol: str, price: float):
+        """가격 히스토리 업데이트 (상관관계 계산용)"""
+        if symbol not in self._price_histories:
+            self._price_histories[symbol] = []
+        self._price_histories[symbol].append(price)
+        if len(self._price_histories[symbol]) > 500:
+            self._price_histories[symbol] = self._price_histories[symbol][-500:]
+
+    def _calculate_correlation(self, sym1: str, sym2: str) -> float:
+        """두 심볼 간 수익률 상관계수"""
+        h1 = self._price_histories.get(sym1, [])
+        h2 = self._price_histories.get(sym2, [])
+
+        min_len = min(len(h1), len(h2))
+        if min_len < 30:
+            return 0.0  # 데이터 부족
+
+        # 수익률 계산
+        p1 = np.array(h1[-min_len:])
+        p2 = np.array(h2[-min_len:])
+        r1 = np.diff(p1) / p1[:-1]
+        r2 = np.diff(p2) / p2[:-1]
+
+        if len(r1) < 20:
+            return 0.0
+
+        correlation = np.corrcoef(r1, r2)[0, 1]
+        return float(correlation) if not np.isnan(correlation) else 0.0
 
     def calculate_position_size(
         self,
@@ -86,9 +253,26 @@ class RiskManager:
 
         return sized
 
-    def record_pnl(self, pnl: float):
-        """PnL 기록"""
+    def record_trade_result(self, pnl: float):
+        """거래 결과 기록 (PnL + 연패/연승 추적)"""
         self.daily_pnl += pnl
+
+        if pnl < 0:
+            self.consecutive_losses += 1
+            # 연패 쿨다운
+            if self.consecutive_losses >= self.cooldown_after_losses:
+                self._cooldown_until = datetime.utcnow() + timedelta(minutes=self.cooldown_minutes)
+                logger.warning(
+                    f"[쿨다운] {self.consecutive_losses}연패 → "
+                    f"{self.cooldown_minutes}분 거래 중단 (~{self._cooldown_until.strftime('%H:%M')})"
+                )
+        else:
+            self.consecutive_losses = 0
+            self._cooldown_until = None
+
+    def record_pnl(self, pnl: float):
+        """PnL 기록 (기존 호환성 유지)"""
+        self.record_trade_result(pnl)
 
     def _check_daily_reset(self):
         now = datetime.utcnow()
@@ -104,6 +288,8 @@ class RiskManager:
         """수동 거래 재개"""
         self.is_trading_halted = False
         self.halt_reason = ""
+        self._cooldown_until = None
+        self.consecutive_losses = 0
         logger.info("거래 수동 재개")
 
     def get_status(self) -> dict:
@@ -116,4 +302,13 @@ class RiskManager:
             "current_drawdown": drawdown,
             "max_drawdown_limit": self.max_drawdown_pct,
             "max_daily_loss_limit": self.max_daily_loss_pct,
+            "consecutive_losses": self.consecutive_losses,
+            "current_leverage": self._last_leverage,
+            "cooldown_active": self._cooldown_until is not None and datetime.utcnow() < self._cooldown_until,
+            "correlations": {
+                f"{s1}-{s2}": round(self._calculate_correlation(s1, s2), 2)
+                for i, s1 in enumerate(self._price_histories)
+                for s2 in list(self._price_histories.keys())[i+1:]
+                if len(self._price_histories.get(s1, [])) > 30 and len(self._price_histories.get(s2, [])) > 30
+            },
         }
