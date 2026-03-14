@@ -18,7 +18,7 @@ class Storage:
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._create_tables()
 
     def _create_tables(self):
