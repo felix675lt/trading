@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoTrader AI Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #0a0e17; color: #e0e0e0; }
+        .header { background: #141b2d; padding: 20px 30px; border-bottom: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center; }
+        .header h1 { font-size: 24px; color: #60a5fa; }
+        .status { padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+        .status.running { background: #065f46; color: #6ee7b7; }
+        .status.stopped { background: #7f1d1d; color: #fca5a5; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; padding: 20px 30px; }
+        .card { background: #141b2d; border-radius: 12px; padding: 20px; border: 1px solid #1e293b; }
+        .card h2 { font-size: 15px; color: #94a3b8; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
+        .metric { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1e293b; }
+        .metric:last-child { border-bottom: none; }
+        .metric .label { color: #94a3b8; font-size: 14px; }
+        .metric .value { font-size: 14px; font-weight: 600; }
+        .positive { color: #34d399; }
+        .negative { color: #f87171; }
+        .neutral { color: #fbbf24; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { text-align: left; padding: 10px 8px; color: #64748b; border-bottom: 1px solid #1e293b; }
+        td { padding: 8px; border-bottom: 1px solid #1e293b; }
+        .wide { grid-column: 1 / -1; }
+        .signal-bar { height: 8px; background: #1e293b; border-radius: 4px; overflow: hidden; margin-top: 5px; }
+        .signal-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>AutoTrader AI</h1>
+        <span class="status stopped" id="status-badge">Connecting...</span>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h2>Portfolio</h2>
+            <div id="portfolio">
+                <div class="metric"><span class="label">Equity</span><span class="value" id="equity">-</span></div>
+                <div class="metric"><span class="label">PnL</span><span class="value" id="pnl">-</span></div>
+                <div class="metric"><span class="label">Return</span><span class="value" id="return-pct">-</span></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Risk Status</h2>
+            <div id="risk-info">
+                <div class="metric"><span class="label">Trading</span><span class="value" id="risk-status">-</span></div>
+                <div class="metric"><span class="label">Daily PnL</span><span class="value" id="daily-pnl">-</span></div>
+                <div class="metric"><span class="label">Drawdown</span><span class="value" id="drawdown">-</span></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>ML Signals</h2>
+            <div id="signals-info">
+                <div class="metric"><span class="label">Direction</span><span class="value" id="signal-dir">-</span></div>
+                <div class="metric"><span class="label">Confidence</span><span class="value" id="signal-conf">-</span></div>
+                <div class="metric">
+                    <span class="label">Signal Strength</span>
+                    <span class="value" id="signal-val">-</span>
+                </div>
+                <div class="signal-bar"><div class="signal-fill" id="signal-bar" style="width:50%;background:#fbbf24"></div></div>
+            </div>
+        </div>
+
+        <div class="card wide">
+            <h2>Open Positions</h2>
+            <table>
+                <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>PnL</th><th>SL</th><th>TP</th></tr></thead>
+                <tbody id="positions-table"><tr><td colspan="7" style="text-align:center;color:#64748b">No open positions</td></tr></tbody>
+            </table>
+        </div>
+
+        <div class="card wide">
+            <h2>Recent Trades</h2>
+            <table>
+                <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>Amount</th><th>PnL</th></tr></thead>
+                <tbody id="trades-table"><tr><td colspan="6" style="text-align:center;color:#64748b">No recent trades</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        async function fetchData(endpoint) {
+            try {
+                const res = await fetch(`/api/${endpoint}`);
+                return await res.json();
+            } catch { return null; }
+        }
+
+        function fmt(n, d=2) { return n != null ? Number(n).toFixed(d) : '-'; }
+        function pnlClass(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral'; }
+
+        async function update() {
+            // Status
+            const status = await fetchData('status');
+            const badge = document.getElementById('status-badge');
+            if (status?.status === 'running') {
+                badge.textContent = `${status.mode?.toUpperCase()} MODE`;
+                badge.className = 'status running';
+            } else {
+                badge.textContent = 'OFFLINE';
+                badge.className = 'status stopped';
+            }
+
+            // Equity
+            const eq = await fetchData('equity');
+            if (eq) {
+                document.getElementById('equity').textContent = `$${fmt(eq.equity)}`;
+                document.getElementById('pnl').textContent = `$${fmt(eq.pnl)}`;
+                document.getElementById('pnl').className = `value ${pnlClass(eq.pnl)}`;
+                const ret = eq.initial > 0 ? ((eq.equity - eq.initial) / eq.initial * 100) : 0;
+                document.getElementById('return-pct').textContent = `${fmt(ret)}%`;
+                document.getElementById('return-pct').className = `value ${pnlClass(ret)}`;
+            }
+
+            // Risk
+            const risk = await fetchData('risk');
+            if (risk) {
+                const rs = document.getElementById('risk-status');
+                rs.textContent = risk.is_halted ? 'HALTED' : 'ACTIVE';
+                rs.className = `value ${risk.is_halted ? 'negative' : 'positive'}`;
+                document.getElementById('daily-pnl').textContent = `$${fmt(risk.daily_pnl)}`;
+                document.getElementById('daily-pnl').className = `value ${pnlClass(risk.daily_pnl)}`;
+                document.getElementById('drawdown').textContent = `${fmt(risk.current_drawdown * 100)}%`;
+            }
+
+            // Signals
+            const sig = await fetchData('signals');
+            if (sig?.signals?.direction) {
+                const s = sig.signals;
+                document.getElementById('signal-dir').textContent = s.direction.toUpperCase();
+                document.getElementById('signal-dir').className = `value ${s.direction==='long'?'positive':s.direction==='short'?'negative':'neutral'}`;
+                document.getElementById('signal-conf').textContent = `${fmt(s.confidence * 100)}%`;
+                document.getElementById('signal-val').textContent = fmt(s.signal, 3);
+                const bar = document.getElementById('signal-bar');
+                const pct = (s.signal + 1) / 2 * 100;
+                bar.style.width = `${pct}%`;
+                bar.style.background = s.signal > 0 ? '#34d399' : s.signal < 0 ? '#f87171' : '#fbbf24';
+            }
+
+            // Positions
+            const pos = await fetchData('positions');
+            const ptb = document.getElementById('positions-table');
+            if (pos?.positions?.length) {
+                ptb.innerHTML = pos.positions.map(p => `
+                    <tr>
+                        <td>${p.symbol}</td>
+                        <td class="${p.side==='long'?'positive':'negative'}">${p.side.toUpperCase()}</td>
+                        <td>${fmt(p.size, 4)}</td>
+                        <td>$${fmt(p.entry_price)}</td>
+                        <td class="${pnlClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl * 100)}%</td>
+                        <td>$${fmt(p.stop_loss)}</td>
+                        <td>$${fmt(p.take_profit)}</td>
+                    </tr>
+                `).join('');
+            }
+
+            // Trades
+            const tr = await fetchData('trades');
+            const ttb = document.getElementById('trades-table');
+            if (tr?.trades?.length) {
+                ttb.innerHTML = tr.trades.slice(0, 20).map(t => `
+                    <tr>
+                        <td>${t.timestamp?.slice(0,19) || '-'}</td>
+                        <td>${t.symbol}</td>
+                        <td class="${t.side==='buy'?'positive':'negative'}">${t.side?.toUpperCase()}</td>
+                        <td>$${fmt(t.price)}</td>
+                        <td>${fmt(t.amount, 4)}</td>
+                        <td class="${pnlClass(t.pnl)}">$${fmt(t.pnl)}</td>
+                    </tr>
+                `).join('');
+            }
+        }
+
+        update();
+        setInterval(update, 5000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,70 @@
+# AutoTrader AI Configuration
+
+exchanges:
+  binance:
+    api_key: ${BINANCE_API_KEY}
+    secret: ${BINANCE_SECRET}
+    testnet: true
+    options:
+      defaultType: future
+  bybit:
+    api_key: ${BYBIT_API_KEY}
+    secret: ${BYBIT_SECRET}
+    testnet: true
+    options:
+      defaultType: future
+
+trading:
+  symbols:
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+  timeframes:
+    - "5m"
+    - "15m"
+    - "1h"
+  leverage: 5
+  mode: "paper"  # backtest / paper / live
+
+risk:
+  max_position_pct: 0.1
+  max_daily_loss_pct: 0.05
+  max_drawdown_pct: 0.15
+  stop_loss_pct: 0.02
+  take_profit_pct: 0.04
+  max_open_positions: 3
+
+ml:
+  retrain_interval_hours: 24
+  lookback_days: 90
+  train_split: 0.8
+  min_accuracy: 0.55
+  features:
+    - rsi
+    - macd
+    - bbands
+    - atr
+    - volume_profile
+    - funding_rate
+
+rl:
+  total_timesteps: 100000
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  gamma: 0.99
+  reward_type: "sharpe"
+
+backtest:
+  initial_capital: 10000
+  commission_pct: 0.0004
+  slippage_pct: 0.0001
+  start_date: "2024-01-01"
+  end_date: "2025-01-01"
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8888
+
+logging:
+  level: "INFO"
+  file: "logs/autotrader.log"
