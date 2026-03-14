@@ -1,8 +1,9 @@
 """외부 데이터 통합 매니저 - 모든 외부 요인을 하나로 통합
 
 데이터 소스:
-1. 기존: 뉴스, 센티먼트, 공포탐욕, 온체인, 매크로, 소셜
-2. 신규: 계절 사이클 (10년 패턴), 파생상품 (펀딩비/OI/롱숏비율), 멀티타임프레임
+1. 기존: 뉴스, 센티먼트, 공포탐욕, 온체인, 매크로, 소셜(Reddit)
+2. 신규: 계절 사이클, 파생상품, 멀티타임프레임
+3. 최신: 크립토 트위터/Stocktwits (실시간 소셜 센티먼트)
 """
 
 import asyncio
@@ -19,6 +20,7 @@ from .social_collector import SocialCollector
 from .seasonal_cycle import SeasonalCycleAnalyzer
 from .derivatives_data import DerivativesDataCollector
 from .multi_timeframe import MultiTimeframeAnalyzer
+from .crypto_twitter import CryptoTwitterCollector
 
 
 class ExternalDataManager:
@@ -50,6 +52,9 @@ class ExternalDataManager:
         self.derivatives = DerivativesDataCollector()
         self.multi_tf = MultiTimeframeAnalyzer()
 
+        # 실시간 소셜 (Stocktwits + CryptoNews AI)
+        self.crypto_twitter = CryptoTwitterCollector()
+
         self.enabled = config.get("enabled", True)
         self.weight = config.get("weight", 0.3)
 
@@ -66,7 +71,10 @@ class ExternalDataManager:
             # 심볼에서 Binance 형식 추출 (BTC/USDT:USDT → BTCUSDT)
             binance_symbol = symbol.replace("/", "").replace(":USDT", "")
 
-            # 병렬 데이터 수집
+            # 심볼 단축 (BTCUSDT → BTC)
+            short_symbol = binance_symbol.replace("USDT", "")
+
+            # 병렬 데이터 수집 (모든 소스 동시)
             await asyncio.gather(
                 self.news.fetch(),
                 self.fear_greed.fetch(),
@@ -74,6 +82,7 @@ class ExternalDataManager:
                 self.macro.fetch(),
                 self.social.fetch(),
                 self.derivatives.collect(binance_symbol),
+                self.crypto_twitter.fetch(short_symbol),
                 return_exceptions=True,
             )
 
@@ -90,6 +99,16 @@ class ExternalDataManager:
             social_features = self.social.get_features(symbol)
             seasonal_features = self.seasonal.get_features()
             derivatives_features = self.derivatives.get_features()
+            twitter_features = self.crypto_twitter.fetch.__self__._cache.get(
+                f"twitter_{short_symbol}", {}
+            ) if hasattr(self.crypto_twitter, '_cache') else {}
+            # 더 안전한 방법으로 트위터 피처 가져오기
+            if not twitter_features:
+                twitter_features = {}
+                for k, v in self.crypto_twitter._cache.items():
+                    if isinstance(v, dict) and "twitter_composite" in v:
+                        twitter_features = v
+                        break
 
             # 계절 시그널 업데이트
             self.seasonal.get_seasonal_signal()
@@ -104,13 +123,14 @@ class ExternalDataManager:
                 **sentiment_features,
                 **seasonal_features,
                 **derivatives_features,
+                **twitter_features,
             }
 
             # 종합 외부 신호 계산
             self.composite_signal = self._compute_composite_signal(
                 fg_features, onchain_features, macro_features,
                 sentiment_features, news_features, social_features,
-                seasonal_features, derivatives_features,
+                seasonal_features, derivatives_features, twitter_features,
             )
 
             self.last_update = datetime.utcnow()
@@ -119,10 +139,12 @@ class ExternalDataManager:
             deriv = self.derivatives.get_signal_for_strategy()
             seasonal_sig = self.seasonal.current_signal
 
+            twitter_sig = self.crypto_twitter.get_signal()
             logger.info(
                 f"[External] 종합신호: {self.composite_signal['score']:.2f} | "
                 f"공포탐욕: {fg_features.get('fg_value', 50):.0f} | "
                 f"센티먼트: {sentiment_features.get('sentiment_avg', 0):.2f} | "
+                f"트위터: {twitter_features.get('twitter_composite', 0):.2f} | "
                 f"펀딩비: {derivatives_features.get('deriv_funding_rate', 0):.1f}bp | "
                 f"롱숏비: {derivatives_features.get('deriv_global_ls_ratio', 1):.2f} | "
                 f"계절: {seasonal_sig.get('direction', '?')}({seasonal_sig.get('score', 0):.2f}) | "
@@ -146,20 +168,23 @@ class ExternalDataManager:
     def _compute_composite_signal(
         self, fg: dict, onchain: dict, macro: dict,
         sentiment: dict, news: dict, social: dict,
-        seasonal: dict, derivatives: dict,
+        seasonal: dict, derivatives: dict, twitter: dict | None = None,
     ) -> dict:
         """
-        종합 외부 신호 계산 (업그레이드)
+        종합 외부 신호 계산 (v3 - 트위터/소셜 통합)
 
         가중치 (총 100%):
-        - 파생상품 (펀딩비/OI/롱숏): 25% ← 선물에서 가장 중요
-        - 계절 사이클: 15% ← 10년 검증된 패턴
-        - Fear & Greed: 15% (역발상 + 순방향)
-        - 센티먼트: 15%
-        - 매크로: 10%
-        - 온체인: 10%
-        - 소셜 버즈: 10%
+        - 파생상품 (펀딩비/OI/롱숏): 20% ← 선물 핵심
+        - 크립토 트위터/Stocktwits:   20% ← 실시간 소셜 (신규)
+        - 계절 사이클:                12% ← 10년 검증 패턴
+        - Fear & Greed:              12% (역발상 + 순방향)
+        - NLP 센티먼트:              12%
+        - 매크로:                     8%
+        - 온체인:                     8%
+        - Reddit 소셜:               8%
         """
+        twitter = twitter or {}
+
         # 각 카테고리 점수 (-1 ~ 1)
         fg_score = fg.get("fg_normalized", 0)
         fg_contrarian = -fg_score * 0.5
@@ -168,7 +193,7 @@ class ExternalDataManager:
         macro_score = macro.get("macro_composite_score", 0)
         onchain_score = onchain.get("onchain_composite_score", 0)
 
-        # 소셜 버즈 점수
+        # Reddit 소셜 버즈 점수
         social_score = 0.0
         if social.get("social_engagement", 0) > 0.5:
             social_score = (social.get("social_sentiment_ratio", 0.5) - 0.5) * 2
@@ -180,16 +205,20 @@ class ExternalDataManager:
         # 계절 시그널
         seasonal_score = seasonal.get("seasonal_score", 0)
 
-        # 가중 평균
+        # 크립토 트위터 시그널 (Stocktwits + AI 센티먼트 + 이벤트)
+        twitter_score = twitter.get("twitter_composite", 0)
+
+        # 가중 평균 (v3)
         composite = (
-            deriv_score * 0.25 +            # 파생상품 (가장 중요)
-            seasonal_score * 0.15 +          # 계절 사이클
-            fg_contrarian * 0.08 +           # 역발상 공포탐욕
-            fg_score * 0.07 +                # 순방향 공포탐욕
-            sentiment_score * 0.15 +          # 센티먼트
-            macro_score * 0.10 +              # 매크로
-            onchain_score * 0.10 +            # 온체인
-            social_score * 0.10               # 소셜
+            deriv_score * 0.20 +             # 파생상품
+            twitter_score * 0.20 +           # 크립토 트위터 (신규)
+            seasonal_score * 0.12 +          # 계절 사이클
+            fg_contrarian * 0.07 +           # 역발상 공포탐욕
+            fg_score * 0.05 +                # 순방향 공포탐욕
+            sentiment_score * 0.12 +         # NLP 센티먼트
+            macro_score * 0.08 +             # 매크로
+            onchain_score * 0.08 +           # 온체인
+            social_score * 0.08              # Reddit 소셜
         )
 
         # 이벤트 임팩트 보정
@@ -233,6 +262,7 @@ class ExternalDataManager:
             "strength": strength,
             "components": {
                 "derivatives": round(deriv_score, 3),
+                "twitter": round(twitter_score, 3),
                 "seasonal": round(seasonal_score, 3),
                 "fear_greed": round(fg_score, 3),
                 "sentiment": round(sentiment_score, 3),
@@ -276,6 +306,7 @@ class ExternalDataManager:
             "sentiment_trend": self.sentiment.get_sentiment_trend(),
             "onchain_data": self.onchain.data,
             "macro_data": self.macro.data,
+            "crypto_twitter": self.crypto_twitter.get_signal(),
             "derivatives": self.derivatives.get_report(),
             "seasonal": self.seasonal.get_report(),
             "multi_timeframe": self.multi_tf.get_report(),

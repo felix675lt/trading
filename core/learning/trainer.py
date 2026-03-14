@@ -57,20 +57,23 @@ class SelfLearningTrainer:
             logger.warning(f"학습 데이터 부족: {len(df)}개")
             return
 
-        feature_cols = self.feature_engineer.get_feature_columns(df)
+        # ML은 외부 피처 포함 전체 사용, RL은 기본 피처만 사용 (차원 고정)
+        all_feature_cols = self.feature_engineer.get_feature_columns(df)
+        base_feature_cols = self.feature_engineer.get_base_feature_columns(df)
 
-        # 2. ML 앙상블 학습
-        self.ensemble.train_all(df, feature_cols)
+        # 2. ML 앙상블 학습 (외부 피처 포함)
+        self.ensemble.train_all(df, all_feature_cols)
 
-        # 3. RL 에이전트 학습
+        # 3. RL 에이전트 학습 (기본 피처만 - 차원 고정 보장)
         ohlcv_cols = ["open", "high", "low", "close", "volume"]
-        data = np.hstack([df[feature_cols].values, df[ohlcv_cols].values]).astype(np.float32)
-        # NaN 처리
-        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        rl_data = np.hstack([df[base_feature_cols].values, df[ohlcv_cols].values]).astype(np.float32)
+        rl_data = np.nan_to_num(rl_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+        logger.info(f"RL 학습 피처: {len(base_feature_cols)}개 (기본) / ML 피처: {len(all_feature_cols)}개 (전체)")
 
         env = self.rl_agent.create_env(
-            data=data,
-            feature_dim=len(feature_cols),
+            data=rl_data,
+            feature_dim=len(base_feature_cols),
             initial_capital=self.config.get("backtest", {}).get("initial_capital", 10000),
             commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
             leverage=self.config.get("trading", {}).get("leverage", 5),

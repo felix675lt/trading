@@ -273,15 +273,14 @@ class AutoTrader:
         # 3. ML 시그널
         ml_signal = self.ensemble.predict(df)
 
-        # 4. RL 행동 결정
+        # 4. RL 행동 결정 (기본 피처만 사용 - 차원 고정 보장)
+        base_feature_cols = self.feature_engineer.get_base_feature_columns(df)
         ohlcv_cols = ["open", "high", "low", "close", "volume"]
-        obs_data = np.hstack([df[feature_cols].values, df[ohlcv_cols].values]).astype(np.float32)
-        obs_data = np.nan_to_num(obs_data, nan=0.0)
+        rl_obs_data = df[base_feature_cols].values[-1].astype(np.float32)
+        rl_obs_data = np.nan_to_num(rl_obs_data, nan=0.0)
 
-        # RL 관찰값 구성 (마지막 피처 + 포지션 정보)
-        obs_features = obs_data[-1, :len(feature_cols)]
         position_info = np.array([0.0, 0.0, self.equity / self.initial_capital, 0.0], dtype=np.float32)
-        obs = np.concatenate([obs_features, position_info])
+        obs = np.concatenate([rl_obs_data, position_info])
 
         rl_action, rl_confidence = self.rl_agent.predict(obs)
 

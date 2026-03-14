@@ -145,6 +145,11 @@ class FeatureEngineer:
         return df
 
     def get_feature_columns(self, df: pd.DataFrame) -> list[str]:
-        """ML 모델에 입력할 피처 컬럼만 반환"""
+        """ML 모델에 입력할 피처 컬럼만 반환 (외부 피처 포함)"""
         exclude = {"open", "high", "low", "close", "volume", "label", "future_return"}
         return [c for c in df.columns if c not in exclude]
+
+    def get_base_feature_columns(self, df: pd.DataFrame) -> list[str]:
+        """RL 모델용 기본 피처만 반환 (외부 피처 제외 - 차원 고정)"""
+        exclude = {"open", "high", "low", "close", "volume", "label", "future_return"}
+        return [c for c in df.columns if c not in exclude and not c.startswith("ext_")]

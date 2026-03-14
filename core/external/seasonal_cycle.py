@@ -47,6 +47,10 @@ class SeasonalCycleAnalyzer:
             "sep_apr_avg": 210.0,         # 평균 210% (역사적 최대)
             "confidence": 0.9,            # 가장 강한 패턴
             "note": "반감기 다음 해: 역사적 최대 강세 구간 (평균 +210%)",
+            # 반감기 후 피크 타이밍 (검증된 패턴):
+            # 2017: 530일 후 피크 (12월), 2021: 550일 후 피크 (11월), 2025: 540일 후 피크 (10월)
+            "peak_days_avg": 540,         # 반감기 후 평균 540일에 피크
+            "peak_days_range": (500, 580), # 500~580일 사이에 피크 형성
         },
         "post_halving_2": {
             "sep_nov_up_ratio": 0.333,    # 33% 상승 (2018, 2022 중 1개만 상승)
@@ -308,17 +312,14 @@ class SeasonalCycleAnalyzer:
                     "message": f"Sep-Nov {phase} 단계 역사적 하락 확률 {1-sep_nov_up_ratio:.0%} (평균 {sep_nov_avg:+.0f}%)",
                 })
 
-        # === 패턴 3: 단계별 특징 ===
+        # === 패턴 3: 단계별 특징 (post_halving_1은 sub-phase 적용) ===
+        days_since = halving.get("days_since_halving", 0)
+
         phase_insights = {
             "halving_year": {
                 "bias": "bullish_setup",
                 "strength": 0.2,
                 "desc": "반감기 연도: 공급 감소 시작 → 강세 준비, Sep-Nov 약 50/50",
-            },
-            "post_halving_1": {
-                "bias": "strong_bullish",
-                "strength": 0.9,
-                "desc": "반감기 다음 해(1~2년): 역사적 최대 강세! Sep-Nov 67% 상승, Dec-Feb +99%, Sep-Apr +210%",
             },
             "post_halving_2": {
                 "bias": "bearish",
@@ -331,6 +332,39 @@ class SeasonalCycleAnalyzer:
                 "desc": "반감기 전 해: 회복/축적, Sep-Nov 67% 상승, Sep-Apr +68%",
             },
         }
+
+        # post_halving_1 sub-phase (검증된 피크 타이밍: 500~580일)
+        if phase == "post_halving_1":
+            peak_range = pattern.get("peak_days_range", (500, 580))
+            if days_since < peak_range[0]:
+                # 상승 구간 (365~500일): 강세 진행 중
+                phase_insights["post_halving_1"] = {
+                    "bias": "strong_bullish",
+                    "strength": 0.8,
+                    "desc": f"post_halving_1 상승 구간 (피크까지 ~{peak_range[0]-days_since}일): 역사적 최대 강세",
+                }
+            elif days_since <= peak_range[1]:
+                # 피크 구간 (500~580일): 고점 경고
+                phase_insights["post_halving_1"] = {
+                    "bias": "peak_warning",
+                    "strength": 0.1,
+                    "desc": f"post_halving_1 피크 구간 (반감기 후 {days_since}일): 고점 형성 중! 신규 롱 자제, 익절 준비",
+                }
+            else:
+                # 하락 구간 (580~730일): 피크 후 조정
+                decline_days = days_since - peak_range[1]
+                phase_insights["post_halving_1"] = {
+                    "bias": "post_peak_bearish",
+                    "strength": -0.5,
+                    "desc": f"post_halving_1 피크 후 조정 ({decline_days}일 경과): 고점 대비 하락 중, 반등 매도 or 관망",
+                }
+        else:
+            if "post_halving_1" not in phase_insights:
+                phase_insights["post_halving_1"] = {
+                    "bias": "strong_bullish",
+                    "strength": 0.8,
+                    "desc": "반감기 다음 해: 역사적 최대 강세 구간",
+                }
 
         if phase in phase_insights:
             insight = phase_insights[phase]
