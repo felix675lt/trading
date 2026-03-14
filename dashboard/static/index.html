@@ -38,6 +38,18 @@
         .component-item { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
         .component-item .name { color: #94a3b8; }
         .component-item .score { font-weight: 600; }
+        .log-container { max-height: 400px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 12px; }
+        .log-entry { padding: 6px 8px; border-bottom: 1px solid #1e293b; display: flex; gap: 10px; align-items: flex-start; }
+        .log-entry:hover { background: #1e293b; }
+        .log-time { color: #64748b; min-width: 70px; flex-shrink: 0; }
+        .log-type { min-width: 80px; flex-shrink: 0; padding: 1px 6px; border-radius: 4px; text-align: center; font-size: 11px; font-weight: 600; }
+        .log-type.analysis { background: #1e3a5f; color: #60a5fa; }
+        .log-type.trade_open { background: #064e3b; color: #6ee7b7; }
+        .log-type.trade_close_win { background: #064e3b; color: #34d399; }
+        .log-type.trade_close_loss { background: #7f1d1d; color: #fca5a5; }
+        .log-type.retrain { background: #78350f; color: #fbbf24; }
+        .log-type.external { background: #4c1d95; color: #a78bfa; }
+        .log-msg { color: #cbd5e1; flex: 1; word-break: break-word; }
     </style>
 </head>
 <body>
@@ -139,6 +151,13 @@
                 <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>PnL</th><th>SL</th><th>TP</th></tr></thead>
                 <tbody id="positions-table"><tr><td colspan="7" style="text-align:center;color:#64748b">No open positions</td></tr></tbody>
             </table>
+        </div>
+
+        <div class="card wide">
+            <h2>Live Learning Log</h2>
+            <div class="log-container" id="live-log">
+                <div style="text-align:center;color:#64748b;padding:20px">Waiting for logs...</div>
+            </div>
         </div>
 
         <div class="card wide">
@@ -277,6 +296,29 @@
                 document.getElementById('ext-news-count').textContent = `${ext.news_count || 0} articles`;
                 document.getElementById('ext-social-count').textContent = `${ext.social_posts || 0} posts`;
                 document.getElementById('comp-features').textContent = `${ext.feature_count || 0} features`;
+            }
+
+            // Live Logs
+            const logs = await fetchData('live_logs');
+            const logContainer = document.getElementById('live-log');
+            if (logs?.logs?.length) {
+                logContainer.innerHTML = logs.logs.slice().reverse().map(l => {
+                    const time = l.timestamp?.slice(11, 19) || '';
+                    let typeClass = l.type || 'analysis';
+                    if (l.type === 'trade_close') {
+                        typeClass = (l.pnl != null && l.pnl >= 0) ? 'trade_close_win' : 'trade_close_loss';
+                    }
+                    const typeLabel = (l.type || 'info').replace('_', ' ').toUpperCase();
+                    let msg = l.message || '';
+                    if (l.symbol) msg = `[${l.symbol}] ${msg}`;
+                    if (l.pnl != null) msg += ` | PnL: ${fmt(l.pnl)}%`;
+                    if (l.confidence != null) msg += ` | Conf: ${fmt(l.confidence * 100)}%`;
+                    return `<div class="log-entry">
+                        <span class="log-time">${time}</span>
+                        <span class="log-type ${typeClass}">${typeLabel}</span>
+                        <span class="log-msg">${msg}</span>
+                    </div>`;
+                }).join('');
             }
 
             // Positions

@@ -1,5 +1,6 @@
 """FastAPI 대시보드 서버"""
 
+import collections
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -7,6 +8,14 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="AutoTrader AI Dashboard")
+
+# 실시간 학습 로그 버퍼 (최근 200개)
+_live_logs: collections.deque = collections.deque(maxlen=200)
+
+
+def add_live_log(entry: dict):
+    """실시간 로그 추가 (main.py에서 호출)"""
+    _live_logs.append(entry)
 
 # 전역 상태 (main.py에서 주입)
 _state = {
@@ -107,3 +116,9 @@ async def get_external():
     if ext:
         return ext.get_report()
     return {}
+
+
+@app.get("/api/live_logs")
+async def get_live_logs():
+    """실시간 학습/거래 로그"""
+    return {"logs": list(_live_logs)}

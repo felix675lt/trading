@@ -29,7 +29,7 @@ from core.risk.manager import RiskManager
 from core.learning.feedback import AnomalyDetector, TradeFeedbackAnalyzer
 from core.strategy.adaptive import AdaptiveOptimizer
 from core.strategy.manager import StrategyManager
-from dashboard.app import app as dashboard_app, set_state
+from dashboard.app import app as dashboard_app, set_state, add_live_log
 
 
 class AutoTrader:
@@ -193,8 +193,18 @@ class AutoTrader:
             try:
                 # 재학습 체크
                 if trainer.should_retrain():
+                    add_live_log({
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "type": "retrain",
+                        "message": "자기학습 재훈련 시작",
+                    })
                     for symbol in symbols:
                         await trainer.train_cycle(exchange_name, symbol, timeframe)
+                    add_live_log({
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "type": "retrain",
+                        "message": "자기학습 재훈련 완료",
+                    })
 
                 # 외부 데이터 업데이트 (매 루프마다, 내부에서 interval 체크)
                 if self.external_manager.enabled:
@@ -283,6 +293,26 @@ class AutoTrader:
             },
         }
 
+        # 실시간 로그 기록
+        price = float(df["close"].iloc[-1])
+        add_live_log({
+            "time": datetime.utcnow().strftime("%H:%M:%S"),
+            "type": "analysis",
+            "symbol": symbol,
+            "price": price,
+            "action": decision.action,
+            "confidence": round(decision.confidence, 3),
+            "ml_dir": ml_signal.get("direction", "?"),
+            "ml_conf": round(ml_signal.get("confidence", 0), 3),
+            "rl_action": ["hold", "long", "short", "close"][rl_action],
+            "rl_conf": round(rl_confidence, 3),
+            "ext_score": round(ext_signal.get("score", 0), 3),
+            "ext_dir": ext_signal.get("direction", "neutral"),
+            "regime": adaptive_params["regime"],
+            "reason": decision.reason,
+            "features_count": len(feature_cols),
+        })
+
         # 5.5. 이상 시장 감지
         price = float(df["close"].iloc[-1])
         volume = float(df["volume"].iloc[-1])
@@ -339,6 +369,15 @@ class AutoTrader:
                     await om.open_position(symbol, decision.action, size, self.config["trading"]["leverage"])
 
             logger.info(f"[{self.mode.upper()}] {decision.action.upper()} {symbol} | 크기: ${size:.2f} | 사유: {decision.reason}")
+            add_live_log({
+                "time": datetime.utcnow().strftime("%H:%M:%S"),
+                "type": "trade_open",
+                "symbol": symbol,
+                "action": decision.action,
+                "size": round(size, 2),
+                "price": price,
+                "reason": decision.reason,
+            })
 
         elif decision.action == "close":
             price = float(df["close"].iloc[-1])
@@ -350,6 +389,13 @@ class AutoTrader:
                         "exchange": exchange_name, "symbol": symbol, "side": "close",
                         "price": price, "amount": result["size"], "pnl": result["pnl"],
                         "fee": result["fee"], "strategy": "hybrid",
+                    })
+                    add_live_log({
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "type": "trade_close",
+                        "symbol": symbol,
+                        "pnl": round(result["pnl"], 2),
+                        "reason": decision.reason,
                     })
                     # 피드백 기록 → 자기학습 (외부 신호 정보 포함)
                     volatility = df["returns_1"].std() if "returns_1" in df.columns else 0
