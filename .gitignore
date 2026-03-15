@@ -11,3 +11,4 @@ models_saved/
 *.pyc
 .venv/
 venv/
+trading/
