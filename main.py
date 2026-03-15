@@ -195,14 +195,14 @@ class AutoTrader:
                 # 재학습 체크
                 if trainer.should_retrain():
                     add_live_log({
-                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "timestamp": datetime.utcnow().isoformat(),
                         "type": "retrain",
                         "message": "자기학습 재훈련 시작",
                     })
                     for symbol in symbols:
                         await trainer.train_cycle(exchange_name, symbol, primary_tf)
                     add_live_log({
-                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "timestamp": datetime.utcnow().isoformat(),
                         "type": "retrain",
                         "message": "자기학습 재훈련 완료",
                     })
@@ -347,7 +347,7 @@ class AutoTrader:
 
         # 실시간 로그 기록
         add_live_log({
-            "time": datetime.utcnow().strftime("%H:%M:%S"),
+            "timestamp": datetime.utcnow().isoformat(),
             "type": "analysis",
             "symbol": symbol,
             "price": price,
@@ -450,7 +450,7 @@ class AutoTrader:
                 f"사유: {decision.reason}"
             )
             add_live_log({
-                "time": datetime.utcnow().strftime("%H:%M:%S"),
+                "timestamp": datetime.utcnow().isoformat(),
                 "type": "trade_open",
                 "symbol": symbol,
                 "action": decision.action,
@@ -472,7 +472,7 @@ class AutoTrader:
                         "fee": result["fee"], "strategy": "hybrid",
                     })
                     add_live_log({
-                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "timestamp": datetime.utcnow().isoformat(),
                         "type": "trade_close",
                         "symbol": symbol,
                         "pnl": round(result["pnl"], 2),

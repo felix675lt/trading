@@ -303,22 +303,41 @@
             const logContainer = document.getElementById('live-log');
             if (logs?.logs?.length) {
                 logContainer.innerHTML = logs.logs.slice().reverse().map(l => {
-                    const time = l.timestamp?.slice(11, 19) || '';
+                    const dt = new Date(l.timestamp);
+                    const time = dt.toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
                     let typeClass = l.type || 'analysis';
                     if (l.type === 'trade_close') {
                         typeClass = (l.pnl != null && l.pnl >= 0) ? 'trade_close_win' : 'trade_close_loss';
                     }
-                    const typeLabel = (l.type || 'info').replace('_', ' ').toUpperCase();
-                    let msg = l.message || '';
-                    if (l.symbol) msg = `[${l.symbol}] ${msg}`;
-                    if (l.pnl != null) msg += ` | PnL: ${fmt(l.pnl)}%`;
-                    if (l.confidence != null) msg += ` | Conf: ${fmt(l.confidence * 100)}%`;
+                    const typeLabel = {
+                        'analysis': '분석',
+                        'trade_open': '진입',
+                        'trade_close': '청산',
+                        'trade_close_win': '수익',
+                        'trade_close_loss': '손실',
+                        'retrain': '재훈련'
+                    }[l.type] || l.type;
+
+                    let msg = '';
+                    if (l.message) msg = l.message;
+                    else if (l.type === 'analysis') {
+                        msg = `[${l.symbol}] ${l.action}`;
+                        if (l.confidence != null) msg += ` (${fmt(l.confidence*100)}%)`;
+                    } else if (l.type === 'trade_open') {
+                        msg = `${l.action.toUpperCase()} ${l.symbol} $${fmt(l.size)}@${fmt(l.price)} ${l.leverage}x`;
+                    } else if (l.type === 'trade_close') {
+                        const pnlStr = l.pnl >= 0 ? `+$${fmt(l.pnl)}` : `-$${fmt(Math.abs(l.pnl))}`;
+                        msg = `${l.symbol} ${pnlStr}`;
+                    }
+
                     return `<div class="log-entry">
                         <span class="log-time">${time}</span>
                         <span class="log-type ${typeClass}">${typeLabel}</span>
                         <span class="log-msg">${msg}</span>
                     </div>`;
                 }).join('');
+            } else {
+                logContainer.innerHTML = '<div style="text-align:center;color:#64748b;padding:20px">로그 대기 중...</div>';
             }
 
             // Positions
