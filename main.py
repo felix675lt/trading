@@ -27,9 +27,25 @@ from core.models.ensemble import EnsembleSignalGenerator
 from core.rl.agent import RLAgent
 from core.risk.manager import RiskManager
 from core.learning.feedback import AnomalyDetector, TradeFeedbackAnalyzer
-from core.strategy.adaptive import AdaptiveOptimizer
+from core.strategy.adaptive import AdaptiveOptimizer, StrategyOptimizer
 from core.strategy.manager import StrategyManager
 from dashboard.app import app as dashboard_app, set_state, add_live_log
+
+# Telegram 알림 (실패해도 트레이딩에 영향 없음)
+try:
+    from scripts.telegram_bot import send_message as tg_send, format_trade_open, format_trade_close, format_system_alert
+    _tg_ok = True
+except Exception:
+    _tg_ok = False
+
+def tg_notify(text, silent=False):
+    """비동기 안전 텔레그램 알림 (실패 무시)"""
+    if not _tg_ok:
+        return
+    try:
+        threading.Thread(target=tg_send, args=(text, "HTML", silent), daemon=True).start()
+    except:
+        pass
 
 
 class AutoTrader:
@@ -38,7 +54,8 @@ class AutoTrader:
     def __init__(self, config_path: str = "config/default.yaml"):
         load_dotenv()
         self.config = self._load_config(config_path)
-        self.mode = self.config["trading"]["mode"]
+        self.mode = self.config["trading"]["mode"]  # paper / live / dual
+        self.dual_mode = (self.mode == "dual")
         self.start_time = datetime.utcnow()
 
         # 로깅 설정
@@ -47,7 +64,7 @@ class AutoTrader:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         logger.add(log_file, rotation="10 MB", level=log_cfg.get("level", "INFO"))
 
-        # 컴포넌트 초기화
+        # 컴포넌트 초기화 (한 번만)
         self.storage = Storage()
         self.feature_engineer = FeatureEngineer(self.config.get("ml", {}).get("features"))
         self.ensemble = EnsembleSignalGenerator()
@@ -61,7 +78,7 @@ class AutoTrader:
         # 외부 데이터 매니저 (뉴스/센티먼트/온체인/매크로/공포탐욕)
         self.external_manager = ExternalDataManager(self.config.get("external", {}))
 
-        # 페이퍼/실거래 트레이더
+        # Paper 트레이더 (paper / dual 모드에서 사용)
         self.paper_trader = PaperTrader(
             initial_capital=self.config.get("backtest", {}).get("initial_capital", 10000),
             commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
@@ -69,6 +86,13 @@ class AutoTrader:
         )
         self.exchange_clients: dict[str, ExchangeClient] = {}
         self.order_managers: dict[str, OrderManager] = {}
+
+        # StrategyOptimizer — Paper/Live 각각 독립 추적
+        self.strategy_optimizer_paper = StrategyOptimizer()
+        self.strategy_optimizer_live = StrategyOptimizer()
+
+        # 최소 주문 notional (거래소 최소수량 충족용)
+        self.min_order_notional = self.config["risk"].get("min_order_notional", 100)
 
         # 상태
         self.equity = self.config.get("backtest", {}).get("initial_capital", 10000)
@@ -98,8 +122,8 @@ class AutoTrader:
         self.collector = DataCollector(self.config["exchanges"])
         await self.collector.initialize()
 
-        # 실거래 모드 시 거래소 클라이언트 초기화
-        if self.mode == "live":
+        # 실거래 모드 시 거래소 클라이언트 초기화 (live 또는 dual)
+        if self.mode in ("live", "dual"):
             for name, cfg in self.config["exchanges"].items():
                 client = ExchangeClient(name, cfg)
                 self.exchange_clients[name] = client
@@ -192,17 +216,36 @@ class AutoTrader:
 
         while self.is_running:
             try:
-                # 재학습 체크
-                if trainer.should_retrain():
+                # 재학습 체크 (일반 + stuck 감지)
+                diag = self.strategy_manager.get_diagnostics()
+                needs_retrain = trainer.should_retrain()
+
+                # 자기진단: 200회 연속 hold (~100분) → 강제 재학습
+                if diag["is_stuck"] and diag["consecutive_holds"] % 200 == 0:
+                    logger.warning(
+                        f"[자기진단] {diag['consecutive_holds']}회 연속 HOLD → 강제 재학습 트리거 "
+                        f"(min_conf: {diag['current_min_confidence']:.3f})"
+                    )
+                    needs_retrain = True
+                    tg_notify(
+                        f"⚠️ <b>자기진단 알림</b>\n"
+                        f"━━━━━━━━━━━━━\n"
+                        f"🔄 {diag['consecutive_holds']}회 연속 HOLD 감지\n"
+                        f"📊 min_conf: {diag['current_min_confidence']:.3f}\n"
+                        f"🤖 강제 재학습 시작",
+                        silent=True,
+                    )
+
+                if needs_retrain:
                     add_live_log({
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
                         "type": "retrain",
-                        "message": "자기학습 재훈련 시작",
+                        "message": f"자기학습 재훈련 시작 (holds: {diag['consecutive_holds']})",
                     })
                     for symbol in symbols:
                         await trainer.train_cycle(exchange_name, symbol, primary_tf)
                     add_live_log({
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
                         "type": "retrain",
                         "message": "자기학습 재훈련 완료",
                     })
@@ -248,6 +291,28 @@ class AutoTrader:
                         f"MTF합류: {mtf.get('score', 0):.2f}({mtf.get('agreement', 0):.0%})"
                     )
 
+                # 자동 전략 최적화 (각 모드별 독립)
+                for label, optimizer in [("PAPER", self.strategy_optimizer_paper),
+                                         ("LIVE", self.strategy_optimizer_live)]:
+                    total = sum(len(v) for v in optimizer.performance_history.values())
+                    last_key = f"_last_opt_{label}"
+                    if total >= 30 and (
+                        loop_count % 2880 == 0 or
+                        total - getattr(self, last_key, 0) >= 30
+                    ):
+                        all_trades = []
+                        for trades_list in optimizer.performance_history.values():
+                            all_trades.extend(trades_list)
+                        if len(all_trades) >= 30:
+                            optimizer.optimize_daily(all_trades)
+                            setattr(self, last_key, total)
+                            report = optimizer.get_report()
+                            logger.info(
+                                f"[{label} Optimizer] 최적화 완료 | "
+                                f"승률: {report['current_win_rate']:.1%} | "
+                                f"거래: {report['total_trades']}"
+                            )
+
                 # 대기
                 await asyncio.sleep(30)
 
@@ -290,13 +355,17 @@ class AutoTrader:
         # 4.6. 멀티타임프레임 합류 시그널
         mtf_signal = self.external_manager.multi_tf.get_signal_for_strategy()
 
-        # 5. 전략 결정 (ML + RL + 외부 요인 + MTF 통합)
+        # 4.7. 모멘텀 시그널 계산 (ML/RL 무반응 시 fallback)
+        momentum_signal = self._calculate_momentum(df)
+
+        # 5. 전략 결정 (ML + RL + 외부 요인 + MTF + 모멘텀 통합)
         current_position = 0.0
-        if self.mode == "paper":
+        if self.mode in ("paper", "dual"):
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
         decision = self.strategy_manager.decide(
             ml_signal, rl_action, rl_confidence, current_position,
             adaptive_params["regime"], external_signal=ext_signal,
+            momentum=momentum_signal,
         )
 
         # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
@@ -339,6 +408,8 @@ class AutoTrader:
                 "agreement": mtf_signal.get("agreement", 0),
                 "direction": mtf_signal.get("direction", "neutral"),
             },
+            "momentum": momentum_signal,
+            "diagnostics": self.strategy_manager.get_diagnostics(),
         }
 
         # 가격 히스토리 업데이트 (상관관계 계산용)
@@ -347,7 +418,7 @@ class AutoTrader:
 
         # 실시간 로그 기록
         add_live_log({
-            "timestamp": datetime.utcnow().isoformat(),
+            "time": datetime.utcnow().strftime("%H:%M:%S"),
             "type": "analysis",
             "symbol": symbol,
             "price": price,
@@ -361,9 +432,14 @@ class AutoTrader:
             "ext_dir": ext_signal.get("direction", "neutral"),
             "mtf_score": round(mtf_signal.get("score", 0), 3),
             "mtf_agree": round(mtf_signal.get("agreement", 0), 2),
+            "mom_dir": momentum_signal.get("direction", "?"),
+            "mom_str": round(momentum_signal.get("strength", 0), 3),
+            "mom_rsi": round(momentum_signal.get("rsi", 50), 1),
             "regime": adaptive_params["regime"],
             "reason": decision.reason,
             "features_count": len(feature_cols),
+            "min_conf": round(self.strategy_manager.min_confidence, 3),
+            "holds": self.strategy_manager._consecutive_holds,
         })
 
         # 5.5. 이상 시장 감지
@@ -378,7 +454,7 @@ class AutoTrader:
                 return
 
         # 6. 리스크 체크
-        num_positions = len(self.paper_trader.positions) if self.mode == "paper" else 0
+        num_positions = len(self.paper_trader.positions) if self.mode in ("paper", "dual") else 0
         can_trade, risk_msg = self.risk_manager.check_can_trade(self.equity, num_positions)
 
         if decision.action in ["long", "short"] and not can_trade:
@@ -403,11 +479,9 @@ class AutoTrader:
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
 
             # 7.1. 포지션 상관관계 체크
-            current_positions = {}
-            if self.mode == "paper":
-                current_positions = {
-                    s: {"side": p.side} for s, p in self.paper_trader.positions.items()
-                }
+            current_positions = {
+                s: {"side": p.side} for s, p in self.paper_trader.positions.items()
+            }
             corr_ok, corr_reason, corr_mult = self.risk_manager.check_correlation(
                 symbol, decision.action, current_positions,
             )
@@ -430,39 +504,87 @@ class AutoTrader:
                 self.equity, decision.confidence, volatility,
                 adaptive_params["position_scale"] * fb_scale * corr_mult,
             )
+
+            # 7.4. 최소 주문 notional 보장 (Binance 최소 $100 + 여유분)
+            notional = size * dynamic_lev
+            min_notional_with_margin = self.min_order_notional * 1.05  # 5% 여유
+            if notional < min_notional_with_margin:
+                size = max(size, min_notional_with_margin / dynamic_lev)
+                # 자본의 50%를 넘지 않도록 캡
+                size = min(size, self.equity * 0.50)
+                notional = size * dynamic_lev
+
             price = float(df["close"].iloc[-1])
 
-            if self.mode == "paper":
-                self.paper_trader.open_position(
-                    symbol, decision.action, size, price,
-                    leverage=dynamic_lev,
-                    sl_pct=self.config["risk"]["stop_loss_pct"] * adaptive_params["stop_loss_mult"],
-                    tp_pct=self.config["risk"]["take_profit_pct"],
-                )
-            elif self.mode == "live":
-                om = self.order_managers.get(exchange_name)
-                if om:
-                    await om.open_position(symbol, decision.action, size, dynamic_lev)
+            # === PAPER 실행 (paper / dual 모드) ===
+            if self.mode in ("paper", "dual"):
+                if symbol not in self.paper_trader.positions:
+                    self.paper_trader.open_position(
+                        symbol, decision.action, size, price,
+                        leverage=dynamic_lev,
+                        sl_pct=self.config["risk"]["stop_loss_pct"] * adaptive_params["stop_loss_mult"],
+                        tp_pct=self.config["risk"]["take_profit_pct"],
+                    )
+                    logger.info(
+                        f"[PAPER] {decision.action.upper()} {symbol} | "
+                        f"마진: ${size:.2f} × {dynamic_lev}x = ${notional:.2f} | "
+                        f"사유: {decision.reason}"
+                    )
+                    add_live_log({
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "type": "trade_open",
+                        "mode": "PAPER",
+                        "symbol": symbol,
+                        "action": decision.action,
+                        "size": round(size, 2),
+                        "price": price,
+                        "leverage": dynamic_lev,
+                        "notional": round(notional, 2),
+                        "reason": decision.reason,
+                    })
+                    tg_notify(format_trade_open("PAPER", symbol, decision.action, price, notional, dynamic_lev, decision.reason), silent=True)
 
-            logger.info(
-                f"[{self.mode.upper()}] {decision.action.upper()} {symbol} | "
-                f"크기: ${size:.2f} | 레버리지: {dynamic_lev}x | "
-                f"사유: {decision.reason}"
-            )
-            add_live_log({
-                "timestamp": datetime.utcnow().isoformat(),
-                "type": "trade_open",
-                "symbol": symbol,
-                "action": decision.action,
-                "size": round(size, 2),
-                "price": price,
-                "leverage": dynamic_lev,
-                "reason": decision.reason,
-            })
+            # === LIVE 실행 (live / dual 모드) ===
+            if self.mode in ("live", "dual"):
+                om = self.order_managers.get(exchange_name)
+                if om and symbol not in getattr(om, "positions", {}):
+                    result = await om.open_position(symbol, decision.action, size, dynamic_lev)
+                    if result:
+                        logger.info(
+                            f"[LIVE] {decision.action.upper()} {symbol} | "
+                            f"마진: ${size:.2f} × {dynamic_lev}x = ${notional:.2f} | "
+                            f"사유: {decision.reason}"
+                        )
+                        add_live_log({
+                            "time": datetime.utcnow().strftime("%H:%M:%S"),
+                            "type": "trade_open",
+                            "mode": "LIVE",
+                            "symbol": symbol,
+                            "action": decision.action,
+                            "size": round(size, 2),
+                            "price": price,
+                            "leverage": dynamic_lev,
+                            "notional": round(notional, 2),
+                            "reason": decision.reason,
+                        })
+                        tg_notify(format_trade_open("🔥LIVE", symbol, decision.action, price, notional, dynamic_lev, decision.reason))
+                    else:
+                        logger.warning(f"[LIVE] {symbol} 주문 실패 (마진 ${size:.2f})")
 
         elif decision.action == "close":
             price = float(df["close"].iloc[-1])
-            if self.mode == "paper":
+            volatility = df["returns_1"].std() if "returns_1" in df.columns else 0
+            trade_context = {
+                "regime": adaptive_params["regime"],
+                "signal": ml_signal.get("signal", 0),
+                "confidence": decision.confidence,
+                "volatility": volatility,
+                "external_score": ext_signal.get("score", 0),
+                "external_direction": ext_signal.get("direction", "neutral"),
+            }
+
+            # === PAPER 청산 ===
+            if self.mode in ("paper", "dual"):
                 result = self.paper_trader.close_position(symbol, price, decision.reason)
                 if result:
                     self.risk_manager.record_pnl(result["pnl"])
@@ -471,46 +593,186 @@ class AutoTrader:
                         "price": price, "amount": result["size"], "pnl": result["pnl"],
                         "fee": result["fee"], "strategy": "hybrid",
                     })
+                    self.feedback.record_trade(result, trade_context)
+                    # Paper StrategyOptimizer 기록
+                    p_hash = self.strategy_optimizer_paper._config_to_hash(
+                        self.strategy_optimizer_paper.current_config
+                    )
+                    self.strategy_optimizer_paper.record_trade(p_hash, {
+                        "pnl": result["pnl"],
+                        "timestamp": datetime.utcnow(),
+                        "symbol": symbol,
+                        "duration_minutes": result.get("duration_minutes", 0),
+                        "hour": datetime.utcnow().hour,
+                    })
                     add_live_log({
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
                         "type": "trade_close",
+                        "mode": "PAPER",
                         "symbol": symbol,
                         "pnl": round(result["pnl"], 2),
                         "reason": decision.reason,
                     })
-                    # 피드백 기록 → 자기학습 (외부 신호 정보 포함)
-                    volatility = df["returns_1"].std() if "returns_1" in df.columns else 0
-                    self.feedback.record_trade(result, {
-                        "regime": adaptive_params["regime"],
-                        "signal": ml_signal.get("signal", 0),
-                        "confidence": decision.confidence,
-                        "volatility": volatility,
-                        "external_score": ext_signal.get("score", 0),
-                        "external_direction": ext_signal.get("direction", "neutral"),
-                    })
-            elif self.mode == "live":
-                om = self.order_managers.get(exchange_name)
-                if om:
-                    await om.close_position(symbol, decision.reason)
+                    logger.info(f"[PAPER] 청산 {symbol} | PnL: ${result['pnl']:.2f}")
+                    tg_notify(format_trade_close("PAPER", symbol, result["pnl"], decision.reason, result.get("duration_minutes", 0)), silent=True)
 
-        # 페이퍼 트레이더 가격 업데이트
-        if self.mode == "paper":
+            # === LIVE 청산 ===
+            if self.mode in ("live", "dual"):
+                om = self.order_managers.get(exchange_name)
+                if om and symbol in om.positions:
+                    live_result = await om.close_position(symbol, decision.reason)
+                    if live_result:
+                        # Live StrategyOptimizer 기록
+                        l_hash = self.strategy_optimizer_live._config_to_hash(
+                            self.strategy_optimizer_live.current_config
+                        )
+                        live_pnl = live_result.get("pnl", 0) if isinstance(live_result, dict) else 0
+                        self.strategy_optimizer_live.record_trade(l_hash, {
+                            "pnl": live_pnl,
+                            "timestamp": datetime.utcnow(),
+                            "symbol": symbol,
+                            "duration_minutes": 0,
+                            "hour": datetime.utcnow().hour,
+                        })
+                        add_live_log({
+                            "time": datetime.utcnow().strftime("%H:%M:%S"),
+                            "type": "trade_close",
+                            "mode": "LIVE",
+                            "symbol": symbol,
+                            "pnl": round(live_pnl, 2),
+                            "reason": decision.reason,
+                        })
+                        logger.info(f"[LIVE] 청산 {symbol} | PnL: ${live_pnl:.2f}")
+                        tg_notify(format_trade_close("🔥LIVE", symbol, live_pnl, decision.reason))
+
+        # 페이퍼 트레이더 가격 업데이트 (paper / dual)
+        if self.mode in ("paper", "dual"):
             price = float(df["close"].iloc[-1])
             self.paper_trader.update_prices({symbol: price})
             self.equity = self.paper_trader.equity
             self.total_pnl = self.equity - self.initial_capital
 
+            # 자기수정: stale 포지션 자동 청산 (4시간 이상 보유 + 수익 없으면)
+            if symbol in self.paper_trader.positions:
+                pos = self.paper_trader.positions[symbol]
+                age_minutes = (datetime.utcnow() - pos.entry_time).total_seconds() / 60
+                if age_minutes > 240 and pos.unrealized_pnl < 0:
+                    result = self.paper_trader.close_position(symbol, price, f"자기수정: {age_minutes:.0f}분 보유 + 손실")
+                    if result:
+                        self.risk_manager.record_pnl(result["pnl"])
+                        self.storage.save_trade({
+                            "exchange": exchange_name, "symbol": symbol, "side": "close",
+                            "price": price, "amount": result["size"], "pnl": result["pnl"],
+                            "fee": result["fee"], "strategy": "auto_close",
+                        })
+                        add_live_log({
+                            "time": datetime.utcnow().strftime("%H:%M:%S"),
+                            "type": "trade_close",
+                            "mode": "PAPER",
+                            "symbol": symbol,
+                            "pnl": round(result["pnl"], 2),
+                            "reason": f"자기수정: {age_minutes:.0f}분 stale 포지션 청산",
+                        })
+                        logger.info(f"[자기수정] PAPER stale 청산 {symbol} | PnL: ${result['pnl']:.2f} | {age_minutes:.0f}분 보유")
+                        tg_notify(format_trade_close("PAPER", symbol, result["pnl"], f"자기수정: stale 청산 ({age_minutes:.0f}분)"), silent=True)
+
+    @staticmethod
+    def _calculate_momentum(df) -> dict:
+        """가격 모멘텀 시그널 계산 (ML/RL fallback용)"""
+        try:
+            close = df["close"].values
+            if len(close) < 30:
+                return {"direction": "neutral", "strength": 0, "rsi": 50, "trend_aligned": False}
+
+            # EMA 크로스오버
+            ema_fast = df["close"].ewm(span=8).mean().values
+            ema_slow = df["close"].ewm(span=21).mean().values
+            ema_trend = df["close"].ewm(span=50).mean().values
+
+            ema_cross = (ema_fast[-1] - ema_slow[-1]) / ema_slow[-1]  # 양수=bullish
+
+            # 최근 N봉 모멘텀
+            returns_5 = (close[-1] - close[-5]) / close[-5] if len(close) >= 5 else 0
+            returns_10 = (close[-1] - close[-10]) / close[-10] if len(close) >= 10 else 0
+            returns_20 = (close[-1] - close[-20]) / close[-20] if len(close) >= 20 else 0
+
+            # RSI (14)
+            rsi = 50.0
+            if "rsi_14" in df.columns:
+                rsi_val = df["rsi_14"].iloc[-1]
+                if not np.isnan(rsi_val):
+                    rsi = float(rsi_val)
+            else:
+                delta = df["close"].diff()
+                gain = delta.where(delta > 0, 0).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain / (loss + 1e-10)
+                rsi = float(100 - (100 / (1 + rs.iloc[-1])))
+
+            # 볼륨 스파이크
+            vol_avg = df["volume"].rolling(20).mean().iloc[-1] if len(df) >= 20 else df["volume"].mean()
+            vol_spike = float(df["volume"].iloc[-1] / (vol_avg + 1e-10))
+
+            # 종합 모멘텀 점수
+            momentum_score = (
+                ema_cross * 10 * 0.3 +   # EMA 크로스 (큰 값으로 스케일)
+                returns_5 * 5 * 0.3 +     # 5봉 수익률
+                returns_10 * 3 * 0.2 +    # 10봉 수익률
+                returns_20 * 2 * 0.2      # 20봉 수익률
+            )
+
+            # 볼륨 스파이크 부스트
+            if vol_spike > 1.5:
+                momentum_score *= (1 + min((vol_spike - 1.5) * 0.3, 0.5))
+
+            # 방향 결정
+            if momentum_score > 0.1:
+                direction = "long"
+            elif momentum_score < -0.1:
+                direction = "short"
+            else:
+                direction = "neutral"
+
+            # 트렌드 일치 (50 EMA 위/아래)
+            trend_aligned = (
+                (direction == "long" and close[-1] > ema_trend[-1]) or
+                (direction == "short" and close[-1] < ema_trend[-1])
+            )
+
+            return {
+                "direction": direction,
+                "strength": round(float(momentum_score), 4),
+                "rsi": round(rsi, 1),
+                "trend_aligned": bool(trend_aligned),
+                "ema_cross": round(float(ema_cross), 6),
+                "returns_5": round(float(returns_5), 6),
+                "vol_spike": round(float(vol_spike), 2),
+            }
+        except Exception as e:
+            logger.debug(f"모멘텀 계산 실패: {e}")
+            return {"direction": "neutral", "strength": 0, "rsi": 50, "trend_aligned": False}
+
     def get_positions(self) -> list[dict]:
-        if self.mode == "paper":
-            return [
-                {
+        positions = []
+        if self.mode in ("paper", "dual"):
+            for p in self.paper_trader.positions.values():
+                positions.append({
+                    "mode": "PAPER",
                     "symbol": p.symbol, "side": p.side, "size": p.size,
                     "entry_price": p.entry_price, "unrealized_pnl": p.unrealized_pnl,
                     "stop_loss": p.stop_loss, "take_profit": p.take_profit,
-                }
-                for p in self.paper_trader.positions.values()
-            ]
-        return []
+                })
+        if self.mode in ("live", "dual"):
+            for name, om in self.order_managers.items():
+                for sym, pos in getattr(om, "positions", {}).items():
+                    positions.append({
+                        "mode": "LIVE",
+                        "symbol": sym, "side": pos.get("side", "?"),
+                        "size": pos.get("size", 0),
+                        "entry_price": pos.get("entry_price", 0),
+                        "unrealized_pnl": pos.get("unrealized_pnl", 0),
+                    })
+        return positions
 
     @property
     def uptime(self):
@@ -531,6 +793,11 @@ async def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config/default.yaml"
     trader = AutoTrader(config_path)
 
+    mode_label = "DUAL (Paper + Live)" if trader.dual_mode else trader.mode.upper()
+    logger.info(f"{'='*60}")
+    logger.info(f"AutoTrader AI 시작 — 모드: {mode_label}")
+    logger.info(f"{'='*60}")
+
     # 대시보드 상태 연결
     set_state(trader, trader.storage)
 
@@ -539,7 +806,9 @@ async def main():
     dash_thread = threading.Thread(
         target=uvicorn.run,
         args=(dashboard_app,),
-        kwargs={"host": dash_config.get("host", "0.0.0.0"), "port": dash_config.get("port", 8888), "log_level": "warning"},
+        kwargs={"host": dash_config.get("host", "0.0.0.0"),
+                "port": dash_config.get("port", 8888),
+                "log_level": "warning"},
         daemon=True,
     )
     dash_thread.start()
@@ -548,7 +817,15 @@ async def main():
     # 초기화
     await trader.initialize()
 
-    # 모드별 실행
+    if trader.dual_mode:
+        logger.info("Paper + Live 동시 학습 모드 활성화")
+        logger.info(f"  자본: ${trader.initial_capital}")
+        logger.info(f"  레버리지: {trader.config['risk']['dynamic_leverage']['base']}x "
+                     f"(min {trader.config['risk']['dynamic_leverage']['min']}x ~ "
+                     f"max {trader.config['risk']['dynamic_leverage']['max']}x)")
+        logger.info(f"  최소 주문: ${trader.min_order_notional} notional")
+
+    # 실행
     try:
         if trader.mode == "backtest":
             await trader.run_backtest()

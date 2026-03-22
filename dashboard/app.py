@@ -1,10 +1,11 @@
 """FastAPI 대시보드 서버"""
 
 import collections
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="AutoTrader AI Dashboard")
@@ -29,6 +30,18 @@ def set_state(trader, storage):
     _state["storage"] = storage
 
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint (from ralph-wiggum pattern)"""
+    trader = _state.get("trader")
+    return JSONResponse({
+        "success": True,
+        "status": "running" if trader else "no_trader",
+        "mode": getattr(trader, "mode", None) if trader else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = Path(__file__).parent / "static" / "index.html"
@@ -39,8 +52,9 @@ async def index():
 async def get_status():
     trader = _state.get("trader")
     if not trader:
-        return {"status": "not_running"}
+        return {"success": False, "status": "not_running"}
     return {
+        "success": True,
         "status": "running",
         "mode": getattr(trader, "mode", "unknown"),
         "uptime": str(getattr(trader, "uptime", "N/A")),
@@ -122,3 +136,28 @@ async def get_external():
 async def get_live_logs():
     """실시간 학습/거래 로그"""
     return {"logs": list(_live_logs)}
+
+
+@app.get("/api/strategy-optimization")
+async def get_strategy_optimization():
+    """전략 최적화 상태 (Paper + Live 각각)"""
+    trader = _state.get("trader")
+    empty = {"config": {}, "win_rate": 0, "total_trades": 0, "best_hour": None}
+    if not trader:
+        return {"paper": empty, "live": empty, "mode": "offline"}
+
+    result = {"mode": getattr(trader, "mode", "paper")}
+    for label, attr in [("paper", "strategy_optimizer_paper"),
+                         ("live", "strategy_optimizer_live")]:
+        opt = getattr(trader, attr, None)
+        if opt:
+            report = opt.get_report()
+            result[label] = {
+                "config": report.get("current_config", {}),
+                "win_rate": report.get("current_win_rate", 0) or 0,
+                "total_trades": report.get("total_trades", 0),
+                "best_hour": report.get("best_hour"),
+            }
+        else:
+            result[label] = empty
+    return result

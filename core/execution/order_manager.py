@@ -32,6 +32,7 @@ class OrderManager:
         self.exchange = exchange
         self.risk_config = risk_config
         self.positions: dict[str, Position] = {}
+        self._failed_attempts: dict[str, int] = {}  # 연속 실패 횟수
 
     async def open_position(
         self,
@@ -45,10 +46,21 @@ class OrderManager:
             logger.warning(f"{symbol} 이미 포지션 보유 중")
             return None
 
+        # 연속 3회 실패 시 10루프 동안 스킵
+        fails = self._failed_attempts.get(symbol, 0)
+        if fails >= 3 and fails < 13:
+            self._failed_attempts[symbol] = fails + 1
+            return None
+        elif fails >= 13:
+            self._failed_attempts[symbol] = 0  # 쿨다운 끝
+
         try:
             await self.exchange.set_leverage(symbol, leverage)
             price = await self.exchange.get_ticker_price(symbol)
-            amount = (size_usdt * leverage) / price
+            # 최소 notional 보장: 수량 올림 (Binance BTC 최소 단위 0.001)
+            import math
+            raw_amount = (size_usdt * leverage) / price
+            amount = math.ceil(raw_amount * 1000) / 1000  # 0.001 단위 올림
 
             order = await self.exchange.create_market_order(symbol, "buy" if side == "long" else "sell", amount)
             fill_price = float(order.get("average", price))
@@ -77,11 +89,13 @@ class OrderManager:
                 take_profit=take_profit,
             )
             self.positions[symbol] = position
+            self._failed_attempts.pop(symbol, None)
             logger.info(f"포지션 개시: {side} {amount:.6f} {symbol} @ {fill_price:.2f} | SL: {stop_loss:.2f} TP: {take_profit:.2f}")
             return position
 
         except Exception as e:
-            logger.error(f"포지션 개시 실패: {e}")
+            self._failed_attempts[symbol] = self._failed_attempts.get(symbol, 0) + 1
+            logger.error(f"포지션 개시 실패 (시도 {self._failed_attempts[symbol]}): {e}")
             return None
 
     async def close_position(self, symbol: str, reason: str = "") -> dict:

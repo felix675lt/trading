@@ -4,7 +4,7 @@ exchanges:
   binance:
     api_key: ${BINANCE_API_KEY}
     secret: ${BINANCE_SECRET}
-    testnet: true
+    testnet: false
     options:
       defaultType: future
   bybit:
@@ -17,29 +17,31 @@ exchanges:
 trading:
   symbols:
     - "BTC/USDT:USDT"
-    - "ETH/USDT:USDT"
   timeframes:
     - "5m"
     - "15m"
     - "1h"
     - "4h"
-  leverage: 5
-  mode: "paper"  # backtest / paper / live
+  leverage: 3
+  mode: "dual"  # backtest / paper / live / dual (Paper+Live 동시)
+  min_confidence: 0.30     # 최소 확신도 (적응형: 장기 hold 시 0.15까지 자동 하향)
+  signal_threshold: 0.08   # ML 시그널 방향 결정 임계값
 
 risk:
-  max_position_pct: 0.1
+  max_position_pct: 0.30        # $200 × 30% = $60 마진
+  min_order_notional: 100       # 거래소 최소 주문 보장 ($100 이상)
   max_daily_loss_pct: 0.05
   max_drawdown_pct: 0.15
   stop_loss_pct: 0.02
   take_profit_pct: 0.04
   max_open_positions: 3
-  cooldown_after_losses: 3    # N연패 후 쿨다운 발동
-  cooldown_minutes: 30        # 쿨다운 지속 시간 (분)
+  cooldown_after_losses: 2
+  cooldown_minutes: 30
   dynamic_leverage:
     enabled: true
-    base: 5                   # 기본 레버리지
-    min: 2                    # 최소 (불확실할 때)
-    max: 10                   # 최대 (확실할 때)
+    base: 3                     # $60 마진 × 3배 = $180 notional
+    min: 2                      # 최소 2배 ($60 × 2 = $120 notional)
+    max: 5                      # 최대 5배 ($60 × 5 = $300 notional)
 
 trailing_stop:
   activate_pct: 0.02    # 2% 수익 도달 시 트레일링 활성화
@@ -68,7 +70,7 @@ rl:
   reward_type: "sharpe"
 
 backtest:
-  initial_capital: 10000
+  initial_capital: 200
   commission_pct: 0.0004
   slippage_pct: 0.0001
   start_date: "2024-01-01"

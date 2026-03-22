@@ -33,7 +33,24 @@ class SelfLearningTrainer:
         self.rl_agent = rl_agent
         self.config = config
         self.feature_engineer = FeatureEngineer(config.get("ml", {}).get("features"))
-        self.last_train_time = datetime.utcnow() - timedelta(hours=999)
+        self._train_time_file = Path("models_saved/.last_train_time")
+        self.last_train_time = self._load_last_train_time()
+
+    def _load_last_train_time(self) -> datetime:
+        try:
+            if self._train_time_file.exists():
+                ts = self._train_time_file.read_text().strip()
+                return datetime.fromisoformat(ts)
+        except Exception:
+            pass
+        return datetime.utcnow() - timedelta(hours=999)
+
+    def _save_last_train_time(self):
+        try:
+            self._train_time_file.parent.mkdir(parents=True, exist_ok=True)
+            self._train_time_file.write_text(self.last_train_time.isoformat())
+        except Exception:
+            pass
 
     def should_retrain(self) -> bool:
         interval = self.config.get("ml", {}).get("retrain_interval_hours", 24)
@@ -91,6 +108,7 @@ class SelfLearningTrainer:
         )
 
         self.last_train_time = datetime.utcnow()
+        self._save_last_train_time()
         logger.info(f"=== 자기학습 사이클 완료 ===")
 
     async def run_continuous(self, exchange_name: str, symbols: list[str], timeframe: str = "1h"):
