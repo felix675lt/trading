@@ -29,6 +29,7 @@ from core.risk.manager import RiskManager
 from core.learning.feedback import AnomalyDetector, TradeFeedbackAnalyzer
 from core.strategy.adaptive import AdaptiveOptimizer, StrategyOptimizer
 from core.strategy.manager import StrategyManager
+from core.external.listing_detector import ListingDetector
 from dashboard.app import app as dashboard_app, set_state, add_live_log
 
 # Telegram 알림 (실패해도 트레이딩에 영향 없음)
@@ -94,6 +95,9 @@ class AutoTrader:
         # 최소 주문 notional (거래소 최소수량 충족용)
         self.min_order_notional = self.config["risk"].get("min_order_notional", 100)
 
+        # 상장 시그널 감지기
+        self.listing_detector = ListingDetector()
+
         # 상태
         self.equity = self.config.get("backtest", {}).get("initial_capital", 10000)
         self.initial_capital = self.equity
@@ -149,6 +153,12 @@ class AutoTrader:
             pass
 
         self.risk_manager.initialize(self.equity)
+
+        # 상장 감지기에 거래소 클라이언트 연결
+        if self.exchange_clients:
+            first_client = list(self.exchange_clients.values())[0]
+            self.listing_detector.exchange = first_client
+
         logger.info("AutoTrader 초기화 완료")
 
     async def run_backtest(self):
@@ -275,6 +285,42 @@ class AutoTrader:
 
                 for symbol in symbols:
                     await self._process_symbol(exchange_name, symbol, primary_tf)
+
+                # === 상장 시그널 스캔 (15분마다) ===
+                if self.listing_detector.exchange and loop_count % 30 == 0:
+                    try:
+                        listing_signals = await self.listing_detector.scan_signals()
+                        if listing_signals:
+                            tradeable = self.listing_detector.get_tradeable_signals(min_score=0.65)
+                            for sig in tradeable[:2]:  # 상위 2개만 거래 시도
+                                sym = sig["symbol"]
+                                if sym not in symbols:
+                                    # 동적으로 심볼 추가하여 처리
+                                    logger.info(
+                                        f"[ListingDetector] 🎯 {sig['coin']} ({sig['tier']}) "
+                                        f"score={sig['confidence']:.2f} → {sig['action']} "
+                                        f"사유: {', '.join(sig['reasons'])}"
+                                    )
+                                    add_live_log({
+                                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                                        "type": "listing_signal",
+                                        "message": f"🎯 상장시그널: {sig['coin']} ({sig['tier']}) "
+                                                   f"score={sig['confidence']:.2f} {', '.join(sig['reasons'])}",
+                                    })
+                                    # 시그널이 강하면 텔레그램 알림
+                                    if sig["confidence"] >= 0.75:
+                                        tg_notify(
+                                            f"🎯 <b>상장 시그널 감지</b>\n"
+                                            f"━━━━━━━━━━━━━\n"
+                                            f"코인: <b>{sig['coin']}</b> ({sig['tier']})\n"
+                                            f"점수: {sig['confidence']:.2f}\n"
+                                            f"방향: {sig['action']}\n"
+                                            f"사유: {', '.join(sig['reasons'])}"
+                                        )
+                            # 대시보드에 리포트 반영
+                            self.last_external["listing"] = self.listing_detector.get_report()
+                    except Exception as e:
+                        logger.debug(f"[ListingDetector] 스캔 실패: {e}")
 
                 loop_count += 1
                 if loop_count % 10 == 0:
