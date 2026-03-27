@@ -369,27 +369,47 @@ class AutoTrader:
         )
 
         # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
-        if decision.action in ["long", "short"] and mtf_signal.get("higher_tf_conflict"):
-            logger.info(f"[MTF] {symbol} 상위 TF 충돌 → 진입 보류")
-            decision = self.strategy_manager.decide(
-                ml_signal, 0, 0, current_position,
-                adaptive_params["regime"], external_signal=ext_signal,
-            )  # hold로 전환
-
-        # 5.2. MTF 합류 확인 시 확신도 부스트
         if decision.action in ["long", "short"]:
             mtf_agreement = mtf_signal.get("agreement", 0)
             mtf_dir = mtf_signal.get("direction", "neutral")
+            action_opposes_mtf = (
+                (decision.action == "long" and mtf_dir == "bearish") or
+                (decision.action == "short" and mtf_dir == "bullish")
+            )
             action_agrees_mtf = (
                 (decision.action == "long" and mtf_dir == "bullish") or
                 (decision.action == "short" and mtf_dir == "bearish")
             )
-            if action_agrees_mtf and mtf_agreement > 0.7:
+
+            # 강한 MTF 반대 (합의 75%+) → 진입 차단
+            if action_opposes_mtf and mtf_agreement >= 0.75:
+                logger.info(
+                    f"[MTF] {symbol} {decision.action} 차단 — "
+                    f"MTF {mtf_dir} 합의 {mtf_agreement:.0%} (conf={decision.confidence:.2f})"
+                )
+                decision.action = "hold"
+                decision.confidence = 0.0
+                decision.size = 0.0
+                decision.reason = f"MTF 강반대 차단 ({mtf_dir} {mtf_agreement:.0%})"
+
+            # 약한 MTF 반대 (50~75%) → 확신도 40% 감소
+            elif action_opposes_mtf and mtf_agreement >= 0.5:
+                decision.confidence *= 0.6
+                decision.reason += f" ! MTF반대({mtf_dir} {mtf_agreement:.0%})"
+                if decision.confidence < self.strategy_manager.min_confidence:
+                    decision.action = "hold"
+                    decision.size = 0.0
+                    decision.reason += " → 확신도부족"
+
+            # MTF 합류 확인 시 확신도 부스트
+            elif action_agrees_mtf and mtf_agreement > 0.7:
                 decision.confidence = min(decision.confidence * 1.15, 1.0)
                 decision.reason += " + MTF합류"
-            elif not action_agrees_mtf and mtf_dir != "neutral":
-                decision.confidence *= 0.8
-                decision.reason += f" ! MTF반대({mtf_dir})"
+
+            # 상위 TF 간 충돌 (4h vs 1h)
+            elif mtf_signal.get("higher_tf_conflict"):
+                decision.confidence *= 0.85
+                decision.reason += " ! TF충돌"
 
         self.last_signals = {
             "symbol": symbol,

@@ -99,14 +99,24 @@ class OrderManager:
             return None
 
     async def close_position(self, symbol: str, reason: str = "") -> dict:
-        """포지션 청산"""
+        """포지션 청산 — 실패 시 포지션 유지, 재시도 가능"""
         if symbol not in self.positions:
             return {}
 
         pos = self.positions[symbol]
         try:
             await self.exchange.cancel_all_orders(symbol)
-            order = await self.exchange.close_position(symbol)
+            # fallback으로 내부 포지션 정보 전달 → get_position 실패해도 청산 가능
+            order = await self.exchange.close_position(
+                symbol,
+                fallback_side=pos.side,
+                fallback_size=pos.size,
+            )
+
+            if not order:
+                logger.error(f"포지션 청산 주문 미실행 ({symbol}) — 포지션 유지, 다음 루프에서 재시도")
+                return {}
+
             fill_price = float(order.get("average", 0))
 
             pnl = 0.0
@@ -129,7 +139,7 @@ class OrderManager:
                 "reason": reason,
             }
         except Exception as e:
-            logger.error(f"포지션 청산 실패 ({symbol}): {e}")
+            logger.error(f"포지션 청산 실패 ({symbol}): {e} — 포지션 유지, 다음 루프에서 재시도")
             return {}
 
     async def update_positions(self):
