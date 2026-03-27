@@ -125,6 +125,21 @@ class ExchangeClient:
         except Exception as e:
             logger.warning(f"주문 취소 실패: {e}")
 
+    async def get_amount_precision(self, symbol: str) -> float:
+        """심볼의 최소 수량 단위(step size) 조회"""
+        if not self.exchange.markets:
+            await self.exchange.load_markets()
+        market = self.exchange.markets.get(symbol, {})
+        precision = market.get("precision", {}).get("amount", 0.001)
+        return precision
+
+    async def get_min_notional(self, symbol: str) -> float:
+        """심볼의 최소 주문 금액(notional) 조회"""
+        if not self.exchange.markets:
+            await self.exchange.load_markets()
+        market = self.exchange.markets.get(symbol, {})
+        return market.get("limits", {}).get("cost", {}).get("min", 5.0)
+
     async def get_ticker_price(self, symbol: str) -> float:
         ticker = await self.exchange.fetch_ticker(symbol)
         return float(ticker["last"])

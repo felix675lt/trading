@@ -57,10 +57,20 @@ class OrderManager:
         try:
             await self.exchange.set_leverage(symbol, leverage)
             price = await self.exchange.get_ticker_price(symbol)
-            # 최소 notional 보장: 수량 올림 (Binance BTC 최소 단위 0.001)
+
+            # 거래소에서 심볼별 수량 정밀도 및 최소 notional 조회
             import math
+            precision = await self.exchange.get_amount_precision(symbol)
+            step = precision if precision > 0 else 0.001
             raw_amount = (size_usdt * leverage) / price
-            amount = math.ceil(raw_amount * 1000) / 1000  # 0.001 단위 올림
+            # step size 단위로 올림
+            amount = math.ceil(raw_amount / step) * step
+
+            # 최소 notional 미달 시 수량 증가
+            min_notional = await self.exchange.get_min_notional(symbol)
+            notional = amount * price
+            if notional < min_notional:
+                amount = math.ceil(min_notional / price / step) * step
 
             order = await self.exchange.create_market_order(symbol, "buy" if side == "long" else "sell", amount)
             fill_price = float(order.get("average", price))
