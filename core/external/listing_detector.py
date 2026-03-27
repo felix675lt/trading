@@ -221,10 +221,8 @@ class ListingDetector:
 
         if signals:
             top3 = signals[:3]
-            logger.info(
-                f"[ListingDetector] 상장 시그널 {len(signals)}건 감지 | "
-                f"Top: {', '.join(f'{s[\"coin\"]}({s[\"score\"]:.2f})' for s in top3)}"
-            )
+            top_str = ", ".join(f"{s['coin']}({s['score']:.2f})" for s in top3)
+            logger.info(f"[ListingDetector] 상장 시그널 {len(signals)}건 감지 | Top: {top_str}")
 
         return signals
 

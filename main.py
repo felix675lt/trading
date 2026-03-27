@@ -283,8 +283,48 @@ class AutoTrader:
                     # 멀티타임프레임 합류 계산
                     mtf_result = self.external_manager.get_multi_tf_confluence()
 
-                for symbol in symbols:
-                    await self._process_symbol(exchange_name, symbol, primary_tf)
+                # === 집중 매매 모드: 모든 심볼 분석 후 최강 시그널 1개만 LIVE 진입 ===
+                concentration = self.config["trading"].get("concentration_mode", False)
+                max_live = self.config["trading"].get("max_concurrent_live", 1)
+                scalp_profiles = self.config["risk"].get("scalp_profiles", {})
+
+                if concentration:
+                    # 모든 심볼의 시그널 수집
+                    candidates = []
+                    for symbol in symbols:
+                        result = await self._analyze_symbol(exchange_name, symbol, primary_tf)
+                        if result and result.get("action") in ("long", "short"):
+                            # 종목별 프로파일로 TP/SL 동적 설정
+                            coin = symbol.split("/")[0]
+                            profile = scalp_profiles.get(coin, {})
+                            result["tp_pct"] = profile.get("tp_pct", self.config["risk"]["take_profit_pct"])
+                            result["sl_pct"] = profile.get("sl_pct", self.config["risk"]["stop_loss_pct"])
+                            result["priority"] = profile.get("priority", 5)
+                            candidates.append(result)
+
+                    # PAPER: 모든 시그널 실행 (학습용)
+                    for c in candidates:
+                        await self._execute_paper(c)
+
+                    # LIVE: 포지션 없을 때만, 가장 강한 시그널 1개 선택
+                    live_positions = sum(
+                        len(om.positions) for om in self.order_managers.values()
+                    )
+                    if live_positions < max_live and candidates:
+                        # 확신도 × (1 - priority/10) 로 최종 순위 결정
+                        best = max(
+                            candidates,
+                            key=lambda c: c["confidence"] * (1 - c["priority"] / 10),
+                        )
+                        await self._execute_live(exchange_name, best)
+                    elif live_positions >= max_live:
+                        # 기존 LIVE 포지션 관리 (TP/SL 체크)
+                        for om in self.order_managers.values():
+                            await om.update_positions()
+                else:
+                    # 기존 모드: 각 심볼 독립 매매
+                    for symbol in symbols:
+                        await self._process_symbol(exchange_name, symbol, primary_tf)
 
                 # === 상장 시그널 스캔 (15분마다) ===
                 if self.listing_detector.exchange and loop_count % 30 == 0:
@@ -741,6 +781,259 @@ class AutoTrader:
                         })
                         logger.info(f"[자기수정] PAPER stale 청산 {symbol} | PnL: ${result['pnl']:.2f} | {age_minutes:.0f}분 보유")
                         tg_notify(format_trade_close("PAPER", symbol, result["pnl"], f"자기수정: stale 청산 ({age_minutes:.0f}분)"), silent=True)
+
+    # =========================================================================
+    # 집중 매매 모드 메서드 (concentration_mode=true)
+    # =========================================================================
+
+    async def _analyze_symbol(self, exchange_name: str, symbol: str, timeframe: str) -> dict | None:
+        """심볼 분석만 수행하고 시그널 반환 (실행 X)"""
+        try:
+            df = await self.collector.fetch_ohlcv(exchange_name, symbol, timeframe, limit=200)
+            df = self.feature_engineer.generate(df)
+            feature_cols = self.feature_engineer.get_feature_columns(df)
+
+            if len(df) < 60:
+                return None
+
+            prices = df["close"].values
+            volumes = df["volume"].values
+            adaptive_params = self.adaptive.update(prices, volumes)
+
+            ml_signal = self.ensemble.predict(df)
+
+            base_feature_cols = self.feature_engineer.get_base_feature_columns(df)
+            rl_obs_data = df[base_feature_cols].values[-1].astype(np.float32)
+            rl_obs_data = np.nan_to_num(rl_obs_data, nan=0.0)
+            position_info = np.array([0.0, 0.0, self.equity / self.initial_capital, 0.0], dtype=np.float32)
+            obs = np.concatenate([rl_obs_data, position_info])
+            rl_action, rl_confidence = self.rl_agent.predict(obs)
+
+            ext_signal = self.external_manager.get_signal_for_strategy()
+            mtf_signal = self.external_manager.multi_tf.get_signal_for_strategy()
+            momentum_signal = self._calculate_momentum(df)
+
+            current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
+            decision = self.strategy_manager.decide(
+                ml_signal, rl_action, rl_confidence, current_position,
+                adaptive_params["regime"], external_signal=ext_signal,
+                momentum=momentum_signal,
+            )
+
+            # MTF 필터 적용
+            if decision.action in ["long", "short"]:
+                mtf_agreement = mtf_signal.get("agreement", 0)
+                mtf_dir = mtf_signal.get("direction", "neutral")
+                action_opposes_mtf = (
+                    (decision.action == "long" and mtf_dir == "bearish") or
+                    (decision.action == "short" and mtf_dir == "bullish")
+                )
+                action_agrees_mtf = (
+                    (decision.action == "long" and mtf_dir == "bullish") or
+                    (decision.action == "short" and mtf_dir == "bearish")
+                )
+                if action_opposes_mtf and mtf_agreement >= 0.75:
+                    decision.action = "hold"
+                    decision.confidence = 0.0
+                elif action_opposes_mtf and mtf_agreement >= 0.5:
+                    decision.confidence *= 0.6
+                elif action_agrees_mtf and mtf_agreement > 0.7:
+                    decision.confidence = min(decision.confidence * 1.15, 1.0)
+
+            price = float(df["close"].iloc[-1])
+            volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
+
+            # 동적 레버리지
+            ext_agrees = (
+                (decision.action == "long" and ext_signal.get("direction") == "bullish") or
+                (decision.action == "short" and ext_signal.get("direction") == "bearish")
+            )
+            dynamic_lev = self.risk_manager.calculate_dynamic_leverage(
+                confidence=decision.confidence,
+                volatility=volatility,
+                regime=adaptive_params["regime"],
+                external_agreement=ext_agrees,
+            )
+
+            # 포지션 크기 (풀시드)
+            fb_scale = self.feedback.get_position_scale(adaptive_params["regime"], decision.action)
+            size = self.risk_manager.calculate_position_size(
+                self.equity, decision.confidence, volatility,
+                adaptive_params["position_scale"] * fb_scale,
+            )
+
+            # 최소 notional 보장
+            notional = size * dynamic_lev
+            min_notional = self.min_order_notional * 1.05
+            if notional < min_notional:
+                size = max(size, min_notional / dynamic_lev)
+                size = min(size, self.equity * 0.95)
+                notional = size * dynamic_lev
+
+            # 로그
+            add_live_log({
+                "time": datetime.utcnow().strftime("%H:%M:%S"),
+                "type": "analysis",
+                "symbol": symbol,
+                "price": price,
+                "action": decision.action,
+                "confidence": round(decision.confidence, 3),
+                "ml_dir": ml_signal.get("direction", "?"),
+                "rl_action": ["hold", "long", "short", "close"][rl_action],
+                "mom_dir": momentum_signal.get("direction", "?"),
+                "regime": adaptive_params["regime"],
+                "reason": decision.reason,
+                "min_conf": round(self.strategy_manager.min_confidence, 3),
+                "holds": self.strategy_manager._consecutive_holds,
+            })
+
+            self.last_signals = {
+                "symbol": symbol,
+                "direction": decision.action,
+                "confidence": decision.confidence,
+                "regime": adaptive_params["regime"],
+                "reason": decision.reason,
+                "momentum": momentum_signal,
+                "diagnostics": self.strategy_manager.get_diagnostics(),
+            }
+
+            # 페이퍼 트레이더 가격 업데이트
+            if self.mode in ("paper", "dual"):
+                self.paper_trader.update_prices({symbol: price})
+                self.equity = self.paper_trader.equity
+                self.total_pnl = self.equity - self.initial_capital
+
+            if decision.action not in ("long", "short", "close"):
+                return None
+
+            return {
+                "symbol": symbol,
+                "exchange_name": exchange_name,
+                "action": decision.action,
+                "confidence": decision.confidence,
+                "size": size,
+                "price": price,
+                "dynamic_lev": dynamic_lev,
+                "notional": notional,
+                "reason": decision.reason,
+                "volatility": volatility,
+                "regime": adaptive_params["regime"],
+                "adaptive_params": adaptive_params,
+                "ml_signal": ml_signal,
+                "ext_signal": ext_signal,
+                "df": df,
+            }
+
+        except Exception as e:
+            logger.debug(f"[집중분석] {symbol} 분석 실패: {e}")
+            return None
+
+    async def _execute_paper(self, c: dict):
+        """PAPER 포지션 실행"""
+        symbol = c["symbol"]
+        if self.mode not in ("paper", "dual"):
+            return
+        if c["action"] in ("long", "short"):
+            if symbol not in self.paper_trader.positions:
+                tp_pct = c.get("tp_pct", self.config["risk"]["take_profit_pct"])
+                sl_pct = c.get("sl_pct", self.config["risk"]["stop_loss_pct"])
+                self.paper_trader.open_position(
+                    symbol, c["action"], c["size"], c["price"],
+                    leverage=c["dynamic_lev"],
+                    sl_pct=sl_pct * c["adaptive_params"]["stop_loss_mult"],
+                    tp_pct=tp_pct,
+                )
+                logger.info(
+                    f"[PAPER] {c['action'].upper()} {symbol} | "
+                    f"${c['size']:.2f} × {c['dynamic_lev']}x = ${c['notional']:.2f} | "
+                    f"{c['reason']}"
+                )
+                add_live_log({
+                    "time": datetime.utcnow().strftime("%H:%M:%S"),
+                    "type": "trade_open",
+                    "mode": "PAPER",
+                    "symbol": symbol,
+                    "action": c["action"],
+                    "size": round(c["size"], 2),
+                    "price": c["price"],
+                    "leverage": c["dynamic_lev"],
+                    "notional": round(c["notional"], 2),
+                    "reason": c["reason"],
+                })
+                tg_notify(format_trade_open("PAPER", symbol, c["action"], c["price"], c["notional"], c["dynamic_lev"], c["reason"]), silent=True)
+        elif c["action"] == "close" and symbol in self.paper_trader.positions:
+            result = self.paper_trader.close_position(symbol, c["price"], c["reason"])
+            if result:
+                self.risk_manager.record_pnl(result["pnl"])
+                logger.info(f"[PAPER] 청산 {symbol} | PnL: ${result['pnl']:.2f}")
+                tg_notify(format_trade_close("PAPER", symbol, result["pnl"], c["reason"], result.get("duration_minutes", 0)), silent=True)
+
+    async def _execute_live(self, exchange_name: str, c: dict):
+        """LIVE 포지션 실행 — 가장 강한 시그널에만"""
+        if self.mode not in ("live", "dual"):
+            return
+        symbol = c["symbol"]
+        om = self.order_managers.get(exchange_name)
+        if not om:
+            return
+
+        if c["action"] in ("long", "short") and symbol not in om.positions:
+            # LIVE는 실제 거래소 잔고 기준 사이즈 조정
+            try:
+                balance = await om.exchange.get_balance()
+                live_free = balance.get("free", 0)
+                # 가용 잔고의 90% 사용 (수수료 여유분)
+                live_size = live_free * 0.90
+                if live_size < self.min_order_notional / c["dynamic_lev"]:
+                    logger.warning(f"[LIVE] 잔고 부족: ${live_free:.2f} (필요: ${self.min_order_notional / c['dynamic_lev']:.2f})")
+                    return
+                c["size"] = live_size
+                c["notional"] = live_size * c["dynamic_lev"]
+            except Exception as e:
+                logger.warning(f"[LIVE] 잔고 조회 실패: {e}")
+
+            result = await om.open_position(symbol, c["action"], c["size"], c["dynamic_lev"])
+            if result:
+                coin = symbol.split("/")[0]
+                logger.info(
+                    f"[LIVE🔥] {c['action'].upper()} {symbol} | "
+                    f"${c['size']:.2f} × {c['dynamic_lev']}x = ${c['notional']:.2f} | "
+                    f"TP: {c.get('tp_pct', 0.012)*100:.1f}% SL: {c.get('sl_pct', 0.008)*100:.1f}% | "
+                    f"{c['reason']}"
+                )
+                add_live_log({
+                    "time": datetime.utcnow().strftime("%H:%M:%S"),
+                    "type": "trade_open",
+                    "mode": "LIVE",
+                    "symbol": symbol,
+                    "action": c["action"],
+                    "size": round(c["size"], 2),
+                    "price": c["price"],
+                    "leverage": c["dynamic_lev"],
+                    "notional": round(c["notional"], 2),
+                    "reason": f"[집중매매] {c['reason']}",
+                })
+                tg_notify(format_trade_open(
+                    "🔥LIVE 집중", symbol, c["action"], c["price"],
+                    c["notional"], c["dynamic_lev"],
+                    f"TP:{c.get('tp_pct',0.012)*100:.1f}% SL:{c.get('sl_pct',0.008)*100:.1f}% | {c['reason']}"
+                ))
+            else:
+                logger.warning(f"[LIVE] {symbol} 주문 실패")
+        elif c["action"] == "close" and symbol in om.positions:
+            live_result = await om.close_position(symbol, c["reason"])
+            if live_result:
+                live_pnl = live_result.get("pnl", 0) if isinstance(live_result, dict) else 0
+                logger.info(f"[LIVE] 청산 {symbol} | PnL: ${live_pnl:.2f}")
+                add_live_log({
+                    "time": datetime.utcnow().strftime("%H:%M:%S"),
+                    "type": "trade_close",
+                    "mode": "LIVE",
+                    "symbol": symbol,
+                    "pnl": round(live_pnl, 2),
+                    "reason": c["reason"],
+                })
+                tg_notify(format_trade_close("🔥LIVE", symbol, live_pnl, c["reason"]))
 
     @staticmethod
     def _calculate_momentum(df) -> dict:

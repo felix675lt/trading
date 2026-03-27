@@ -1,4 +1,5 @@
 # AutoTrader AI Configuration
+# === 소시드 집중 스캘핑 모드 ($188) ===
 
 exchanges:
   binance:
@@ -30,26 +31,56 @@ trading:
   min_confidence: 0.30     # 최소 확신도 (적응형: 장기 hold 시 0.15까지 자동 하향)
   signal_threshold: 0.08   # ML 시그널 방향 결정 임계값
 
+  # === 집중 매매 모드 ===
+  # 소시드($188)에서는 분산 X → 가장 강한 신호 1개에 풀시드 집중
+  concentration_mode: true
+  max_concurrent_live: 1   # LIVE: 한 번에 1포지션만 (풀시드 올인)
+  max_concurrent_paper: 4  # PAPER: 학습용으로 다중 가능
+
 risk:
-  max_position_pct: 0.20        # $188 × 20% = $37.60 마진 (멀티심볼 분산)
-  min_order_notional: 5         # 알트코인 최소 $5 (BTC: $37.60 × 3x = $112.80 > $100)
-  max_daily_loss_pct: 0.05
-  max_drawdown_pct: 0.15
-  stop_loss_pct: 0.02
-  take_profit_pct: 0.04
-  max_open_positions: 4         # 심볼당 최대 1포지션
+  max_position_pct: 0.95        # 풀시드 집중: $188 × 95% = $178.6 마진
+  min_order_notional: 5         # 알트코인 최소 $5
+  max_daily_loss_pct: 0.05      # 일 최대 손실 5%
+  max_drawdown_pct: 0.15        # MDD 15%
+  stop_loss_pct: 0.008          # 0.8% SL (3x → 실질 2.4% 손실)
+  take_profit_pct: 0.012        # 1.2% TP (3x → 실질 3.6% 수익)
+  max_open_positions: 1         # LIVE 1포지션 제한
   cooldown_after_losses: 2
   cooldown_minutes: 30
   dynamic_leverage:
     enabled: true
-    base: 3                     # $60 마진 × 3배 = $180 notional
-    min: 2                      # 최소 2배 ($60 × 2 = $120 notional)
-    max: 5                      # 최대 5배 ($60 × 5 = $300 notional)
+    base: 3                     # $188 × 3x = $564 notional
+    min: 2                      # 약한 시그널: 2x ($376)
+    max: 5                      # 강한 시그널: 5x ($940)
+
+  # === 종목별 스캘핑 프로파일 ===
+  scalp_profiles:
+    BTC:
+      tp_pct: 0.010       # 1.0% TP (안정)
+      sl_pct: 0.007       # 0.7% SL
+      priority: 2          # 2순위 (변동성 낮음)
+    ETH:
+      tp_pct: 0.012       # 1.2% TP
+      sl_pct: 0.008       # 0.8% SL
+      priority: 3
+    SOL:
+      tp_pct: 0.015       # 1.5% TP (공격적)
+      sl_pct: 0.010       # 1.0% SL
+      priority: 1          # 1순위 (변동성 높고 유동성 충분)
+    DOGE:
+      tp_pct: 0.015       # 1.5% TP
+      sl_pct: 0.010       # 1.0% SL
+      priority: 4
+    # 상장 시그널 코인
+    LISTING:
+      tp_pct: 0.050       # 5.0% TP (큰 움직임 기대)
+      sl_pct: 0.020       # 2.0% SL
+      priority: 0          # 최우선
 
 trailing_stop:
-  activate_pct: 0.02    # 2% 수익 도달 시 트레일링 활성화
-  distance_pct: 0.015   # 최고점에서 1.5% 하락 시 청산
-  step_pct: 0.005        # SL을 0.5% 단위로 끌어올림
+  activate_pct: 0.008    # 0.8% 수익 시 트레일링 활성화 (스캘핑용)
+  distance_pct: 0.005    # 최고점에서 0.5% 하락 시 청산
+  step_pct: 0.003        # SL을 0.3% 단위로 끌어올림
 
 ml:
   retrain_interval_hours: 24
