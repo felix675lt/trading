@@ -21,6 +21,7 @@ from .seasonal_cycle import SeasonalCycleAnalyzer
 from .derivatives_data import DerivativesDataCollector
 from .multi_timeframe import MultiTimeframeAnalyzer
 from .crypto_twitter import CryptoTwitterCollector
+from .polymarket import PolymarketCollector
 
 
 class ExternalDataManager:
@@ -55,6 +56,9 @@ class ExternalDataManager:
         # 실시간 소셜 (Stocktwits + CryptoNews AI)
         self.crypto_twitter = CryptoTwitterCollector()
 
+        # 예측 시장 (Polymarket 내부자 베팅 패턴)
+        self.polymarket = PolymarketCollector()
+
         self.enabled = config.get("enabled", True)
         self.weight = config.get("weight", 0.3)
 
@@ -83,6 +87,7 @@ class ExternalDataManager:
                 self.social.fetch(),
                 self.derivatives.collect(binance_symbol),
                 self.crypto_twitter.fetch(short_symbol),
+                self.polymarket.fetch(),
                 return_exceptions=True,
             )
 
@@ -110,6 +115,9 @@ class ExternalDataManager:
                         twitter_features = v
                         break
 
+            # Polymarket 시그널
+            polymarket_features = self.polymarket.get_features()
+
             # 계절 시그널 업데이트
             self.seasonal.get_seasonal_signal()
 
@@ -124,6 +132,7 @@ class ExternalDataManager:
                 **seasonal_features,
                 **derivatives_features,
                 **twitter_features,
+                **polymarket_features,
             }
 
             # 종합 외부 신호 계산
@@ -131,6 +140,7 @@ class ExternalDataManager:
                 fg_features, onchain_features, macro_features,
                 sentiment_features, news_features, social_features,
                 seasonal_features, derivatives_features, twitter_features,
+                polymarket_features,
             )
 
             self.last_update = datetime.utcnow()
@@ -140,6 +150,9 @@ class ExternalDataManager:
             seasonal_sig = self.seasonal.current_signal
 
             twitter_sig = self.crypto_twitter.get_signal()
+            poly_sig = self.polymarket.get_signal()
+            poly_markets = poly_sig.get("polymarket_markets_monitored", 0)
+            poly_sc = poly_sig.get("polymarket_score", 0)
             logger.info(
                 f"[External] 종합신호: {self.composite_signal['score']:.2f} | "
                 f"공포탐욕: {fg_features.get('fg_value', 50):.0f} | "
@@ -148,7 +161,8 @@ class ExternalDataManager:
                 f"펀딩비: {derivatives_features.get('deriv_funding_rate', 0):.1f}bp | "
                 f"롱숏비: {derivatives_features.get('deriv_global_ls_ratio', 1):.2f} | "
                 f"계절: {seasonal_sig.get('direction', '?')}({seasonal_sig.get('score', 0):.2f}) | "
-                f"반감기: {seasonal_sig.get('halving_phase', '?')}"
+                f"반감기: {seasonal_sig.get('halving_phase', '?')} | "
+                f"PM: {poly_sc:.2f}({poly_markets}건)"
             )
 
             return self.composite_signal
@@ -169,21 +183,24 @@ class ExternalDataManager:
         self, fg: dict, onchain: dict, macro: dict,
         sentiment: dict, news: dict, social: dict,
         seasonal: dict, derivatives: dict, twitter: dict | None = None,
+        polymarket: dict | None = None,
     ) -> dict:
         """
-        종합 외부 신호 계산 (v3 - 트위터/소셜 통합)
+        종합 외부 신호 계산 (v4 - Polymarket 내부자 시그널 추가)
 
         가중치 (총 100%):
-        - 파생상품 (펀딩비/OI/롱숏): 20% ← 선물 핵심
-        - 크립토 트위터/Stocktwits:   20% ← 실시간 소셜 (신규)
-        - 계절 사이클:                12% ← 10년 검증 패턴
+        - 파생상품 (펀딩비/OI/롱숏): 18% ← 선물 핵심
+        - 크립토 트위터/Stocktwits:   18% ← 실시간 소셜
+        - Polymarket 예측 시장:        8% ← 내부자 베팅 패턴 (신규)
+        - 계절 사이클:                10% ← 10년 검증 패턴
         - Fear & Greed:              12% (역발상 + 순방향)
-        - NLP 센티먼트:              12%
+        - NLP 센티먼트:              10%
         - 매크로:                     8%
         - 온체인:                     8%
         - Reddit 소셜:               8%
         """
         twitter = twitter or {}
+        polymarket = polymarket or {}
 
         # 각 카테고리 점수 (-1 ~ 1)
         fg_score = fg.get("fg_normalized", 0)
@@ -208,18 +225,31 @@ class ExternalDataManager:
         # 크립토 트위터 시그널 (Stocktwits + AI 센티먼트 + 이벤트)
         twitter_score = twitter.get("twitter_composite", 0)
 
-        # 가중 평균 (v3)
+        # Polymarket 시그널 (예측 시장 내부자 베팅 패턴)
+        poly_score = polymarket.get("polymarket_score", 0)
+        poly_confidence = polymarket.get("polymarket_confidence", 0)
+
+        # 가중 평균 (v4 - Polymarket 추가)
         composite = (
-            deriv_score * 0.20 +             # 파생상품
-            twitter_score * 0.20 +           # 크립토 트위터 (신규)
-            seasonal_score * 0.12 +          # 계절 사이클
+            deriv_score * 0.18 +             # 파생상품
+            twitter_score * 0.18 +           # 크립토 트위터
+            poly_score * 0.08 +              # Polymarket 예측 시장 (신규)
+            seasonal_score * 0.10 +          # 계절 사이클
             fg_contrarian * 0.07 +           # 역발상 공포탐욕
             fg_score * 0.05 +                # 순방향 공포탐욕
-            sentiment_score * 0.12 +         # NLP 센티먼트
+            sentiment_score * 0.10 +         # NLP 센티먼트
             macro_score * 0.08 +             # 매크로
             onchain_score * 0.08 +           # 온체인
             social_score * 0.08              # Reddit 소셜
         )
+
+        # Polymarket 강한 시그널 시 추가 부스트
+        # (확신도 높고 방향 일치하면 composite 강화)
+        if poly_confidence > 0.5 and abs(poly_score) > 0.3:
+            if (poly_score > 0 and composite > 0) or (poly_score < 0 and composite < 0):
+                composite *= 1.15  # 같은 방향이면 15% 부스트
+            elif (poly_score > 0 and composite < -0.1) or (poly_score < 0 and composite > 0.1):
+                composite *= 0.85  # 반대 방향이면 약화
 
         # 이벤트 임팩트 보정
         high_impact = sentiment.get("high_impact_count", 0)
@@ -263,6 +293,7 @@ class ExternalDataManager:
             "components": {
                 "derivatives": round(deriv_score, 3),
                 "twitter": round(twitter_score, 3),
+                "polymarket": round(poly_score, 3),
                 "seasonal": round(seasonal_score, 3),
                 "fear_greed": round(fg_score, 3),
                 "sentiment": round(sentiment_score, 3),
@@ -310,5 +341,6 @@ class ExternalDataManager:
             "derivatives": self.derivatives.get_report(),
             "seasonal": self.seasonal.get_report(),
             "multi_timeframe": self.multi_tf.get_report(),
+            "polymarket": self.polymarket.get_report(),
             "feature_count": len(self.all_features),
         }
