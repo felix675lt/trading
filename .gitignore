@@ -11,3 +11,5 @@ models_saved/
 *.pyc
 .venv/
 venv/
+trading/
+.DS_Store

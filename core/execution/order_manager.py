@@ -113,7 +113,6 @@ class OrderManager:
                     take_profit = entry_price * (1 - tp_pct)
 
                 # 기존 대기 주문 확인
-                import math
                 open_orders = []
                 try:
                     open_orders = await self.exchange.exchange.fetch_open_orders(symbol)

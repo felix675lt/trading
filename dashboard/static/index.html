@@ -5,44 +5,124 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AutoTrader AI Dashboard</title>
     <style>
+        /* === CSS Variables (from ralph-wiggum pattern) === */
+        :root {
+            --bg-primary: #0a0e17;
+            --bg-card: #141b2d;
+            --border: #1e293b;
+            --text-primary: #e0e0e0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent: #60a5fa;
+            --positive: #34d399;
+            --negative: #f87171;
+            --neutral: #fbbf24;
+            --purple: #a78bfa;
+            --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.4);
+            --radius: 12px;
+            --toast-success: #10b981;
+            --toast-error: #ef4444;
+            --toast-warning: #f59e0b;
+            --toast-info: #3b82f6;
+        }
+
+        /* === Base === */
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', sans-serif; background: #0a0e17; color: #e0e0e0; }
-        .header { background: #141b2d; padding: 20px 30px; border-bottom: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center; }
-        .header h1 { font-size: 24px; color: #60a5fa; }
-        .status { padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background: var(--bg-primary); color: var(--text-primary); }
+
+        /* === Animations (from ralph-wiggum) === */
+        @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideInRight { from { transform: translateX(400px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        @keyframes slideOutRight { from { transform: translateX(0); opacity: 1; } to { transform: translateX(400px); opacity: 0; } }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+        /* === Header === */
+        .header {
+            background: var(--bg-card);
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            box-shadow: var(--shadow-md);
+        }
+        .header h1 { font-size: 22px; color: var(--accent); font-weight: 700; }
+        .header-right { display: flex; align-items: center; gap: 12px; }
+        .status { padding: 5px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; letter-spacing: 0.5px; }
         .status.running { background: #065f46; color: #6ee7b7; }
-        .status.stopped { background: #7f1d1d; color: #fca5a5; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; padding: 20px 30px; }
-        .card { background: #141b2d; border-radius: 12px; padding: 20px; border: 1px solid #1e293b; }
-        .card h2 { font-size: 15px; color: #94a3b8; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
+        .status.stopped { background: #7f1d1d; color: #fca5a5; animation: pulse 2s infinite; }
+        .uptime { font-size: 11px; color: var(--text-muted); }
+
+        /* === Grid === */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 16px;
+            padding: 16px 24px;
+            animation: fadeIn 0.5s ease-out;
+        }
+
+        /* === Cards === */
+        .card {
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            padding: 18px;
+            border: 1px solid var(--border);
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .card:hover { border-color: #334155; box-shadow: var(--shadow-md); }
+        .card h2 { font-size: 13px; color: var(--text-secondary); margin-bottom: 14px; text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600; }
         .card.external { border-color: #7c3aed33; }
-        .card.external h2 { color: #a78bfa; }
-        .metric { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1e293b; }
+        .card.external:hover { border-color: #7c3aed66; }
+        .card.external h2 { color: var(--purple); }
+
+        /* === Metrics === */
+        .metric { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--border); }
         .metric:last-child { border-bottom: none; }
-        .metric .label { color: #94a3b8; font-size: 14px; }
-        .metric .value { font-size: 14px; font-weight: 600; }
-        .positive { color: #34d399; }
-        .negative { color: #f87171; }
-        .neutral { color: #fbbf24; }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th { text-align: left; padding: 10px 8px; color: #64748b; border-bottom: 1px solid #1e293b; }
-        td { padding: 8px; border-bottom: 1px solid #1e293b; }
+        .metric .label { color: var(--text-secondary); font-size: 13px; }
+        .metric .value { font-size: 13px; font-weight: 600; }
+        .positive { color: var(--positive); }
+        .negative { color: var(--negative); }
+        .neutral { color: var(--neutral); }
+
+        /* === Tables === */
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th { text-align: left; padding: 8px 6px; color: var(--text-muted); border-bottom: 1px solid var(--border); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
+        td { padding: 7px 6px; border-bottom: 1px solid var(--border); }
+        tr { transition: background 0.15s; }
+        tr:hover { background: rgba(30, 41, 59, 0.5); }
         .wide { grid-column: 1 / -1; }
-        .signal-bar { height: 8px; background: #1e293b; border-radius: 4px; overflow: hidden; margin-top: 5px; }
-        .signal-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+
+        /* === Signal Bar === */
+        .signal-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 5px; }
+        .signal-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease, background 0.3s; }
+
+        /* === Gauge === */
         .gauge { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
-        .gauge-bar { flex: 1; height: 12px; background: linear-gradient(to right, #f87171, #fbbf24, #34d399); border-radius: 6px; position: relative; }
-        .gauge-marker { width: 4px; height: 18px; background: #fff; border-radius: 2px; position: absolute; top: -3px; transition: left 0.3s; }
-        .gauge-label { font-size: 12px; color: #94a3b8; min-width: 40px; }
-        .component-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
-        .component-item { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
-        .component-item .name { color: #94a3b8; }
+        .gauge-bar { flex: 1; height: 12px; background: linear-gradient(to right, var(--negative), var(--neutral), var(--positive)); border-radius: 6px; position: relative; }
+        .gauge-marker { width: 4px; height: 18px; background: #fff; border-radius: 2px; position: absolute; top: -3px; transition: left 0.5s ease; }
+        .gauge-label { font-size: 11px; color: var(--text-muted); min-width: 35px; }
+
+        /* === Components Grid === */
+        .component-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 12px; }
+        .component-item { display: flex; justify-content: space-between; padding: 4px 0; font-size: 12px; }
+        .component-item .name { color: var(--text-secondary); }
         .component-item .score { font-weight: 600; }
-        .log-container { max-height: 400px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 12px; }
-        .log-entry { padding: 6px 8px; border-bottom: 1px solid #1e293b; display: flex; gap: 10px; align-items: flex-start; }
-        .log-entry:hover { background: #1e293b; }
-        .log-time { color: #64748b; min-width: 70px; flex-shrink: 0; }
-        .log-type { min-width: 80px; flex-shrink: 0; padding: 1px 6px; border-radius: 4px; text-align: center; font-size: 11px; font-weight: 600; }
+
+        /* === Log Container === */
+        .log-container { max-height: 400px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 11px; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+        .log-container::-webkit-scrollbar { width: 6px; }
+        .log-container::-webkit-scrollbar-track { background: transparent; }
+        .log-container::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        .log-entry { padding: 5px 8px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: flex-start; animation: slideIn 0.3s ease-out; }
+        .log-entry:hover { background: var(--border); }
+        .log-time { color: var(--text-muted); min-width: 62px; flex-shrink: 0; }
+        .log-type { min-width: 76px; flex-shrink: 0; padding: 1px 6px; border-radius: 4px; text-align: center; font-size: 10px; font-weight: 600; }
         .log-type.analysis { background: #1e3a5f; color: #60a5fa; }
         .log-type.trade_open { background: #064e3b; color: #6ee7b7; }
         .log-type.trade_close_win { background: #064e3b; color: #34d399; }
@@ -50,12 +130,66 @@
         .log-type.retrain { background: #78350f; color: #fbbf24; }
         .log-type.external { background: #4c1d95; color: #a78bfa; }
         .log-msg { color: #cbd5e1; flex: 1; word-break: break-word; }
+
+        /* === Toast Notifications (from ralph-wiggum) === */
+        .toast-container { position: fixed; top: 16px; right: 16px; z-index: 10000; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+        .toast {
+            padding: 12px 20px;
+            border-radius: 8px;
+            color: white;
+            font-weight: 600;
+            font-size: 13px;
+            box-shadow: var(--shadow-lg);
+            animation: slideInRight 0.3s ease-out;
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            max-width: 360px;
+        }
+        .toast.success { background: var(--toast-success); }
+        .toast.error { background: var(--toast-error); }
+        .toast.warning { background: var(--toast-warning); }
+        .toast.info { background: var(--toast-info); }
+        .toast.exiting { animation: slideOutRight 0.3s ease-out forwards; }
+        .toast-icon { font-size: 16px; flex-shrink: 0; }
+
+        /* === Connection Indicator === */
+        .conn-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+        .conn-dot.ok { background: var(--positive); box-shadow: 0 0 6px var(--positive); }
+        .conn-dot.fail { background: var(--negative); box-shadow: 0 0 6px var(--negative); animation: pulse 1.5s infinite; }
+
+        /* === Responsive (from ralph-wiggum) === */
+        @media (max-width: 768px) {
+            .header { padding: 12px 16px; }
+            .header h1 { font-size: 18px; }
+            .grid { padding: 12px 16px; gap: 12px; grid-template-columns: 1fr; }
+            .card { padding: 14px; }
+            .component-grid { grid-template-columns: 1fr; }
+            .log-container { max-height: 300px; font-size: 10px; }
+            .log-time { min-width: 50px; }
+            .log-type { min-width: 60px; font-size: 9px; }
+            .toast-container { right: 8px; left: 8px; }
+            .toast { max-width: 100%; }
+        }
+        @media (max-width: 480px) {
+            .header h1 { font-size: 16px; }
+            .uptime { display: none; }
+            table { font-size: 11px; }
+            th, td { padding: 5px 4px; }
+        }
     </style>
 </head>
 <body>
+    <!-- Toast Container (from ralph-wiggum) -->
+    <div class="toast-container" id="toast-container"></div>
+
     <div class="header">
         <h1>AutoTrader AI</h1>
-        <span class="status stopped" id="status-badge">Connecting...</span>
+        <div class="header-right">
+            <span class="uptime" id="uptime"></span>
+            <span class="status stopped" id="status-badge"><span class="conn-dot fail"></span>Connecting...</span>
+        </div>
     </div>
 
     <div class="grid">
@@ -82,15 +216,17 @@
             <div id="signals-info">
                 <div class="metric"><span class="label">Direction</span><span class="value" id="signal-dir">-</span></div>
                 <div class="metric"><span class="label">Confidence</span><span class="value" id="signal-conf">-</span></div>
-                <div class="metric">
-                    <span class="label">Signal Strength</span>
-                    <span class="value" id="signal-val">-</span>
-                </div>
-                <div class="signal-bar"><div class="signal-fill" id="signal-bar" style="width:50%;background:#fbbf24"></div></div>
+                <div class="metric"><span class="label">Signal Strength</span><span class="value" id="signal-val">-</span></div>
+                <div class="signal-bar"><div class="signal-fill" id="signal-bar" style="width:50%;background:var(--neutral)"></div></div>
+                <div class="metric"><span class="label">Regime</span><span class="value" id="signal-regime">-</span></div>
+                <div class="metric"><span class="label">Momentum</span><span class="value" id="signal-mom">-</span></div>
+                <div class="metric"><span class="label">RSI</span><span class="value" id="signal-rsi">-</span></div>
+                <div class="metric"><span class="label">Min Confidence</span><span class="value" id="signal-minconf">-</span></div>
+                <div class="metric"><span class="label">Holds</span><span class="value" id="signal-holds">-</span></div>
             </div>
         </div>
 
-        <!-- 외부 데이터 분석 카드 -->
+        <!-- External Factors -->
         <div class="card external">
             <h2>External Factors</h2>
             <div id="external-info">
@@ -128,7 +264,7 @@
                 <div class="component-item"><span class="name">Social</span><span class="score" id="comp-social">-</span></div>
                 <div class="component-item"><span class="name">Features</span><span class="score" id="comp-features">-</span></div>
             </div>
-            <div class="metric" style="margin-top:10px">
+            <div class="metric" style="margin-top:8px">
                 <span class="label">News</span>
                 <span class="value" id="ext-news-count">-</span>
             </div>
@@ -140,23 +276,38 @@
 
         <div class="card external">
             <h2>External Signal Reason</h2>
-            <div id="ext-reason" style="font-size:13px;color:#94a3b8;line-height:1.6">
+            <div id="ext-reason" style="font-size:12px;color:var(--text-secondary);line-height:1.6">
                 Waiting for data...
             </div>
+        </div>
+
+        <div class="card" style="border-color:#065f4633">
+            <h2 style="color:#6ee7b7">Paper Optimizer</h2>
+            <div class="metric"><span class="label">Win Rate</span><span class="value" id="paper-wr">-</span></div>
+            <div class="metric"><span class="label">Trades</span><span class="value" id="paper-trades">0</span></div>
+            <div class="metric"><span class="label">Config</span><span class="value" id="paper-config" style="font-size:11px">-</span></div>
+            <div class="metric"><span class="label">Best Hour</span><span class="value" id="paper-hour">-</span></div>
+        </div>
+        <div class="card" style="border-color:#f8717133">
+            <h2 style="color:#fca5a5">Live Optimizer</h2>
+            <div class="metric"><span class="label">Win Rate</span><span class="value" id="live-wr">-</span></div>
+            <div class="metric"><span class="label">Trades</span><span class="value" id="live-trades">0</span></div>
+            <div class="metric"><span class="label">Config</span><span class="value" id="live-config" style="font-size:11px">-</span></div>
+            <div class="metric"><span class="label">Best Hour</span><span class="value" id="live-hour">-</span></div>
         </div>
 
         <div class="card wide">
             <h2>Open Positions</h2>
             <table>
-                <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>PnL</th><th>SL</th><th>TP</th></tr></thead>
-                <tbody id="positions-table"><tr><td colspan="7" style="text-align:center;color:#64748b">No open positions</td></tr></tbody>
+                <thead><tr><th>Mode</th><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>PnL</th><th>SL</th><th>TP</th></tr></thead>
+                <tbody id="positions-table"><tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No open positions</td></tr></tbody>
             </table>
         </div>
 
         <div class="card wide">
             <h2>Live Learning Log</h2>
             <div class="log-container" id="live-log">
-                <div style="text-align:center;color:#64748b;padding:20px">Waiting for logs...</div>
+                <div style="text-align:center;color:var(--text-muted);padding:20px">Waiting for logs...</div>
             </div>
         </div>
 
@@ -164,38 +315,97 @@
             <h2>Recent Trades</h2>
             <table>
                 <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>Amount</th><th>PnL</th></tr></thead>
-                <tbody id="trades-table"><tr><td colspan="6" style="text-align:center;color:#64748b">No recent trades</td></tr></tbody>
+                <tbody id="trades-table"><tr><td colspan="6" style="text-align:center;color:var(--text-muted)">No recent trades</td></tr></tbody>
             </table>
         </div>
     </div>
 
     <script>
+        // === XSS Protection (from ralph-wiggum) ===
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // === Toast Notification System (from ralph-wiggum) ===
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const icons = { success: '\u2705', error: '\u274C', warning: '\u26A0\uFE0F', info: '\u2139\uFE0F' };
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.innerHTML = `<span class="toast-icon">${icons[type] || ''}</span>${escapeHtml(message)}`;
+            container.appendChild(toast);
+
+            setTimeout(() => {
+                toast.classList.add('exiting');
+                setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 300);
+            }, 4000);
+        }
+
+        // === Trade Event Tracking (new trades trigger toasts) ===
+        let _lastLogCount = 0;
+        let _seenTradeIds = new Set();
+
+        function checkNewTradeEvents(logs) {
+            if (!logs || !logs.length) return;
+            for (const l of logs) {
+                const key = `${l.time}_${l.type}_${l.symbol || ''}`;
+                if (_seenTradeIds.has(key)) continue;
+                _seenTradeIds.add(key);
+
+                if (l.type === 'trade_open') {
+                    const dir = l.action === 'long' ? 'LONG' : 'SHORT';
+                    const mode = l.mode || '';
+                    showToast(`${mode} ${dir} ${l.symbol} @ $${fmt(l.price)} (${l.leverage}x)`, 'info');
+                } else if (l.type === 'trade_close') {
+                    const won = l.pnl >= 0;
+                    showToast(`${l.mode || ''} ${l.symbol} ${won ? 'Win' : 'Loss'}: $${fmt(l.pnl)}`, won ? 'success' : 'error');
+                } else if (l.type === 'retrain') {
+                    showToast(l.message || 'Model retraining', 'warning');
+                }
+            }
+            // Keep set manageable
+            if (_seenTradeIds.size > 500) {
+                const arr = [..._seenTradeIds];
+                _seenTradeIds = new Set(arr.slice(-200));
+            }
+        }
+
+        // === Utility ===
         async function fetchData(endpoint) {
             try {
                 const res = await fetch(`/api/${endpoint}`);
+                if (!res.ok) return null;
                 return await res.json();
             } catch { return null; }
         }
 
         function fmt(n, d=2) { return n != null ? Number(n).toFixed(d) : '-'; }
         function pnlClass(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral'; }
-
         function scoreClass(v) {
             if (v > 0.1) return 'positive';
             if (v < -0.1) return 'negative';
             return 'neutral';
         }
 
+        // === Main Update Loop ===
+        let _connectionOk = false;
+
         async function update() {
             // Status
             const status = await fetchData('status');
             const badge = document.getElementById('status-badge');
             if (status?.status === 'running') {
-                badge.textContent = `${status.mode?.toUpperCase()} MODE`;
+                const mode = (status.mode || 'unknown').toUpperCase();
+                badge.innerHTML = `<span class="conn-dot ok"></span>${mode} MODE`;
                 badge.className = 'status running';
+                document.getElementById('uptime').textContent = status.uptime ? `uptime: ${status.uptime.split('.')[0]}` : '';
+                if (!_connectionOk) { _connectionOk = true; showToast('Dashboard connected', 'success'); }
             } else {
-                badge.textContent = 'OFFLINE';
+                badge.innerHTML = '<span class="conn-dot fail"></span>OFFLINE';
                 badge.className = 'status stopped';
+                if (_connectionOk) { _connectionOk = false; showToast('Connection lost', 'error'); }
             }
 
             // Equity
@@ -217,7 +427,7 @@
                 rs.className = `value ${risk.is_halted ? 'negative' : 'positive'}`;
                 document.getElementById('daily-pnl').textContent = `$${fmt(risk.daily_pnl)}`;
                 document.getElementById('daily-pnl').className = `value ${pnlClass(risk.daily_pnl)}`;
-                document.getElementById('drawdown').textContent = `${fmt(risk.current_drawdown * 100)}%`;
+                document.getElementById('drawdown').textContent = `${fmt((risk.current_drawdown||0) * 100)}%`;
             }
 
             // Signals
@@ -231,13 +441,32 @@
                 const bar = document.getElementById('signal-bar');
                 const pct = (s.signal + 1) / 2 * 100;
                 bar.style.width = `${pct}%`;
-                bar.style.background = s.signal > 0 ? '#34d399' : s.signal < 0 ? '#f87171' : '#fbbf24';
+                bar.style.background = s.signal > 0 ? 'var(--positive)' : s.signal < 0 ? 'var(--negative)' : 'var(--neutral)';
 
-                // 외부 요인 reason 표시
-                if (s.reason) {
-                    document.getElementById('ext-reason').textContent = s.reason;
+                // Regime
+                if (s.regime) {
+                    document.getElementById('signal-regime').textContent = s.regime.toUpperCase();
                 }
-                // 시그널에 포함된 외부 요인 정보
+                // Momentum
+                if (s.momentum) {
+                    const m = s.momentum;
+                    const momEl = document.getElementById('signal-mom');
+                    momEl.textContent = `${(m.direction||'neutral').toUpperCase()} (${fmt(m.strength,3)})`;
+                    momEl.className = `value ${m.direction==='long'?'positive':m.direction==='short'?'negative':'neutral'}`;
+                    const rsiEl = document.getElementById('signal-rsi');
+                    rsiEl.textContent = fmt(m.rsi, 1);
+                    rsiEl.className = `value ${m.rsi < 30 ? 'negative' : m.rsi > 70 ? 'positive' : 'neutral'}`;
+                }
+                // Diagnostics
+                if (s.diagnostics) {
+                    const d = s.diagnostics;
+                    document.getElementById('signal-minconf').textContent = `${fmt(d.current_min_confidence * 100)}%`;
+                    const holdsEl = document.getElementById('signal-holds');
+                    holdsEl.textContent = d.consecutive_holds || 0;
+                    holdsEl.className = `value ${d.consecutive_holds > 50 ? 'negative' : d.consecutive_holds > 20 ? 'neutral' : 'positive'}`;
+                }
+
+                if (s.reason) document.getElementById('ext-reason').textContent = s.reason;
                 if (s.external) {
                     const ext = s.external;
                     const dir = document.getElementById('ext-direction');
@@ -251,7 +480,6 @@
             if (ext && ext.composite_signal) {
                 const cs = ext.composite_signal;
                 const score = cs.score || 0;
-
                 document.getElementById('ext-score').textContent = fmt(score, 3);
                 document.getElementById('ext-score').className = `value ${scoreClass(score)}`;
 
@@ -259,63 +487,91 @@
                 dir.textContent = (cs.direction || 'neutral').toUpperCase();
                 dir.className = `value ${cs.direction==='bullish'?'positive':cs.direction==='bearish'?'negative':'neutral'}`;
 
-                // Gauge
                 const gaugePct = (score + 1) / 2 * 100;
                 document.getElementById('ext-gauge').style.left = `${Math.max(0, Math.min(100, gaugePct))}%`;
 
-                // Components
                 const comp = cs.components || {};
-                document.getElementById('comp-fg').textContent = fmt(comp.fear_greed || 0, 2);
-                document.getElementById('comp-fg').className = `score ${scoreClass(comp.fear_greed || 0)}`;
-                document.getElementById('comp-sent').textContent = fmt(comp.sentiment || 0, 2);
-                document.getElementById('comp-sent').className = `score ${scoreClass(comp.sentiment || 0)}`;
-                document.getElementById('comp-macro').textContent = fmt(comp.macro || 0, 2);
-                document.getElementById('comp-macro').className = `score ${scoreClass(comp.macro || 0)}`;
-                document.getElementById('comp-onchain').textContent = fmt(comp.onchain || 0, 2);
-                document.getElementById('comp-onchain').className = `score ${scoreClass(comp.onchain || 0)}`;
-                document.getElementById('comp-social').textContent = fmt(comp.social || 0, 2);
-                document.getElementById('comp-social').className = `score ${scoreClass(comp.social || 0)}`;
-
-                // Fear & Greed
-                if (ext.fear_greed?.value != null) {
-                    const fgVal = ext.fear_greed.value;
-                    const fgText = `${fgVal} (${ext.fear_greed.classification || ''})`;
-                    const fgEl = document.getElementById('ext-fg');
-                    fgEl.textContent = fgText;
-                    fgEl.className = `value ${fgVal < 30 ? 'negative' : fgVal > 70 ? 'positive' : 'neutral'}`;
+                for (const [key, id] of [['fear_greed','comp-fg'],['sentiment','comp-sent'],['macro','comp-macro'],['onchain','comp-onchain'],['social','comp-social']]) {
+                    const el = document.getElementById(id);
+                    const v = comp[key] || 0;
+                    el.textContent = fmt(v, 2);
+                    el.className = `score ${scoreClass(v)}`;
                 }
 
-                // Sentiment trend
+                if (ext.fear_greed?.value != null) {
+                    const fgVal = ext.fear_greed.value;
+                    const fgEl = document.getElementById('ext-fg');
+                    fgEl.textContent = `${fgVal} (${ext.fear_greed.classification || ''})`;
+                    fgEl.className = `value ${fgVal < 30 ? 'negative' : fgVal > 70 ? 'positive' : 'neutral'}`;
+                }
                 if (ext.sentiment_trend != null) {
                     const st = document.getElementById('ext-sentiment');
                     st.textContent = fmt(ext.sentiment_trend, 3);
                     st.className = `value ${scoreClass(ext.sentiment_trend)}`;
                 }
-
-                // Counts
                 document.getElementById('ext-news-count').textContent = `${ext.news_count || 0} articles`;
                 document.getElementById('ext-social-count').textContent = `${ext.social_posts || 0} posts`;
                 document.getElementById('comp-features').textContent = `${ext.feature_count || 0} features`;
             }
 
-            // Live Logs
+            // Strategy Optimization (Paper + Live)
+            const strat = await fetchData('strategy-optimization');
+            if (strat) {
+                for (const [key, prefix] of [['paper','paper'], ['live','live']]) {
+                    const d = strat[key] || {};
+                    const wr = d.win_rate || 0;
+                    const wrEl = document.getElementById(`${prefix}-wr`);
+                    wrEl.textContent = d.total_trades > 0 ? `${fmt(wr * 100)}%` : 'Collecting...';
+                    wrEl.className = `value ${wr > 0.55 ? 'positive' : wr > 0.45 ? 'neutral' : d.total_trades > 0 ? 'negative' : ''}`;
+                    document.getElementById(`${prefix}-trades`).textContent = d.total_trades || 0;
+                    document.getElementById(`${prefix}-hour`).textContent = d.best_hour != null ? `${d.best_hour}:00 UTC` : '-';
+                    // Show config summary
+                    const cfg = d.config || {};
+                    const cfgEl = document.getElementById(`${prefix}-config`);
+                    if (cfg.stop_loss_pct) {
+                        cfgEl.textContent = `SL:${(cfg.stop_loss_pct*100).toFixed(0)}% TP:${(cfg.take_profit_pct*100).toFixed(0)}% / ${cfg.signal_refresh_interval||30}s`;
+                    }
+                }
+            }
+
+            // Live Logs (with XSS protection + toast alerts)
             const logs = await fetchData('live_logs');
             const logContainer = document.getElementById('live-log');
             if (logs?.logs?.length) {
-                logContainer.innerHTML = logs.logs.slice().reverse().map(l => {
-                    const time = l.timestamp?.slice(11, 19) || '';
+                checkNewTradeEvents(logs.logs.slice(_lastLogCount));
+                _lastLogCount = logs.logs.length;
+
+                logContainer.innerHTML = logs.logs.slice().reverse().slice(0, 100).map(l => {
+                    const time = escapeHtml(l.time || '');
                     let typeClass = l.type || 'analysis';
                     if (l.type === 'trade_close') {
                         typeClass = (l.pnl != null && l.pnl >= 0) ? 'trade_close_win' : 'trade_close_loss';
                     }
-                    const typeLabel = (l.type || 'info').replace('_', ' ').toUpperCase();
-                    let msg = l.message || '';
-                    if (l.symbol) msg = `[${l.symbol}] ${msg}`;
-                    if (l.pnl != null) msg += ` | PnL: ${fmt(l.pnl)}%`;
-                    if (l.confidence != null) msg += ` | Conf: ${fmt(l.confidence * 100)}%`;
+                    const mode = l.mode ? `[${escapeHtml(l.mode)}] ` : '';
+                    const typeLabel = escapeHtml((l.type || 'info').replace(/_/g, ' ').toUpperCase());
+
+                    let msg = '';
+                    if (l.type === 'trade_open') {
+                        const dir = l.action === 'long' ? '\uD83D\uDFE2 LONG' : '\uD83D\uDD34 SHORT';
+                        msg = `${mode}[${escapeHtml(l.symbol||'')}] ${dir} $${fmt(l.price)} | $${l.notional || l.size} (${l.leverage || '?'}x)`;
+                    } else if (l.type === 'trade_close') {
+                        const icon = l.pnl >= 0 ? '\u2705' : '\u274C';
+                        msg = `${mode}[${escapeHtml(l.symbol||'')}] ${icon} PnL: $${fmt(l.pnl)} | ${escapeHtml(l.reason || '')}`;
+                    } else if (l.type === 'analysis') {
+                        const dir = l.action === 'long' ? '\u2191' : l.action === 'short' ? '\u2193' : '\u2192';
+                        msg = `[${escapeHtml(l.symbol||'')}] $${fmt(l.price)} ${dir} Conf:${fmt((l.confidence||0)*100)}%`;
+                        msg += ` ML:${escapeHtml(l.ml_dir||'?')}(${fmt((l.ml_conf||0)*100)}%)`;
+                        msg += ` RL:${escapeHtml(l.rl_action||'?')}(${fmt((l.rl_conf||0)*100)}%)`;
+                        if (l.mom_dir && l.mom_dir !== 'neutral') msg += ` Mom:${escapeHtml(l.mom_dir)}`;
+                        if (l.regime) msg += ` [${escapeHtml(l.regime)}]`;
+                    } else {
+                        msg = escapeHtml(l.message || '');
+                        if (l.symbol) msg = `[${escapeHtml(l.symbol)}] ${msg}`;
+                    }
+
                     return `<div class="log-entry">
                         <span class="log-time">${time}</span>
-                        <span class="log-type ${typeClass}">${typeLabel}</span>
+                        <span class="log-type ${escapeHtml(typeClass)}">${typeLabel}</span>
                         <span class="log-msg">${msg}</span>
                     </div>`;
                 }).join('');
@@ -327,15 +583,18 @@
             if (pos?.positions?.length) {
                 ptb.innerHTML = pos.positions.map(p => `
                     <tr>
-                        <td>${p.symbol}</td>
-                        <td class="${p.side==='long'?'positive':'negative'}">${p.side.toUpperCase()}</td>
+                        <td style="font-weight:600;color:${p.mode==='LIVE'?'var(--negative)':'var(--positive)'}">${escapeHtml(p.mode||'')}</td>
+                        <td>${escapeHtml(p.symbol||'')}</td>
+                        <td class="${p.side==='long'?'positive':'negative'}">${escapeHtml((p.side||'').toUpperCase())}</td>
                         <td>${fmt(p.size, 4)}</td>
                         <td>$${fmt(p.entry_price)}</td>
-                        <td class="${pnlClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl * 100)}%</td>
+                        <td class="${pnlClass(p.unrealized_pnl)}">${fmt((p.unrealized_pnl||0) * 100)}%</td>
                         <td>$${fmt(p.stop_loss)}</td>
                         <td>$${fmt(p.take_profit)}</td>
                     </tr>
                 `).join('');
+            } else {
+                ptb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No open positions</td></tr>';
             }
 
             // Trades
@@ -344,17 +603,20 @@
             if (tr?.trades?.length) {
                 ttb.innerHTML = tr.trades.slice(0, 20).map(t => `
                     <tr>
-                        <td>${t.timestamp?.slice(0,19) || '-'}</td>
-                        <td>${t.symbol}</td>
-                        <td class="${t.side==='buy'?'positive':'negative'}">${t.side?.toUpperCase()}</td>
+                        <td>${escapeHtml(t.timestamp?.slice(0,19) || '-')}</td>
+                        <td>${escapeHtml(t.symbol||'')}</td>
+                        <td class="${t.side==='buy'?'positive':'negative'}">${escapeHtml((t.side||'').toUpperCase())}</td>
                         <td>$${fmt(t.price)}</td>
                         <td>${fmt(t.amount, 4)}</td>
                         <td class="${pnlClass(t.pnl)}">$${fmt(t.pnl)}</td>
                     </tr>
                 `).join('');
+            } else {
+                ttb.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted)">No recent trades</td></tr>';
             }
         }
 
+        // Initial load + polling
         update();
         setInterval(update, 5000);
     </script>

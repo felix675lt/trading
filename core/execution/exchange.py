@@ -78,28 +78,42 @@ class ExchangeClient:
         try:
             positions = await self.exchange.fetch_positions([symbol])
             for pos in positions:
-                if float(pos.get("contracts", 0)) > 0:
+                contracts = pos.get("contracts", 0) or 0
+                if float(contracts) > 0:
+                    lev = pos.get("leverage")
+                    leverage = int(lev) if lev is not None else 1
+                    entry = pos.get("entryPrice") or 0
+                    upnl = pos.get("unrealizedPnl") or 0
                     return {
                         "symbol": symbol,
                         "side": pos.get("side", ""),
-                        "size": float(pos.get("contracts", 0)),
-                        "entry_price": float(pos.get("entryPrice", 0)),
-                        "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
-                        "leverage": int(pos.get("leverage", 1)),
+                        "size": float(contracts),
+                        "entry_price": float(entry),
+                        "unrealized_pnl": float(upnl),
+                        "leverage": leverage,
                     }
             return {"symbol": symbol, "side": "", "size": 0, "entry_price": 0, "unrealized_pnl": 0}
         except Exception as e:
             logger.error(f"포지션 조회 실패: {e}")
             return {}
 
-    async def close_position(self, symbol: str) -> dict:
-        """포지션 전체 청산"""
+    async def close_position(self, symbol: str, fallback_side: str = "", fallback_size: float = 0) -> dict:
+        """포지션 전체 청산 — get_position 실패 시 fallback 사용"""
         pos = await self.get_position(symbol)
-        if pos.get("size", 0) == 0:
+        size = pos.get("size", 0)
+        side_raw = pos.get("side", "")
+
+        # get_position 실패 또는 빈 결과 시 fallback 사용
+        if size == 0 and fallback_size > 0:
+            size = fallback_size
+            side_raw = fallback_side
+            logger.warning(f"포지션 조회 실패 → fallback 사용: {fallback_side} {fallback_size}")
+
+        if size == 0:
             return {}
 
-        side = "sell" if pos["side"] == "long" else "buy"
-        return await self.create_market_order(symbol, side, pos["size"])
+        close_side = "sell" if side_raw == "long" else "buy"
+        return await self.create_market_order(symbol, close_side, size)
 
     async def cancel_all_orders(self, symbol: str):
         """모든 미체결 주문 취소"""
@@ -110,6 +124,21 @@ class ExchangeClient:
             logger.info(f"{symbol} 미체결 주문 {len(orders)}건 취소")
         except Exception as e:
             logger.warning(f"주문 취소 실패: {e}")
+
+    async def get_amount_precision(self, symbol: str) -> float:
+        """심볼의 최소 수량 단위(step size) 조회"""
+        if not self.exchange.markets:
+            await self.exchange.load_markets()
+        market = self.exchange.markets.get(symbol, {})
+        precision = market.get("precision", {}).get("amount", 0.001)
+        return precision
+
+    async def get_min_notional(self, symbol: str) -> float:
+        """심볼의 최소 주문 금액(notional) 조회"""
+        if not self.exchange.markets:
+            await self.exchange.load_markets()
+        market = self.exchange.markets.get(symbol, {})
+        return market.get("limits", {}).get("cost", {}).get("min", 5.0)
 
     async def get_ticker_price(self, symbol: str) -> float:
         ticker = await self.exchange.fetch_ticker(symbol)

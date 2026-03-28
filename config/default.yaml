@@ -1,10 +1,11 @@
 # AutoTrader AI Configuration
+# === 소시드 집중 스캘핑 모드 ($188) ===
 
 exchanges:
   binance:
     api_key: ${BINANCE_API_KEY}
     secret: ${BINANCE_SECRET}
-    testnet: true
+    testnet: false
     options:
       defaultType: future
   bybit:
@@ -16,35 +17,77 @@ exchanges:
 
 trading:
   symbols:
-    - "BTC/USDT:USDT"
+    # BTC 제외: 시드 $10K 미만에서는 변동성 대비 수익 비효율
+    # BTC 일중범위 3.5% vs SOL 5.8% → 같은 돈으로 65% 더 벌 수 있음
+    # BTC는 시드 $10K 이상에서 재활성화
+    #- "BTC/USDT:USDT"
     - "ETH/USDT:USDT"
+    - "SOL/USDT:USDT"
+    - "DOGE/USDT:USDT"
   timeframes:
     - "5m"
     - "15m"
     - "1h"
     - "4h"
-  leverage: 5
-  mode: "paper"  # backtest / paper / live
+  leverage: 3
+  mode: "dual"  # backtest / paper / live / dual (Paper+Live 동시)
+  min_confidence: 0.30     # 최소 확신도 (적응형: 장기 hold 시 0.15까지 자동 하향)
+  signal_threshold: 0.08   # ML 시그널 방향 결정 임계값
+
+  # === 집중 매매 모드 ===
+  # 소시드($188)에서는 분산 X → 가장 강한 신호 1개에 풀시드 집중
+  concentration_mode: true
+  max_concurrent_live: 1   # LIVE: 한 번에 1포지션만 (풀시드 올인)
+  max_concurrent_paper: 4  # PAPER: 학습용으로 다중 가능
 
 risk:
-  max_position_pct: 0.1
-  max_daily_loss_pct: 0.05
-  max_drawdown_pct: 0.15
-  stop_loss_pct: 0.02
-  take_profit_pct: 0.04
-  max_open_positions: 3
-  cooldown_after_losses: 3    # N연패 후 쿨다운 발동
-  cooldown_minutes: 30        # 쿨다운 지속 시간 (분)
+  max_position_pct: 0.95        # 풀시드 집중: $188 × 95% = $178.6 마진
+  min_order_notional: 5         # 알트코인 최소 $5
+  max_daily_loss_pct: 0.05      # 일 최대 손실 5%
+  max_drawdown_pct: 0.15        # MDD 15%
+  stop_loss_pct: 0.008          # 0.8% SL (3x → 실질 2.4% 손실)
+  take_profit_pct: 0.012        # 1.2% TP (3x → 실질 3.6% 수익)
+  max_open_positions: 1         # LIVE 1포지션 제한
+  cooldown_after_losses: 2
+  cooldown_minutes: 30
   dynamic_leverage:
     enabled: true
-    base: 5                   # 기본 레버리지
-    min: 2                    # 최소 (불확실할 때)
-    max: 10                   # 최대 (확실할 때)
+    base: 3                     # $188 × 3x = $564 notional
+    min: 2                      # 약한 시그널: 2x ($376)
+    max: 5                      # 강한 시그널: 5x ($940)
+
+  # === 종목별 스캘핑 프로파일 ===
+  scalp_profiles:
+    BTC:
+      tp_pct: 0.010       # 1.0% TP (안정)
+      sl_pct: 0.007       # 0.7% SL
+      priority: 2          # 2순위 (변동성 낮음)
+    ETH:
+      tp_pct: 0.012       # 1.2% TP
+      sl_pct: 0.008       # 0.8% SL
+      priority: 3
+    SOL:
+      tp_pct: 0.015       # 1.5% TP (공격적)
+      sl_pct: 0.010       # 1.0% SL
+      priority: 1          # 1순위 (변동성 높고 유동성 충분)
+    DOGE:
+      tp_pct: 0.015       # 1.5% TP
+      sl_pct: 0.010       # 1.0% SL
+      priority: 4
+    # 상장 시그널 코인
+    LISTING:
+      tp_pct: 0.050       # 5.0% TP (큰 움직임 기대)
+      sl_pct: 0.020       # 2.0% SL
+      priority: 0          # 최우선
 
 trailing_stop:
-  activate_pct: 0.02    # 2% 수익 도달 시 트레일링 활성화
-  distance_pct: 0.015   # 최고점에서 1.5% 하락 시 청산
-  step_pct: 0.005        # SL을 0.5% 단위로 끌어올림
+  # 이전: 0.8% 활성화, 0.5% 거리 → 실질 0.3%에서 튕김 → 재진입 반복
+  # 수정: 더 여유롭게 → 추세를 더 오래 타고 수수료 절약
+  activate_pct: 0.015    # 1.5% 수익 시 트레일링 활성화 (TP 근처)
+  distance_pct: 0.008    # 최고점에서 0.8% 하락 시 청산
+  step_pct: 0.004        # SL을 0.4% 단위로 끌어올림
+  # 실질 최소 수익: 1.5% - 0.8% = 0.7% 보장
+  # 추세 지속 시: 트레일링이 따라가며 수익 극대화
 
 ml:
   retrain_interval_hours: 24
@@ -68,7 +111,7 @@ rl:
   reward_type: "sharpe"
 
 backtest:
-  initial_capital: 10000
+  initial_capital: 200
   commission_pct: 0.0004
   slippage_pct: 0.0001
   start_date: "2024-01-01"
