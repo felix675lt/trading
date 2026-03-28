@@ -1103,6 +1103,9 @@ class AutoTrader:
                 live_pnl = live_result.get("pnl", 0) if isinstance(live_result, dict) else 0
                 logger.info(f"[LIVE] 청산 {symbol} | PnL: ${live_pnl:.2f}")
 
+                # LIVE도 쿨다운/연패 추적
+                self.risk_manager.record_pnl(live_pnl)
+
                 # LIVE 청산도 피드백 학습에 기록
                 self.feedback.record_trade(
                     {"pnl": live_pnl, "side": live_result.get("side", ""), "symbol": symbol},

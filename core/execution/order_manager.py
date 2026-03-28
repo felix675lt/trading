@@ -34,10 +34,55 @@ class OrderManager:
         self.positions: dict[str, Position] = {}
         self._failed_attempts: dict[str, int] = {}  # 연속 실패 횟수
         self._on_sl_callback = None  # SL 소멸 감지 콜백
+        self._last_close_time: dict[str, datetime] = {}  # 심볼별 마지막 청산 시각
+        self._last_close_side: dict[str, str] = {}  # 심볼별 마지막 포지션 방향
+        self._consecutive_sl: dict[str, int] = {}  # 심볼별 연속 SL 횟수
+        self._min_reentry_minutes = 5  # SL 후 최소 재진입 대기 시간
 
     def set_sl_callback(self, callback):
         """SL/자동청산 감지 시 호출할 콜백 등록 (피드백 학습용)"""
         self._on_sl_callback = callback
+
+    def can_reenter(self, symbol: str, side: str) -> tuple[bool, str]:
+        """재진입 가능 여부 확인
+        - SL 직후: 최소 5분 × 연속SL횟수 대기
+        - TP 직후: 최소 3분 대기 (같은 가격대 재진입 방지)
+        - 같은 방향 2연속 SL: 방향 전환 요구
+        """
+        last_close = self._last_close_time.get(symbol)
+        if not last_close:
+            return True, ""
+
+        elapsed = (datetime.utcnow() - last_close).total_seconds() / 60
+        consecutive = self._consecutive_sl.get(symbol, 0)
+
+        if consecutive > 0:
+            # SL 후 대기 (연속 SL일수록 길어짐)
+            wait_minutes = self._min_reentry_minutes * max(1, consecutive)
+            if elapsed < wait_minutes:
+                remaining = wait_minutes - elapsed
+                return False, f"SL 후 대기: {remaining:.0f}분 남음 ({consecutive}연속SL)"
+
+            # 같은 방향 2연속 SL → 방향 전환 요구
+            last_side = self._last_close_side.get(symbol, "")
+            if consecutive >= 2 and side == last_side:
+                return False, f"같은방향 {side} {consecutive}연속SL → 방향전환 필요"
+        else:
+            # TP 후에도 최소 3분 대기 (같은 가격대 재진입 방지 + 수수료 절약)
+            if elapsed < 3:
+                remaining = 3 - elapsed
+                return False, f"TP 후 대기: {remaining:.1f}분 남음 (같은가격대 재진입 방지)"
+
+        return True, ""
+
+    def record_close(self, symbol: str, side: str, was_sl: bool):
+        """청산 기록 (재진입 제어용)"""
+        self._last_close_time[symbol] = datetime.utcnow()
+        self._last_close_side[symbol] = side
+        if was_sl:
+            self._consecutive_sl[symbol] = self._consecutive_sl.get(symbol, 0) + 1
+        else:
+            self._consecutive_sl[symbol] = 0  # TP 시 리셋
 
     async def open_position(
         self,
@@ -49,6 +94,12 @@ class OrderManager:
         """포지션 개시"""
         if symbol in self.positions:
             logger.warning(f"{symbol} 이미 포지션 보유 중")
+            return None
+
+        # SL 후 재진입 체크
+        can, reason = self.can_reenter(symbol, side)
+        if not can:
+            logger.info(f"[재진입차단] {symbol} {side}: {reason}")
             return None
 
         # 연속 3회 실패 시 10루프 동안 스킵
@@ -153,7 +204,11 @@ class OrderManager:
             except Exception:
                 pass
 
-            logger.info(f"포지션 청산: {symbol} | PnL: {pnl:.2f} USDT | 사유: {reason}")
+            # 4. 재진입 제어용 기록 (SL인지 TP인지 판별)
+            was_sl = pnl < 0
+            self.record_close(symbol, pos.side, was_sl)
+
+            logger.info(f"포지션 청산: {symbol} | PnL: {pnl:.2f} USDT | 사유: {reason} | {'SL' if was_sl else 'TP'}")
 
             return {
                 "symbol": symbol,
@@ -190,6 +245,9 @@ class OrderManager:
                         f"[OrderManager] {symbol} 거래소에서 포지션 소멸 감지 "
                         f"(SL/청산 체결) → 추정 PnL: ${sl_pnl:.2f} | 내부 정리 + 잔여 주문 취소"
                     )
+
+                    # 재진입 제어 기록 (SL로 간주)
+                    self.record_close(symbol, pos.side, was_sl=True)
 
                     # 피드백 콜백 호출 (SL 패턴 학습용)
                     if self._on_sl_callback:
