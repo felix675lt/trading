@@ -65,7 +65,7 @@ class SelfLearningTrainer:
         return df
 
     async def train_cycle(self, exchange_name: str, symbol: str, timeframe: str = "1h"):
-        """전체 학습 사이클 실행"""
+        """전체 학습 사이클 실행 (기존 모델이 있으면 이어서 학습)"""
         logger.info(f"=== 자기학습 사이클 시작: {symbol} {timeframe} ===")
 
         # 1. 데이터 수집
@@ -78,15 +78,33 @@ class SelfLearningTrainer:
         all_feature_cols = self.feature_engineer.get_feature_columns(df)
         base_feature_cols = self.feature_engineer.get_base_feature_columns(df)
 
-        # 2. ML 앙상블 학습 (외부 피처 포함)
+        # 1.5. 기존 모델 로드 (이어서 학습하기 위해)
+        #      이미 메모리에 있으면 그대로, 없으면 파일에서 로드
+        if self.ensemble.xgb.model is None:
+            self.ensemble.load_all()
+            if self.ensemble.xgb.model:
+                logger.info("기존 ML 모델 로드 → 증분학습 모드")
+        if self.rl_agent.model is None:
+            self.rl_agent.load()
+            if self.rl_agent.model:
+                logger.info("기존 RL 모델 로드 → 이어서 학습 모드")
+
+        prev_xgb_acc = self.ensemble.xgb.accuracy
+        prev_lstm_acc = self.ensemble.lstm.accuracy
+
+        # 2. ML 앙상블 학습 (기존 모델 이어서 / 외부 피처 포함)
         self.ensemble.train_all(df, all_feature_cols)
 
-        # 3. RL 에이전트 학습 (기본 피처만 - 차원 고정 보장)
+        # 3. RL 에이전트 학습 (기존 모델 이어서 / 기본 피처만)
         ohlcv_cols = ["open", "high", "low", "close", "volume"]
         rl_data = np.hstack([df[base_feature_cols].values, df[ohlcv_cols].values]).astype(np.float32)
         rl_data = np.nan_to_num(rl_data, nan=0.0, posinf=0.0, neginf=0.0)
 
-        logger.info(f"RL 학습 피처: {len(base_feature_cols)}개 (기본) / ML 피처: {len(all_feature_cols)}개 (전체)")
+        is_incremental = self.rl_agent.model is not None
+        logger.info(
+            f"{'증분' if is_incremental else '최초'}학습 | "
+            f"RL 피처: {len(base_feature_cols)}개 / ML 피처: {len(all_feature_cols)}개"
+        )
 
         env = self.rl_agent.create_env(
             data=rl_data,
@@ -105,6 +123,15 @@ class SelfLearningTrainer:
         self.storage.save_model_performance(
             "ensemble", self.ensemble.xgb.accuracy, rl_metrics.get("sharpe_ratio", 0),
             rl_metrics.get("win_rate", 0),
+        )
+
+        # 학습 결과 비교 로그
+        xgb_diff = self.ensemble.xgb.accuracy - prev_xgb_acc if prev_xgb_acc > 0 else 0
+        lstm_diff = self.ensemble.lstm.accuracy - prev_lstm_acc if prev_lstm_acc > 0 else 0
+        logger.info(
+            f"XGB: {self.ensemble.xgb.accuracy:.4f} ({xgb_diff:+.4f}) | "
+            f"LSTM: {self.ensemble.lstm.accuracy:.4f} ({lstm_diff:+.4f}) | "
+            f"RL Sharpe: {rl_metrics.get('sharpe_ratio', 0):.2f}"
         )
 
         self.last_train_time = datetime.utcnow()

@@ -52,7 +52,7 @@ class LSTMPredictor:
 
     def train(self, df: pd.DataFrame, feature_cols: list[str], label_col: str = "label",
               epochs: int = 50, batch_size: int = 64, lr: float = 0.001):
-        """모델 학습"""
+        """모델 학습 (기존 모델이 있으면 fine-tuning, 없으면 최초 학습)"""
         self.feature_columns = feature_cols
         X = df[feature_cols].values.astype(np.float32)
         y = df[label_col].values.astype(np.int64)
@@ -74,12 +74,30 @@ class LSTMPredictor:
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-        self.model = LSTMNetwork(input_size=len(feature_cols)).to(self.device)
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        prev_accuracy = self.accuracy
+        is_finetune = self.model is not None and len(feature_cols) == len(self.feature_columns)
+
+        if is_finetune:
+            # === Fine-tuning: 기존 가중치에서 이어서 학습 ===
+            logger.info(f"LSTM Fine-tuning 시작 (기존 정확도: {prev_accuracy:.4f})")
+            finetune_lr = lr * 0.3  # 학습률 30%로 낮춰서 기존 지식 보존
+            finetune_epochs = max(epochs // 2, 15)  # 에폭 절반
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=finetune_lr)
+
+            # 기존 모델의 best state 백업 (롤백용)
+            best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        else:
+            # === 최초 학습 ===
+            logger.info("LSTM 최초 학습 시작")
+            finetune_epochs = epochs
+            self.model = LSTMNetwork(input_size=len(feature_cols)).to(self.device)
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+            best_state = None
+
         criterion = nn.CrossEntropyLoss()
 
         best_acc = 0.0
-        for epoch in range(epochs):
+        for epoch in range(finetune_epochs):
             self.model.train()
             total_loss = 0
             for batch_X, batch_y in train_loader:
@@ -88,6 +106,7 @@ class LSTMPredictor:
                 output = self.model(batch_X)
                 loss = criterion(output, batch_y)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)  # gradient clipping
                 optimizer.step()
                 total_loss += loss.item()
 
@@ -98,12 +117,30 @@ class LSTMPredictor:
                 acc = (pred == test_y).float().mean().item()
                 if acc > best_acc:
                     best_acc = acc
+                    best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
             if (epoch + 1) % 10 == 0:
-                logger.info(f"LSTM Epoch {epoch+1}/{epochs} - Loss: {total_loss/len(train_loader):.4f}, Val Acc: {acc:.4f}")
+                train_type = "Fine-tune" if is_finetune else "Train"
+                logger.info(f"LSTM {train_type} {epoch+1}/{finetune_epochs} - Loss: {total_loss/len(train_loader):.4f}, Val Acc: {acc:.4f}")
+
+        # 성능 하락 시 롤백
+        if is_finetune and prev_accuracy > 0 and best_acc < prev_accuracy - 0.05:
+            logger.warning(
+                f"LSTM 정확도 하락 감지: {prev_accuracy:.4f} → {best_acc:.4f} — 기존 모델 유지"
+            )
+            if best_state:
+                self.model.load_state_dict(best_state)
+            self.accuracy = prev_accuracy
+            return self.accuracy
+
+        # best state 복원
+        if best_state:
+            self.model.load_state_dict(best_state)
 
         self.accuracy = best_acc
-        logger.info(f"LSTM 학습 완료 - 최고 정확도: {self.accuracy:.4f}")
+        train_type = "Fine-tune" if is_finetune else "최초학습"
+        improvement = f" ({best_acc - prev_accuracy:+.4f})" if prev_accuracy > 0 else ""
+        logger.info(f"LSTM {train_type} 완료 - 최고 정확도: {self.accuracy:.4f}{improvement}")
         return self.accuracy
 
     def predict(self, df: pd.DataFrame) -> dict:

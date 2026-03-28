@@ -21,7 +21,7 @@ class XGBoostPredictor:
         self.accuracy: float = 0.0
 
     def train(self, df: pd.DataFrame, feature_cols: list[str], label_col: str = "label"):
-        """학습 데이터로 모델 훈련"""
+        """학습 데이터로 모델 훈련 (기존 모델이 있으면 이어서 학습)"""
         self.feature_columns = feature_cols
         X = df[feature_cols].values
         y = df[label_col].values
@@ -30,25 +30,58 @@ class XGBoostPredictor:
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
 
-        self.model = XGBClassifier(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            use_label_encoder=False,
-            eval_metric="mlogloss",
-            early_stopping_rounds=20,
-        )
-        self.model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            verbose=False,
-        )
+        prev_accuracy = self.accuracy
+
+        if self.model is not None:
+            # === 기존 모델 이어서 학습 (incremental) ===
+            logger.info(f"XGBoost 증분학습 시작 (기존 정확도: {prev_accuracy:.4f})")
+            self.model.set_params(
+                n_estimators=self.model.n_estimators + 100,  # 트리 100개 추가
+                learning_rate=0.02,  # 학습률 낮춰서 기존 지식 보존
+            )
+            self.model.fit(
+                X_train, y_train,
+                eval_set=[(X_test, y_test)],
+                xgb_model=self.model.get_booster(),  # 기존 모델에서 이어서
+                verbose=False,
+            )
+        else:
+            # === 최초 학습 ===
+            logger.info("XGBoost 최초 학습 시작")
+            self.model = XGBClassifier(
+                n_estimators=300,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                use_label_encoder=False,
+                eval_metric="mlogloss",
+                early_stopping_rounds=20,
+            )
+            self.model.fit(
+                X_train, y_train,
+                eval_set=[(X_test, y_test)],
+                verbose=False,
+            )
 
         y_pred = self.model.predict(X_test)
-        self.accuracy = accuracy_score(y_test, y_pred)
-        logger.info(f"XGBoost 학습 완료 - 정확도: {self.accuracy:.4f}")
+        new_accuracy = accuracy_score(y_test, y_pred)
+
+        # 성능이 크게 하락하면 롤백 (5%p 이상 하락 방지)
+        if prev_accuracy > 0 and new_accuracy < prev_accuracy - 0.05:
+            logger.warning(
+                f"XGBoost 정확도 하락 감지: {prev_accuracy:.4f} → {new_accuracy:.4f} "
+                f"(차이: {new_accuracy - prev_accuracy:+.4f}) — 기존 모델 유지"
+            )
+            # 롤백: 저장된 모델 다시 로드
+            if self.load():
+                return self.accuracy
+            # 로드 실패 시 새 모델 수용
+
+        self.accuracy = new_accuracy
+        train_type = "증분" if prev_accuracy > 0 else "최초"
+        improvement = f" ({new_accuracy - prev_accuracy:+.4f})" if prev_accuracy > 0 else ""
+        logger.info(f"XGBoost {train_type}학습 완료 - 정확도: {self.accuracy:.4f}{improvement}")
         logger.info(f"\n{classification_report(y_test, y_pred, target_names=['하락','횡보','상승'], zero_division=0)}")
         return self.accuracy
 

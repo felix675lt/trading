@@ -127,6 +127,8 @@ class StrategyOptimizer:
         )
         # performance_history: config_hash → [trade_list] (호환용 alias)
         self.performance_history: dict[str, list] = defaultdict(list)
+        # adjustments: optimize_daily에서 산출한 실제 파라미터 조정값
+        self.adjustments: dict = {}
         logger.info("[StrategyOptimizer] 자동 전략 최적화 시스템 초기화")
 
     def _config_to_hash(self, config: dict) -> str:
@@ -189,17 +191,37 @@ class StrategyOptimizer:
             "configs": configs,
         }
 
-    def optimize_daily(self, all_trades: list[dict]):
-        """일일 최적화 — 거래 결과 기반 파라미터 자동 조정"""
+    def get_adjustments(self) -> dict:
+        """현재 적용 중인 자동 조정값 반환"""
+        return self.adjustments
+
+    def get_position_scale(self, symbol: str = "", hour: int = -1) -> float:
+        """종목/시간대별 포지션 크기 조정 배율"""
+        scale = self.adjustments.get("global_scale", 1.0)
+        if symbol and f"scale_{symbol}" in self.adjustments:
+            scale *= self.adjustments[f"scale_{symbol}"]
+        if hour >= 0 and self.adjustments.get(f"avoid_hour_{hour}"):
+            scale *= 0.0  # 해당 시간대 거래 차단
+        if hour >= 0 and f"boost_hour_{hour}" in self.adjustments:
+            scale *= self.adjustments[f"boost_hour_{hour}"]
+        return max(0.0, min(2.0, scale))
+
+    def optimize_daily(self, all_trades: list[dict]) -> dict:
+        """일일 최적화 — 거래 결과 기반 파라미터 자동 조정
+
+        분석 후 self.adjustments에 실제 파라미터 변경을 저장하여
+        다음 거래에 반영합니다.
+        """
         if len(all_trades) < 10:
-            return
+            return {}
 
         wins = sum(1 for t in all_trades if t.get("pnl", 0) > 0)
         losses = len(all_trades) - wins
         total_pnl = sum(t.get("pnl", 0) for t in all_trades)
         win_rate = wins / len(all_trades) if all_trades else 0
+        changes = []
 
-        # 시간대별 성과 분석
+        # === 1. 시간대별 성과 분석 → 거래 회피/선호 시간대 ===
         hour_pnl = defaultdict(list)
         for t in all_trades:
             hour_pnl[t.get("hour", 0)].append(t.get("pnl", 0))
@@ -207,8 +229,66 @@ class StrategyOptimizer:
         best_hours = sorted(hour_pnl.keys(), key=lambda h: sum(hour_pnl[h]), reverse=True)[:3]
         worst_hours = sorted(hour_pnl.keys(), key=lambda h: sum(hour_pnl[h]))[:3]
 
+        for h in worst_hours:
+            trades_h = hour_pnl[h]
+            if len(trades_h) >= 3:
+                h_wr = sum(1 for p in trades_h if p > 0) / len(trades_h)
+                if h_wr < 0.25 and sum(trades_h) < 0:
+                    self.adjustments[f"avoid_hour_{h}"] = True
+                    changes.append(f"UTC {h}시 회피 (승률 {h_wr:.0%})")
+
+        for h in best_hours:
+            trades_h = hour_pnl[h]
+            if len(trades_h) >= 3:
+                h_wr = sum(1 for p in trades_h if p > 0) / len(trades_h)
+                if h_wr > 0.65:
+                    self.adjustments[f"boost_hour_{h}"] = 1.2
+                    changes.append(f"UTC {h}시 확신도 ×1.2 (승률 {h_wr:.0%})")
+
+        # === 2. 종목별 성과 → 종목 우선순위 자동 조정 ===
+        symbol_pnl = defaultdict(list)
+        for t in all_trades:
+            symbol_pnl[t.get("symbol", "")].append(t.get("pnl", 0))
+
+        for sym, pnls in symbol_pnl.items():
+            if len(pnls) >= 5:
+                sym_wr = sum(1 for p in pnls if p > 0) / len(pnls)
+                sym_total = sum(pnls)
+                if sym_wr < 0.25 and sym_total < 0:
+                    self.adjustments[f"scale_{sym}"] = 0.5
+                    changes.append(f"{sym} 포지션 50% 축소 (승률 {sym_wr:.0%})")
+                elif sym_wr > 0.6 and sym_total > 0:
+                    self.adjustments[f"scale_{sym}"] = 1.3
+                    changes.append(f"{sym} 포지션 30% 확대 (승률 {sym_wr:.0%})")
+
+        # === 3. 승률 기반 전체 포지션 스케일 조정 ===
+        if win_rate < 0.3:
+            self.adjustments["global_scale"] = max(0.3, self.adjustments.get("global_scale", 1.0) - 0.1)
+            changes.append(f"전체 포지션 축소 → {self.adjustments['global_scale']:.1f}x (승률 {win_rate:.0%})")
+        elif win_rate > 0.55 and total_pnl > 0:
+            self.adjustments["global_scale"] = min(1.5, self.adjustments.get("global_scale", 1.0) + 0.1)
+            changes.append(f"전체 포지션 확대 → {self.adjustments['global_scale']:.1f}x (승률 {win_rate:.0%})")
+
+        # === 4. 평균 손실 대비 평균 이익 비율 (RR비) → TP/SL 조정 제안 ===
+        win_pnls = [t.get("pnl", 0) for t in all_trades if t.get("pnl", 0) > 0]
+        loss_pnls = [t.get("pnl", 0) for t in all_trades if t.get("pnl", 0) <= 0]
+        if win_pnls and loss_pnls:
+            avg_win = sum(win_pnls) / len(win_pnls)
+            avg_loss = abs(sum(loss_pnls) / len(loss_pnls))
+            rr_ratio = avg_win / avg_loss if avg_loss > 0 else 1.0
+            self.adjustments["rr_ratio"] = round(rr_ratio, 2)
+            if rr_ratio < 1.0:
+                changes.append(f"RR비 {rr_ratio:.2f} (손실>이익) → TP 확대 or SL 축소 필요")
+            elif rr_ratio > 2.0:
+                changes.append(f"RR비 {rr_ratio:.2f} (양호)")
+
         logger.info(
             f"[StrategyOptimizer] 일일 최적화: {len(all_trades)}건 | "
             f"승률 {win_rate:.0%} | PnL: ${total_pnl:.2f} | "
             f"베스트시간: {best_hours} | 워스트시간: {worst_hours}"
         )
+        if changes:
+            for c in changes:
+                logger.info(f"[StrategyOptimizer] 📐 조정: {c}")
+
+        return {"win_rate": win_rate, "total_pnl": total_pnl, "changes": changes}

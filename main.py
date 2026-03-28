@@ -1155,14 +1155,22 @@ class AutoTrader:
             return
 
         if c["action"] in ("long", "short") and symbol not in om.positions:
+            # StrategyOptimizer 조정값 적용 (시간대/종목별 스케일)
+            opt_scale = self.strategy_optimizer_live.get_position_scale(
+                symbol=symbol, hour=datetime.utcnow().hour
+            )
+            if opt_scale <= 0:
+                logger.info(f"[LIVE] {symbol} 거래 차단 (optimizer: 시간대/종목 회피)")
+                return
+
             # LIVE는 실제 거래소 잔고 기준 사이즈 조정
             try:
                 balance = await om.exchange.get_balance()
                 live_free = balance.get("free", 0)
-                # 가용 잔고의 90% 사용 (수수료 여유분)
-                live_size = live_free * 0.90
+                # 가용 잔고의 90% × optimizer 스케일
+                live_size = live_free * 0.90 * opt_scale
                 if live_size < self.min_order_notional / c["dynamic_lev"]:
-                    logger.warning(f"[LIVE] 잔고 부족: ${live_free:.2f} (필요: ${self.min_order_notional / c['dynamic_lev']:.2f})")
+                    logger.warning(f"[LIVE] 잔고 부족: ${live_free:.2f} × {opt_scale:.1f} (필요: ${self.min_order_notional / c['dynamic_lev']:.2f})")
                     return
                 c["size"] = live_size
                 c["notional"] = live_size * c["dynamic_lev"]

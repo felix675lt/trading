@@ -51,23 +51,34 @@ class RLAgent:
         return self.env
 
     def train(self, env: TradingEnvironment, total_timesteps: int | None = None):
-        """PPO 에이전트 학습"""
+        """PPO 에이전트 학습 (기존 모델이 있으면 이어서 학습)"""
         timesteps = total_timesteps or self.config.get("total_timesteps", 100000)
 
-        self.model = PPO(
-            "MlpPolicy",
-            env,
-            learning_rate=self.config.get("learning_rate", 3e-4),
-            n_steps=self.config.get("n_steps", 2048),
-            batch_size=self.config.get("batch_size", 64),
-            gamma=self.config.get("gamma", 0.99),
-            verbose=0,
-            policy_kwargs={"net_arch": [256, 256, 128]},
-        )
+        if self.model is not None:
+            # === 기존 모델에서 이어서 학습 (continual learning) ===
+            logger.info(f"PPO 이어서 학습 시작 - {timesteps // 2} steps (기존 모델 기반)")
+            # 기존 모델에 새 환경 연결
+            self.model.set_env(env)
+            # 학습률을 절반으로 낮춰서 기존 지식 보존
+            self.model.learning_rate = self.config.get("learning_rate", 3e-4) * 0.5
+            finetune_steps = timesteps // 2  # 스텝도 절반
+        else:
+            # === 최초 학습 ===
+            logger.info(f"PPO 최초 학습 시작 - {timesteps} steps")
+            self.model = PPO(
+                "MlpPolicy",
+                env,
+                learning_rate=self.config.get("learning_rate", 3e-4),
+                n_steps=self.config.get("n_steps", 2048),
+                batch_size=self.config.get("batch_size", 64),
+                gamma=self.config.get("gamma", 0.99),
+                verbose=0,
+                policy_kwargs={"net_arch": [256, 256, 128]},
+            )
+            finetune_steps = timesteps
 
         callback = TradingCallback(eval_freq=10000)
-        logger.info(f"PPO 학습 시작 - {timesteps} steps")
-        self.model.learn(total_timesteps=timesteps, callback=callback)
+        self.model.learn(total_timesteps=finetune_steps, callback=callback)
         logger.info("PPO 학습 완료")
 
         metrics = env.get_metrics()
