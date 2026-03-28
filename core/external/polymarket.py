@@ -110,67 +110,66 @@ class PolymarketCollector:
             return self._empty_signal()
 
     async def _discover_markets(self):
-        """크립토 관련 활성 마켓 검색"""
+        """크립토 관련 활성 마켓 검색 (public-search API 사용)"""
+        import json as json_mod
         discovered = []
 
         async with aiohttp.ClientSession() as session:
             for keyword in self.CRYPTO_KEYWORDS + self.MACRO_KEYWORDS:
                 try:
-                    url = f"{self.GAMMA_BASE}/events"
-                    params = {
-                        "title_contains": keyword,
-                        "active": "true",
-                        "closed": "false",
-                        "limit": 5,
-                        "order": "volume24hr",
-                        "ascending": "false",
-                    }
+                    # public-search는 events 안에 markets가 nested
+                    url = f"{self.GAMMA_BASE}/public-search"
+                    params = {"q": keyword, "limit": 5}
                     async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status != 200:
                             continue
-                        events = await resp.json()
+                        data = await resp.json()
 
-                        for event in events:
-                            markets = event.get("markets", [])
-                            for mkt in markets:
-                                if not mkt.get("active") or mkt.get("closed"):
-                                    continue
+                    events = data.get("events", []) if isinstance(data, dict) else data
 
-                                market_id = mkt.get("id", "")
-                                title = (mkt.get("question") or mkt.get("groupItemTitle") or "").lower()
+                    for event in events:
+                        event_title = event.get("title", "")
+                        markets = event.get("markets", [])
 
-                                # 크립토 영향도 판별
-                                impact = self._assess_crypto_impact(title)
-                                if abs(impact) < 0.1:
-                                    continue
+                        for mkt in markets:
+                            if mkt.get("closed") or mkt.get("archived"):
+                                continue
 
-                                # 중복 제거
-                                if any(m["id"] == market_id for m in discovered):
-                                    continue
+                            market_id = mkt.get("id", "")
+                            question = (mkt.get("question") or mkt.get("groupItemTitle") or "").lower()
+                            title = f"{event_title} {question}".lower()
 
-                                outcome_prices = mkt.get("outcomePrices", "[]")
-                                if isinstance(outcome_prices, str):
-                                    import json
-                                    try:
-                                        outcome_prices = json.loads(outcome_prices)
-                                    except Exception:
-                                        outcome_prices = []
+                            # 크립토 영향도 판별
+                            impact = self._assess_crypto_impact(title)
+                            if abs(impact) < 0.1:
+                                continue
 
-                                yes_price = float(outcome_prices[0]) if outcome_prices else 0.5
+                            # 중복 제거
+                            if any(m["id"] == market_id for m in discovered):
+                                continue
 
-                                discovered.append({
-                                    "id": market_id,
-                                    "title": title,
-                                    "event_title": event.get("title", ""),
-                                    "impact": impact,
-                                    "yes_price": yes_price,
-                                    "volume_24h": float(mkt.get("volume24hr", 0) or 0),
-                                    "volume_total": float(mkt.get("volumeNum", 0) or 0),
-                                    "one_hour_change": float(mkt.get("oneHourPriceChange", 0) or 0),
-                                    "one_day_change": float(mkt.get("oneDayPriceChange", 0) or 0),
-                                    "clob_token_ids": mkt.get("clobTokenIds", []),
-                                    "condition_id": mkt.get("conditionId", ""),
-                                })
+                            outcome_prices = mkt.get("outcomePrices", "[]")
+                            if isinstance(outcome_prices, str):
+                                try:
+                                    outcome_prices = json_mod.loads(outcome_prices)
+                                except Exception:
+                                    outcome_prices = []
+
+                            yes_price = float(outcome_prices[0]) if outcome_prices else 0.5
+
+                            discovered.append({
+                                "id": market_id,
+                                "title": question,
+                                "event_title": event_title,
+                                "impact": impact,
+                                "yes_price": yes_price,
+                                "volume_24h": float(mkt.get("volume24hr", 0) or 0),
+                                "volume_total": float(mkt.get("volumeNum", 0) or 0),
+                                "one_hour_change": float(mkt.get("oneHourPriceChange", 0) or 0),
+                                "one_day_change": float(mkt.get("oneDayPriceChange", 0) or 0),
+                                "clob_token_ids": mkt.get("clobTokenIds", []),
+                                "condition_id": mkt.get("conditionId", ""),
+                            })
 
                     await asyncio.sleep(0.2)  # rate limit 배려
 
