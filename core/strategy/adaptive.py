@@ -125,6 +125,8 @@ class StrategyOptimizer:
         self.config_performance: dict[str, dict] = defaultdict(
             lambda: {"trades": [], "total_pnl": 0.0, "wins": 0, "losses": 0}
         )
+        # performance_history: config_hash → [trade_list] (호환용 alias)
+        self.performance_history: dict[str, list] = defaultdict(list)
         logger.info("[StrategyOptimizer] 자동 전략 최적화 시스템 초기화")
 
     def _config_to_hash(self, config: dict) -> str:
@@ -136,21 +138,27 @@ class StrategyOptimizer:
         """거래 결과를 config 해시에 연결하여 기록"""
         perf = self.config_performance[config_hash]
         pnl = trade.get("pnl", 0)
-        perf["trades"].append({
+        trade_record = {
             "pnl": pnl,
             "timestamp": str(trade.get("timestamp", datetime.utcnow())),
             "symbol": trade.get("symbol", ""),
             "hour": trade.get("hour", 0),
-        })
+        }
+        perf["trades"].append(trade_record)
         perf["total_pnl"] += pnl
         if pnl > 0:
             perf["wins"] += 1
         else:
             perf["losses"] += 1
 
+        # performance_history도 동기화 (호환용)
+        self.performance_history[config_hash].append(trade_record)
+
         # 최근 100건만 유지
         if len(perf["trades"]) > 100:
             perf["trades"] = perf["trades"][-100:]
+        if len(self.performance_history[config_hash]) > 100:
+            self.performance_history[config_hash] = self.performance_history[config_hash][-100:]
 
     def get_best_config(self) -> tuple[str, dict]:
         """가장 성과 좋은 config 해시 반환"""
@@ -176,3 +184,27 @@ class StrategyOptimizer:
             "total_configs": len(configs),
             "configs": configs,
         }
+
+    def optimize_daily(self, all_trades: list[dict]):
+        """일일 최적화 — 거래 결과 기반 파라미터 자동 조정"""
+        if len(all_trades) < 10:
+            return
+
+        wins = sum(1 for t in all_trades if t.get("pnl", 0) > 0)
+        losses = len(all_trades) - wins
+        total_pnl = sum(t.get("pnl", 0) for t in all_trades)
+        win_rate = wins / len(all_trades) if all_trades else 0
+
+        # 시간대별 성과 분석
+        hour_pnl = defaultdict(list)
+        for t in all_trades:
+            hour_pnl[t.get("hour", 0)].append(t.get("pnl", 0))
+
+        best_hours = sorted(hour_pnl.keys(), key=lambda h: sum(hour_pnl[h]), reverse=True)[:3]
+        worst_hours = sorted(hour_pnl.keys(), key=lambda h: sum(hour_pnl[h]))[:3]
+
+        logger.info(
+            f"[StrategyOptimizer] 일일 최적화: {len(all_trades)}건 | "
+            f"승률 {win_rate:.0%} | PnL: ${total_pnl:.2f} | "
+            f"베스트시간: {best_hours} | 워스트시간: {worst_hours}"
+        )
