@@ -159,6 +159,39 @@ class AutoTrader:
             first_client = list(self.exchange_clients.values())[0]
             self.listing_detector.exchange = first_client
 
+        # SL 콜백 등록 (SL 체결 시 피드백 학습 + 텔레그램 알림)
+        def on_sl_triggered(result: dict):
+            symbol = result.get("symbol", "?")
+            pnl = result.get("pnl", 0)
+            side = result.get("side", "?")
+
+            # 피드백 학습에 기록
+            self.feedback.record_trade(
+                {"pnl": pnl, "side": side, "symbol": symbol},
+                {"regime": "unknown", "signal": 0, "confidence": 0,
+                 "external_score": 0, "external_direction": "neutral"},
+            )
+            self.risk_manager.record_pnl(pnl)
+            self.storage.save_trade({
+                "exchange": "binance", "symbol": symbol, "side": "close",
+                "price": result.get("exit_price", 0),
+                "amount": result.get("size", 0),
+                "pnl": pnl, "fee": 0, "strategy": "sl_triggered",
+            })
+
+            logger.info(f"[SL학습] {symbol} {side} SL 체결 → PnL: ${pnl:.2f} → 피드백 기록 완료")
+            tg_notify(
+                f"🛑 <b>SL 체결</b>\n"
+                f"━━━━━━━━━━━━━\n"
+                f"종목: {symbol}\n"
+                f"방향: {side}\n"
+                f"PnL: ${pnl:+.2f}\n"
+                f"📝 피드백 학습에 기록됨"
+            )
+
+        for om in self.order_managers.values():
+            om.set_sl_callback(on_sl_triggered)
+
         logger.info("AutoTrader 초기화 완료")
 
     async def run_backtest(self):
@@ -496,6 +529,27 @@ class AutoTrader:
             elif mtf_signal.get("higher_tf_conflict"):
                 decision.confidence *= 0.85
                 decision.reason += " ! TF충돌"
+
+        # === 펀딩비 필터 (_process_symbol 경로) ===
+        if decision.action in ("long", "short"):
+            ext_features_all = self.external_manager.get_all_features()
+            funding_rate = ext_features_all.get("deriv_funding_rate", 0)
+
+            if decision.action == "short" and funding_rate < -0.5:
+                old_conf = decision.confidence
+                decision.confidence *= 0.5
+                decision.reason += f" !음펀비({funding_rate:.1f}bp)숏감액"
+                if decision.confidence < self.strategy_manager.min_confidence:
+                    decision.action = "hold"
+                    decision.size = 0.0
+                    decision.reason += " →차단"
+                logger.info(
+                    f"[FundingFilter] {symbol} 음펀비 {funding_rate:.2f}bp + SHORT "
+                    f"→ conf {old_conf:.2f}→{decision.confidence:.2f}"
+                )
+            elif decision.action == "long" and funding_rate > 2.0:
+                decision.confidence *= 0.7
+                decision.reason += f" !양펀비({funding_rate:.1f}bp)롱감액"
 
         self.last_signals = {
             "symbol": symbol,
@@ -840,6 +894,29 @@ class AutoTrader:
                 elif action_agrees_mtf and mtf_agreement > 0.7:
                     decision.confidence = min(decision.confidence * 1.15, 1.0)
 
+            # === 펀딩비 필터: 음펀비에서 숏 진입 차단 ===
+            # 음펀비 = 시장 과매도 → 반등 확률↑ → 숏 SL 확률↑
+            if decision.action in ("long", "short"):
+                ext_features = self.external_manager.get_all_features()
+                funding_rate = ext_features.get("deriv_funding_rate", 0)  # bp 단위
+
+                if decision.action == "short" and funding_rate < -0.5:
+                    # 음펀비 -0.5bp 이하에서 숏 → 확신도 50% 감소
+                    old_conf = decision.confidence
+                    decision.confidence *= 0.5
+                    decision.reason += f" !음펀비({funding_rate:.1f}bp)숏감액"
+                    if decision.confidence < self.strategy_manager.min_confidence:
+                        decision.action = "hold"
+                        decision.reason += " →차단"
+                    logger.info(
+                        f"[FundingFilter] {symbol} 음펀비 {funding_rate:.2f}bp + SHORT "
+                        f"→ conf {old_conf:.2f}→{decision.confidence:.2f}"
+                    )
+                elif decision.action == "long" and funding_rate > 2.0:
+                    # 양펀비 +2bp 이상에서 롱 → 확신도 30% 감소 (과열)
+                    decision.confidence *= 0.7
+                    decision.reason += f" !양펀비({funding_rate:.1f}bp)롱감액"
+
             price = float(df["close"].iloc[-1])
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
 
@@ -1025,6 +1102,22 @@ class AutoTrader:
             if live_result:
                 live_pnl = live_result.get("pnl", 0) if isinstance(live_result, dict) else 0
                 logger.info(f"[LIVE] 청산 {symbol} | PnL: ${live_pnl:.2f}")
+
+                # LIVE 청산도 피드백 학습에 기록
+                self.feedback.record_trade(
+                    {"pnl": live_pnl, "side": live_result.get("side", ""), "symbol": symbol},
+                    {"regime": c.get("regime", "unknown"), "signal": 0,
+                     "confidence": c.get("confidence", 0),
+                     "external_score": c.get("ext_signal", {}).get("score", 0) if isinstance(c.get("ext_signal"), dict) else 0,
+                     "external_direction": "neutral"},
+                )
+                self.storage.save_trade({
+                    "exchange": exchange_name, "symbol": symbol, "side": "close",
+                    "price": live_result.get("exit_price", 0),
+                    "amount": live_result.get("size", 0),
+                    "pnl": live_pnl, "fee": 0, "strategy": "live_concentration",
+                })
+
                 add_live_log({
                     "time": datetime.utcnow().strftime("%H:%M:%S"),
                     "type": "trade_close",

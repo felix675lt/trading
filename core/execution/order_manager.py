@@ -33,6 +33,11 @@ class OrderManager:
         self.risk_config = risk_config
         self.positions: dict[str, Position] = {}
         self._failed_attempts: dict[str, int] = {}  # 연속 실패 횟수
+        self._on_sl_callback = None  # SL 소멸 감지 콜백
+
+    def set_sl_callback(self, callback):
+        """SL/자동청산 감지 시 호출할 콜백 등록 (피드백 학습용)"""
+        self._on_sl_callback = callback
 
     async def open_position(
         self,
@@ -175,10 +180,32 @@ class OrderManager:
 
                 # 2. 거래소에 포지션이 없음 → SL 체결 등으로 이미 청산됨
                 if exchange_size == 0:
+                    # SL PnL 추정 (SL가격 기준)
+                    if pos.side == "long":
+                        sl_pnl = (pos.stop_loss - pos.entry_price) / pos.entry_price * pos.size * pos.entry_price
+                    else:
+                        sl_pnl = (pos.entry_price - pos.stop_loss) / pos.entry_price * pos.size * pos.entry_price
+
                     logger.info(
                         f"[OrderManager] {symbol} 거래소에서 포지션 소멸 감지 "
-                        f"(SL/청산 체결) → 내부 정리 + 잔여 주문 취소"
+                        f"(SL/청산 체결) → 추정 PnL: ${sl_pnl:.2f} | 내부 정리 + 잔여 주문 취소"
                     )
+
+                    # 피드백 콜백 호출 (SL 패턴 학습용)
+                    if self._on_sl_callback:
+                        try:
+                            self._on_sl_callback({
+                                "symbol": symbol,
+                                "side": pos.side,
+                                "entry_price": pos.entry_price,
+                                "exit_price": pos.stop_loss,
+                                "size": pos.size,
+                                "pnl": sl_pnl,
+                                "reason": "SL 체결 (거래소 자동)",
+                            })
+                        except Exception as cb_e:
+                            logger.debug(f"SL 콜백 실패: {cb_e}")
+
                     # 잔여 오픈 오더 전부 취소
                     await self.exchange.cancel_all_orders(symbol)
                     del self.positions[symbol]

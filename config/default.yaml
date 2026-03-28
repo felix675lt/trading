@@ -17,7 +17,10 @@ exchanges:
 
 trading:
   symbols:
-    - "BTC/USDT:USDT"
+    # BTC 제외: 시드 $10K 미만에서는 변동성 대비 수익 비효율
+    # BTC 일중범위 3.5% vs SOL 5.8% → 같은 돈으로 65% 더 벌 수 있음
+    # BTC는 시드 $10K 이상에서 재활성화
+    #- "BTC/USDT:USDT"
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
     - "DOGE/USDT:USDT"
