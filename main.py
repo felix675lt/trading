@@ -38,6 +38,13 @@ try:
     _tg_ok = True
 except Exception:
     _tg_ok = False
+    # fallback 함수 정의 (telegram_bot.py 없을 때)
+    def format_trade_open(mode, symbol, action, price, notional, lev, reason):
+        return f"{mode} {action.upper()} {symbol} @ {price} ({notional:.0f}$ x{lev}) | {reason}"
+    def format_trade_close(mode, symbol, pnl, reason, duration=0):
+        return f"{mode} 청산 {symbol} PnL: ${pnl:+.2f} | {reason}"
+    def format_system_alert(msg):
+        return f"⚠️ {msg}"
 
 def tg_notify(text, silent=False):
     """비동기 안전 텔레그램 알림 (실패 무시)"""
