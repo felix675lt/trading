@@ -112,23 +112,34 @@ class OrderManager:
                     stop_loss = entry_price * (1 + sl_pct)
                     take_profit = entry_price * (1 - tp_pct)
 
-                # 기존 대기 주문 확인
-                open_orders = []
-                try:
-                    open_orders = await self.exchange.exchange.fetch_open_orders(symbol)
-                except Exception:
-                    pass
-
+                # 기존 Algo 주문 확인 (SL/TP)
+                algo_orders = await self.exchange.get_algo_orders(symbol)
                 has_sl = any(
-                    o.get("type", "").lower() in ("stop_market", "stop", "stop_loss")
-                    for o in open_orders
+                    o.get("orderType", "").upper() in ("STOP_MARKET", "STOP")
+                    for o in algo_orders
+                )
+                has_tp = any(
+                    o.get("orderType", "").upper() in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT")
+                    for o in algo_orders
                 )
 
-                # SL 없으면 재설정
+                # 기존 주문 전부 취소 후 깨끗하게 재설정
+                if algo_orders:
+                    await self.exchange.cancel_all_orders(symbol)
+                    has_sl = False
+                    has_tp = False
+
+                close_side = "sell" if side == "long" else "buy"
+
+                # SL 설정
                 if not has_sl:
-                    sl_side = "sell" if side == "long" else "buy"
-                    await self.exchange.create_stop_loss(symbol, sl_side, size, stop_loss)
-                    logger.warning(f"[복구] {symbol} SL 재설정: {stop_loss:.4f}")
+                    await self.exchange.create_stop_loss(symbol, close_side, size, stop_loss)
+                    logger.warning(f"[복구] {symbol} SL 설정: {stop_loss:.4f}")
+
+                # TP 설정
+                if not has_tp:
+                    await self.exchange.create_take_profit(symbol, close_side, size, take_profit)
+                    logger.warning(f"[복구] {symbol} TP 설정: {take_profit:.4f}")
 
                 position = Position(
                     symbol=symbol,
@@ -142,7 +153,7 @@ class OrderManager:
                 recovered.append(position)
                 logger.info(
                     f"[복구] 포지션 복구: {side} {size} {symbol} @ {entry_price:.4f} "
-                    f"| SL: {stop_loss:.4f} TP: {take_profit:.4f} | SL주문={'기존' if has_sl else '재설정'}"
+                    f"| SL: {stop_loss:.4f} TP: {take_profit:.4f}"
                 )
 
             except Exception as e:
@@ -208,9 +219,10 @@ class OrderManager:
                 stop_loss = fill_price * (1 + sl_pct)
                 take_profit = fill_price * (1 - tp_pct)
 
-            # 스탑로스 주문
+            # 스탑로스 + 테이크프로핏 주문 (거래소 Algo Order)
             sl_side = "sell" if side == "long" else "buy"
             await self.exchange.create_stop_loss(symbol, sl_side, amount, stop_loss)
+            await self.exchange.create_take_profit(symbol, sl_side, amount, take_profit)
 
             position = Position(
                 symbol=symbol,

@@ -116,14 +116,56 @@ class ExchangeClient:
         return await self.create_market_order(symbol, close_side, size)
 
     async def cancel_all_orders(self, symbol: str):
-        """모든 미체결 주문 취소"""
+        """모든 미체결 주문 취소 (일반 주문 + Algo 조건부 주문)"""
+        cancelled = 0
+        # 1. 일반 미체결 주문 취소
         try:
             orders = await self.exchange.fetch_open_orders(symbol)
             for order in orders:
                 await self.exchange.cancel_order(order["id"], symbol)
-            logger.info(f"{symbol} 미체결 주문 {len(orders)}건 취소")
+                cancelled += 1
         except Exception as e:
-            logger.warning(f"주문 취소 실패: {e}")
+            logger.warning(f"일반 주문 취소 실패: {e}")
+
+        # 2. Algo 조건부 주문 취소 (SL/TP — Binance Algo Order API)
+        try:
+            # symbol → Binance 심볼 (e.g., "SOL/USDT:USDT" → "SOLUSDT")
+            raw_symbol = symbol.replace("/", "").replace(":USDT", "")
+            result = await self.exchange.fapiPrivateGetOpenAlgoOrders({})
+            algo_orders = result if isinstance(result, list) else result.get("orders", [])
+            for ao in algo_orders:
+                if ao.get("symbol") == raw_symbol:
+                    try:
+                        await self.exchange.fapiPrivateDeleteAlgoOrder({"algoId": ao["algoId"]})
+                        cancelled += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"Algo 주문 조회/취소 실패: {e}")
+
+        if cancelled > 0:
+            logger.info(f"{symbol} 주문 {cancelled}건 취소 (일반+Algo)")
+
+    async def create_take_profit(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
+        """테이크프로핏 주문 (거래소 Algo Order)"""
+        try:
+            params = {"stopPrice": tp_price, "reduceOnly": True}
+            order = await self.exchange.create_order(symbol, "take_profit_market", side, amount, None, params)
+            logger.info(f"테이크프로핏 설정: {side} {amount} {symbol} @ {tp_price}")
+            return order
+        except Exception as e:
+            logger.warning(f"테이크프로핏 설정 실패: {e}")
+            return {}
+
+    async def get_algo_orders(self, symbol: str) -> list[dict]:
+        """Algo 조건부 주문 조회 (SL/TP)"""
+        try:
+            raw_symbol = symbol.replace("/", "").replace(":USDT", "")
+            result = await self.exchange.fapiPrivateGetOpenAlgoOrders({})
+            algo_orders = result if isinstance(result, list) else result.get("orders", [])
+            return [ao for ao in algo_orders if ao.get("symbol") == raw_symbol]
+        except Exception:
+            return []
 
     async def get_amount_precision(self, symbol: str) -> float:
         """심볼의 최소 수량 단위(step size) 조회"""
