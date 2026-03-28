@@ -159,38 +159,57 @@ class AutoTrader:
             first_client = list(self.exchange_clients.values())[0]
             self.listing_detector.exchange = first_client
 
-        # SL 콜백 등록 (SL 체결 시 피드백 학습 + 텔레그램 알림)
-        def on_sl_triggered(result: dict):
-            symbol = result.get("symbol", "?")
-            pnl = result.get("pnl", 0)
-            side = result.get("side", "?")
+        # SL/TP 콜백 등록 (체결 시 피드백 학습 + 텔레그램 알림)
+        def _make_trade_callback(close_type: str):
+            """SL/TP 공통 콜백 생성"""
+            def on_triggered(result: dict):
+                symbol = result.get("symbol", "?")
+                pnl = result.get("pnl", 0)
+                side = result.get("side", "?")
 
-            # 피드백 학습에 기록
-            self.feedback.record_trade(
-                {"pnl": pnl, "side": side, "symbol": symbol},
-                {"regime": "unknown", "signal": 0, "confidence": 0,
-                 "external_score": 0, "external_direction": "neutral"},
-            )
-            self.risk_manager.record_pnl(pnl)
-            self.storage.save_trade({
-                "exchange": "binance", "symbol": symbol, "side": "close",
-                "price": result.get("exit_price", 0),
-                "amount": result.get("size", 0),
-                "pnl": pnl, "fee": 0, "strategy": "sl_triggered",
-            })
+                # 현재 시장 레짐 가져오기
+                regime = self.adaptive.current_regime if hasattr(self, 'adaptive_optimizer') else "unknown"
 
-            logger.info(f"[SL학습] {symbol} {side} SL 체결 → PnL: ${pnl:.2f} → 피드백 기록 완료")
-            tg_notify(
-                f"🛑 <b>SL 체결</b>\n"
-                f"━━━━━━━━━━━━━\n"
-                f"종목: {symbol}\n"
-                f"방향: {side}\n"
-                f"PnL: ${pnl:+.2f}\n"
-                f"📝 피드백 학습에 기록됨"
-            )
+                # 피드백 학습에 기록
+                self.feedback.record_trade(
+                    {"pnl": pnl, "side": side, "symbol": symbol},
+                    {"regime": regime, "signal": 0, "confidence": 0,
+                     "external_score": 0, "external_direction": "neutral"},
+                )
+                self.risk_manager.record_pnl(pnl)
+                self.storage.save_trade({
+                    "exchange": "binance", "symbol": symbol, "side": "close",
+                    "price": result.get("exit_price", 0),
+                    "amount": result.get("size", 0),
+                    "pnl": pnl, "fee": 0,
+                    "strategy": f"{close_type.lower()}_triggered",
+                })
+
+                # StrategyOptimizer 기록
+                l_hash = self.strategy_optimizer_live._config_to_hash(
+                    self.strategy_optimizer_live.current_config
+                )
+                self.strategy_optimizer_live.record_trade(l_hash, {
+                    "pnl": pnl, "timestamp": datetime.utcnow(),
+                    "symbol": symbol, "hour": datetime.utcnow().hour,
+                })
+
+                emoji = "🛑" if close_type == "SL" else "🎯"
+                logger.info(f"[{close_type}학습] {symbol} {side} {close_type} 체결 → PnL: ${pnl:.2f} → 학습기록 완료 (regime={regime})")
+                tg_notify(
+                    f"{emoji} <b>{close_type} 체결</b>\n"
+                    f"━━━━━━━━━━━━━\n"
+                    f"종목: {symbol}\n"
+                    f"방향: {side}\n"
+                    f"PnL: ${pnl:+.2f}\n"
+                    f"레짐: {regime}\n"
+                    f"📝 피드백 학습에 기록됨"
+                )
+            return on_triggered
 
         for om in self.order_managers.values():
-            om.set_sl_callback(on_sl_triggered)
+            om.set_sl_callback(_make_trade_callback("SL"))
+            om.set_tp_callback(_make_trade_callback("TP"))
 
         # 시스템 재시작 시 기존 포지션 복구 + SL 재설정
         trading_symbols = self.config.get("trading", {}).get("symbols", [])
@@ -805,6 +824,24 @@ class AutoTrader:
                             self.strategy_optimizer_live.current_config
                         )
                         live_pnl = live_result.get("pnl", 0) if isinstance(live_result, dict) else 0
+
+                        # 학습 기록 (feedback + storage + risk)
+                        self.risk_manager.record_pnl(live_pnl)
+                        self.feedback.record_trade(
+                            {"pnl": live_pnl, "side": live_result.get("side", ""), "symbol": symbol},
+                            {"regime": adaptive_params.get("regime", "unknown"),
+                             "signal": ml_signal, "confidence": decision.confidence,
+                             "external_score": ext_signal.get("score", 0) if isinstance(ext_signal, dict) else 0,
+                             "external_direction": ext_signal.get("direction", "neutral") if isinstance(ext_signal, dict) else "neutral"},
+                        )
+                        self.storage.save_trade({
+                            "exchange": exchange_name, "symbol": symbol, "side": "close",
+                            "price": live_result.get("exit_price", 0),
+                            "amount": live_result.get("size", 0),
+                            "pnl": live_pnl, "fee": 0, "strategy": "live_signal_close",
+                        })
+
+                        # StrategyOptimizer 기록
                         self.strategy_optimizer_live.record_trade(l_hash, {
                             "pnl": live_pnl,
                             "timestamp": datetime.utcnow(),
@@ -820,7 +857,7 @@ class AutoTrader:
                             "pnl": round(live_pnl, 2),
                             "reason": decision.reason,
                         })
-                        logger.info(f"[LIVE] 청산 {symbol} | PnL: ${live_pnl:.2f}")
+                        logger.info(f"[LIVE] 청산 {symbol} | PnL: ${live_pnl:.2f} → 학습기록 완료")
                         tg_notify(format_trade_close("🔥LIVE", symbol, live_pnl, decision.reason))
 
         # 페이퍼 트레이더 가격 업데이트 (paper / dual)
@@ -837,10 +874,17 @@ class AutoTrader:
                 if age_minutes > 240 and pos.unrealized_pnl < 0:
                     result = self.paper_trader.close_position(symbol, price, f"자기수정: {age_minutes:.0f}분 보유 + 손실")
                     if result:
-                        self.risk_manager.record_pnl(result["pnl"])
+                        stale_pnl = result["pnl"]
+                        self.risk_manager.record_pnl(stale_pnl)
+                        self.feedback.record_trade(
+                            {"pnl": stale_pnl, "side": result.get("side", ""), "symbol": symbol},
+                            {"regime": self.adaptive.current_regime,
+                             "signal": 0, "confidence": 0,
+                             "external_score": 0, "external_direction": "neutral"},
+                        )
                         self.storage.save_trade({
                             "exchange": exchange_name, "symbol": symbol, "side": "close",
-                            "price": price, "amount": result["size"], "pnl": result["pnl"],
+                            "price": price, "amount": result["size"], "pnl": stale_pnl,
                             "fee": result["fee"], "strategy": "auto_close",
                         })
                         add_live_log({
@@ -848,11 +892,11 @@ class AutoTrader:
                             "type": "trade_close",
                             "mode": "PAPER",
                             "symbol": symbol,
-                            "pnl": round(result["pnl"], 2),
+                            "pnl": round(stale_pnl, 2),
                             "reason": f"자기수정: {age_minutes:.0f}분 stale 포지션 청산",
                         })
-                        logger.info(f"[자기수정] PAPER stale 청산 {symbol} | PnL: ${result['pnl']:.2f} | {age_minutes:.0f}분 보유")
-                        tg_notify(format_trade_close("PAPER", symbol, result["pnl"], f"자기수정: stale 청산 ({age_minutes:.0f}분)"), silent=True)
+                        logger.info(f"[자기수정] PAPER stale 청산 {symbol} | PnL: ${stale_pnl:.2f} | {age_minutes:.0f}분 보유 → 학습기록 완료")
+                        tg_notify(format_trade_close("PAPER", symbol, stale_pnl, f"자기수정: stale 청산 ({age_minutes:.0f}분)"), silent=True)
 
     # =========================================================================
     # 집중 매매 모드 메서드 (concentration_mode=true)
@@ -1059,9 +1103,31 @@ class AutoTrader:
         elif c["action"] == "close" and symbol in self.paper_trader.positions:
             result = self.paper_trader.close_position(symbol, c["price"], c["reason"])
             if result:
-                self.risk_manager.record_pnl(result["pnl"])
-                logger.info(f"[PAPER] 청산 {symbol} | PnL: ${result['pnl']:.2f}")
-                tg_notify(format_trade_close("PAPER", symbol, result["pnl"], c["reason"], result.get("duration_minutes", 0)), silent=True)
+                paper_pnl = result["pnl"]
+                self.risk_manager.record_pnl(paper_pnl)
+
+                # 학습 기록 (feedback + storage + optimizer)
+                self.feedback.record_trade(
+                    {"pnl": paper_pnl, "side": c["action_before_close"] if "action_before_close" in c else result.get("side", ""), "symbol": symbol},
+                    {"regime": c.get("adaptive_params", {}).get("regime", "unknown"),
+                     "signal": c.get("ml_signal", 0), "confidence": c.get("confidence", 0),
+                     "external_score": 0, "external_direction": "neutral"},
+                )
+                self.storage.save_trade({
+                    "exchange": "paper", "symbol": symbol, "side": "close",
+                    "price": c["price"], "amount": result.get("size", 0),
+                    "pnl": paper_pnl, "fee": 0, "strategy": "paper_concentration",
+                })
+                p_hash = self.strategy_optimizer_paper._config_to_hash(
+                    self.strategy_optimizer_paper.current_config
+                )
+                self.strategy_optimizer_paper.record_trade(p_hash, {
+                    "pnl": paper_pnl, "timestamp": datetime.utcnow(),
+                    "symbol": symbol, "hour": datetime.utcnow().hour,
+                })
+
+                logger.info(f"[PAPER] 청산 {symbol} | PnL: ${paper_pnl:.2f} → 학습기록 완료")
+                tg_notify(format_trade_close("PAPER", symbol, paper_pnl, c["reason"], result.get("duration_minutes", 0)), silent=True)
 
     async def _execute_live(self, exchange_name: str, c: dict):
         """LIVE 포지션 실행 — 가장 강한 시그널에만"""
@@ -1127,16 +1193,26 @@ class AutoTrader:
                 # LIVE 청산도 피드백 학습에 기록
                 self.feedback.record_trade(
                     {"pnl": live_pnl, "side": live_result.get("side", ""), "symbol": symbol},
-                    {"regime": c.get("regime", "unknown"), "signal": 0,
+                    {"regime": c.get("adaptive_params", {}).get("regime", "unknown"),
+                     "signal": c.get("ml_signal", 0),
                      "confidence": c.get("confidence", 0),
                      "external_score": c.get("ext_signal", {}).get("score", 0) if isinstance(c.get("ext_signal"), dict) else 0,
-                     "external_direction": "neutral"},
+                     "external_direction": c.get("ext_signal", {}).get("direction", "neutral") if isinstance(c.get("ext_signal"), dict) else "neutral"},
                 )
                 self.storage.save_trade({
                     "exchange": exchange_name, "symbol": symbol, "side": "close",
                     "price": live_result.get("exit_price", 0),
                     "amount": live_result.get("size", 0),
                     "pnl": live_pnl, "fee": 0, "strategy": "live_concentration",
+                })
+
+                # StrategyOptimizer 기록
+                l_hash = self.strategy_optimizer_live._config_to_hash(
+                    self.strategy_optimizer_live.current_config
+                )
+                self.strategy_optimizer_live.record_trade(l_hash, {
+                    "pnl": live_pnl, "timestamp": datetime.utcnow(),
+                    "symbol": symbol, "hour": datetime.utcnow().hour,
                 })
 
                 add_live_log({

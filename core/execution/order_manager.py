@@ -34,6 +34,7 @@ class OrderManager:
         self.positions: dict[str, Position] = {}
         self._failed_attempts: dict[str, int] = {}  # 연속 실패 횟수
         self._on_sl_callback = None  # SL 소멸 감지 콜백
+        self._on_tp_callback = None  # TP 청산 콜백
         self._last_close_time: dict[str, datetime] = {}  # 심볼별 마지막 청산 시각
         self._last_close_side: dict[str, str] = {}  # 심볼별 마지막 포지션 방향
         self._consecutive_sl: dict[str, int] = {}  # 심볼별 연속 SL 횟수
@@ -42,6 +43,10 @@ class OrderManager:
     def set_sl_callback(self, callback):
         """SL/자동청산 감지 시 호출할 콜백 등록 (피드백 학습용)"""
         self._on_sl_callback = callback
+
+    def set_tp_callback(self, callback):
+        """TP 청산 시 호출할 콜백 등록 (피드백 학습용)"""
+        self._on_tp_callback = callback
 
     def can_reenter(self, symbol: str, side: str) -> tuple[bool, str]:
         """재진입 가능 여부 확인
@@ -311,36 +316,57 @@ class OrderManager:
                 exchange_pos = await self.exchange.get_position(symbol)
                 exchange_size = exchange_pos.get("size", 0) if exchange_pos else 0
 
-                # 2. 거래소에 포지션이 없음 → SL 체결 등으로 이미 청산됨
+                # 2. 거래소에 포지션이 없음 → SL/TP 체결로 이미 청산됨
                 if exchange_size == 0:
-                    # SL PnL 추정 (SL가격 기준)
+                    # 마지막 가격으로 SL인지 TP인지 판별
+                    try:
+                        last_price = await self.exchange.get_ticker_price(symbol)
+                    except Exception:
+                        last_price = pos.stop_loss  # 조회 실패 시 SL로 간주
+
+                    # TP 방향으로 청산됐는지 판별
                     if pos.side == "long":
-                        sl_pnl = (pos.stop_loss - pos.entry_price) / pos.entry_price * pos.size * pos.entry_price
+                        was_tp = last_price >= pos.take_profit * 0.998  # TP 근처
+                        exit_price = pos.take_profit if was_tp else pos.stop_loss
+                        pnl = (exit_price - pos.entry_price) / pos.entry_price * pos.size * pos.entry_price
                     else:
-                        sl_pnl = (pos.entry_price - pos.stop_loss) / pos.entry_price * pos.size * pos.entry_price
+                        was_tp = last_price <= pos.take_profit * 1.002
+                        exit_price = pos.take_profit if was_tp else pos.stop_loss
+                        pnl = (pos.entry_price - exit_price) / pos.entry_price * pos.size * pos.entry_price
+
+                    close_type = "TP" if was_tp else "SL"
+                    was_sl = not was_tp
 
                     logger.info(
                         f"[OrderManager] {symbol} 거래소에서 포지션 소멸 감지 "
-                        f"(SL/청산 체결) → 추정 PnL: ${sl_pnl:.2f} | 내부 정리 + 잔여 주문 취소"
+                        f"({close_type} 체결) → 추정 PnL: ${pnl:.2f} | 내부 정리 + 잔여 주문 취소"
                     )
 
-                    # 재진입 제어 기록 (SL로 간주)
-                    self.record_close(symbol, pos.side, was_sl=True)
+                    # 재진입 제어 기록
+                    self.record_close(symbol, pos.side, was_sl=was_sl)
 
-                    # 피드백 콜백 호출 (SL 패턴 학습용)
-                    if self._on_sl_callback:
+                    # 콜백 호출 (학습용)
+                    callback_data = {
+                        "symbol": symbol,
+                        "side": pos.side,
+                        "entry_price": pos.entry_price,
+                        "exit_price": exit_price,
+                        "size": pos.size,
+                        "pnl": pnl,
+                        "reason": f"{close_type} 체결 (거래소 자동)",
+                        "close_type": close_type,
+                    }
+
+                    if was_sl and self._on_sl_callback:
                         try:
-                            self._on_sl_callback({
-                                "symbol": symbol,
-                                "side": pos.side,
-                                "entry_price": pos.entry_price,
-                                "exit_price": pos.stop_loss,
-                                "size": pos.size,
-                                "pnl": sl_pnl,
-                                "reason": "SL 체결 (거래소 자동)",
-                            })
+                            self._on_sl_callback(callback_data)
                         except Exception as cb_e:
                             logger.debug(f"SL 콜백 실패: {cb_e}")
+                    elif was_tp and self._on_tp_callback:
+                        try:
+                            self._on_tp_callback(callback_data)
+                        except Exception as cb_e:
+                            logger.debug(f"TP 콜백 실패: {cb_e}")
 
                     # 잔여 오픈 오더 전부 취소
                     await self.exchange.cancel_all_orders(symbol)
@@ -352,12 +378,8 @@ class OrderManager:
 
                 if pos.side == "long":
                     pos.unrealized_pnl = (price - pos.entry_price) / pos.entry_price
-                    if price >= pos.take_profit:
-                        await self.close_position(symbol, "TP 도달")
                 else:
                     pos.unrealized_pnl = (pos.entry_price - price) / pos.entry_price
-                    if price <= pos.take_profit:
-                        await self.close_position(symbol, "TP 도달")
             except Exception as e:
                 logger.warning(f"포지션 업데이트 실패 ({symbol}): {e}")
 
