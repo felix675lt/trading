@@ -1,5 +1,10 @@
 """적응형 파라미터 최적화 - 시장 상태에 따라 파라미터 자동 조정"""
 
+import hashlib
+import json
+from collections import defaultdict
+from datetime import datetime
+
 import numpy as np
 from loguru import logger
 
@@ -106,3 +111,68 @@ class AdaptiveOptimizer:
         params = self.regime_params.get(self.current_regime, self.regime_params["normal"])
         params["regime"] = self.current_regime
         return params
+
+
+class StrategyOptimizer:
+    """자동 전략 최적화 시스템 — Paper/Live 독립 추적
+
+    거래 결과를 config 해시별로 기록하고,
+    최적 파라미터 조합을 자동으로 탐색합니다.
+    """
+
+    def __init__(self):
+        self.current_config: dict = {}
+        self.config_performance: dict[str, dict] = defaultdict(
+            lambda: {"trades": [], "total_pnl": 0.0, "wins": 0, "losses": 0}
+        )
+        logger.info("[StrategyOptimizer] 자동 전략 최적화 시스템 초기화")
+
+    def _config_to_hash(self, config: dict) -> str:
+        """설정 dict를 고유 해시로 변환"""
+        serialized = json.dumps(config, sort_keys=True, default=str)
+        return hashlib.md5(serialized.encode()).hexdigest()[:12]
+
+    def record_trade(self, config_hash: str, trade: dict):
+        """거래 결과를 config 해시에 연결하여 기록"""
+        perf = self.config_performance[config_hash]
+        pnl = trade.get("pnl", 0)
+        perf["trades"].append({
+            "pnl": pnl,
+            "timestamp": str(trade.get("timestamp", datetime.utcnow())),
+            "symbol": trade.get("symbol", ""),
+            "hour": trade.get("hour", 0),
+        })
+        perf["total_pnl"] += pnl
+        if pnl > 0:
+            perf["wins"] += 1
+        else:
+            perf["losses"] += 1
+
+        # 최근 100건만 유지
+        if len(perf["trades"]) > 100:
+            perf["trades"] = perf["trades"][-100:]
+
+    def get_best_config(self) -> tuple[str, dict]:
+        """가장 성과 좋은 config 해시 반환"""
+        best_hash = ""
+        best_pnl = float("-inf")
+        for h, perf in self.config_performance.items():
+            if len(perf["trades"]) >= 3 and perf["total_pnl"] > best_pnl:
+                best_pnl = perf["total_pnl"]
+                best_hash = h
+        return best_hash, self.config_performance.get(best_hash, {})
+
+    def get_report(self) -> dict:
+        """성과 리포트"""
+        configs = {}
+        for h, perf in self.config_performance.items():
+            total = perf["wins"] + perf["losses"]
+            configs[h] = {
+                "trades": total,
+                "win_rate": perf["wins"] / total if total > 0 else 0,
+                "total_pnl": round(perf["total_pnl"], 2),
+            }
+        return {
+            "total_configs": len(configs),
+            "configs": configs,
+        }
