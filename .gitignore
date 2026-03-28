@@ -12,3 +12,4 @@ models_saved/
 .venv/
 venv/
 trading/
+.DS_Store

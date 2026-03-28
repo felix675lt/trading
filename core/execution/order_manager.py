@@ -109,14 +109,18 @@ class OrderManager:
             return None
 
     async def close_position(self, symbol: str, reason: str = "") -> dict:
-        """포지션 청산 — 실패 시 포지션 유지, 재시도 가능"""
+        """포지션 청산 — 실패 시 포지션 유지, 재시도 가능
+        청산 완료 시 잔여 오픈 오더(SL/TP) 전부 취소
+        """
         if symbol not in self.positions:
             return {}
 
         pos = self.positions[symbol]
         try:
+            # 1. 먼저 대기 주문(SL/TP) 전부 취소
             await self.exchange.cancel_all_orders(symbol)
-            # fallback으로 내부 포지션 정보 전달 → get_position 실패해도 청산 가능
+
+            # 2. 포지션 청산 (fallback으로 내부 포지션 정보 전달)
             order = await self.exchange.close_position(
                 symbol,
                 fallback_side=pos.side,
@@ -137,6 +141,13 @@ class OrderManager:
                     pnl = (pos.entry_price - fill_price) / pos.entry_price * pos.size * pos.entry_price
 
             del self.positions[symbol]
+
+            # 3. 청산 후 혹시 남아있는 잔여 주문 한 번 더 정리
+            try:
+                await self.exchange.cancel_all_orders(symbol)
+            except Exception:
+                pass
+
             logger.info(f"포지션 청산: {symbol} | PnL: {pnl:.2f} USDT | 사유: {reason}")
 
             return {
@@ -153,9 +164,27 @@ class OrderManager:
             return {}
 
     async def update_positions(self):
-        """모든 포지션의 미실현 PnL 업데이트 및 TP 확인"""
+        """모든 포지션의 미실현 PnL 업데이트 및 TP 확인
+        + 거래소에서 이미 청산된 포지션(SL 체결 등) 감지 → 내부 정리 + 잔여 주문 취소
+        """
         for symbol, pos in list(self.positions.items()):
             try:
+                # 1. 거래소 실제 포지션 확인
+                exchange_pos = await self.exchange.get_position(symbol)
+                exchange_size = exchange_pos.get("size", 0) if exchange_pos else 0
+
+                # 2. 거래소에 포지션이 없음 → SL 체결 등으로 이미 청산됨
+                if exchange_size == 0:
+                    logger.info(
+                        f"[OrderManager] {symbol} 거래소에서 포지션 소멸 감지 "
+                        f"(SL/청산 체결) → 내부 정리 + 잔여 주문 취소"
+                    )
+                    # 잔여 오픈 오더 전부 취소
+                    await self.exchange.cancel_all_orders(symbol)
+                    del self.positions[symbol]
+                    continue
+
+                # 3. 현재가 조회 및 PnL 업데이트
                 price = await self.exchange.get_ticker_price(symbol)
 
                 if pos.side == "long":
