@@ -1,0 +1,56 @@
+{
+  "pattern_scores": {},
+  "hourly_performance": {
+    "15": {
+      "wins": 0,
+      "losses": 5,
+      "total_pnl": -9.08
+    }
+  },
+  "regime_performance": {
+    "unknown": {
+      "wins": 0,
+      "losses": 5,
+      "total_pnl": -9.08
+    }
+  },
+  "symbol_performance": {
+    "BTC/USDT:USDT": {
+      "wins": 0,
+      "losses": 3,
+      "total_pnl": -3.15
+    },
+    "SOL/USDT:USDT": {
+      "wins": 0,
+      "losses": 2,
+      "total_pnl": -5.93
+    }
+  },
+  "direction_performance": {
+    "close": {
+      "wins": 0,
+      "losses": 3,
+      "total_pnl": -3.15
+    },
+    "short": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -2.99
+    },
+    "long": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -2.94
+    }
+  },
+  "signal_accuracy": {
+    "weak": {
+      "wins": 0,
+      "losses": 5
+    }
+  },
+  "external_accuracy": {},
+  "lessons": [],
+  "adjustments": {},
+  "total_analyzed": 5
+}

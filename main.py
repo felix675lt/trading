@@ -175,7 +175,7 @@ class AutoTrader:
                 side = result.get("side", "?")
 
                 # 현재 시장 레짐 가져오기
-                regime = self.adaptive.current_regime if hasattr(self, 'adaptive_optimizer') else "unknown"
+                regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "unknown"
 
                 # 피드백 학습에 기록
                 self.feedback.record_trade(
@@ -190,6 +190,7 @@ class AutoTrader:
                     "amount": result.get("size", 0),
                     "pnl": pnl, "fee": 0,
                     "strategy": f"{close_type.lower()}_triggered",
+                    "mode": "LIVE",
                 })
 
                 # StrategyOptimizer 기록
@@ -475,6 +476,10 @@ class AutoTrader:
                                 f"승률: {report['current_win_rate']:.1%} | "
                                 f"거래: {report['total_trades']}"
                             )
+
+                # === 2시간마다 학습 자가진단 (240 루프 × 30초 ≈ 2시간) ===
+                if loop_count % 240 == 0 and loop_count > 0:
+                    await self._learning_health_check()
 
                 # 대기
                 await asyncio.sleep(30)
@@ -796,6 +801,7 @@ class AutoTrader:
                         "exchange": exchange_name, "symbol": symbol, "side": "close",
                         "price": price, "amount": result["size"], "pnl": result["pnl"],
                         "fee": result["fee"], "strategy": "hybrid",
+                        "mode": "PAPER",
                     })
                     self.feedback.record_trade(result, trade_context)
                     # Paper StrategyOptimizer 기록
@@ -846,6 +852,7 @@ class AutoTrader:
                             "price": live_result.get("exit_price", 0),
                             "amount": live_result.get("size", 0),
                             "pnl": live_pnl, "fee": 0, "strategy": "live_signal_close",
+                            "mode": "LIVE",
                         })
 
                         # StrategyOptimizer 기록
@@ -893,6 +900,7 @@ class AutoTrader:
                             "exchange": exchange_name, "symbol": symbol, "side": "close",
                             "price": price, "amount": result["size"], "pnl": stale_pnl,
                             "fee": result["fee"], "strategy": "auto_close",
+                            "mode": "PAPER",
                         })
                         add_live_log({
                             "time": datetime.utcnow().strftime("%H:%M:%S"),
@@ -1124,6 +1132,7 @@ class AutoTrader:
                     "exchange": "paper", "symbol": symbol, "side": "close",
                     "price": c["price"], "amount": result.get("size", 0),
                     "pnl": paper_pnl, "fee": 0, "strategy": "paper_concentration",
+                    "mode": "PAPER",
                 })
                 p_hash = self.strategy_optimizer_paper._config_to_hash(
                     self.strategy_optimizer_paper.current_config
@@ -1211,6 +1220,7 @@ class AutoTrader:
                     "price": live_result.get("exit_price", 0),
                     "amount": live_result.get("size", 0),
                     "pnl": live_pnl, "fee": 0, "strategy": "live_concentration",
+                    "mode": "LIVE",
                 })
 
                 # StrategyOptimizer 기록
@@ -1231,6 +1241,132 @@ class AutoTrader:
                     "reason": c["reason"],
                 })
                 tg_notify(format_trade_close("🔥LIVE", symbol, live_pnl, c["reason"]))
+
+    async def _learning_health_check(self):
+        """2시간마다 학습 시스템 자가진단 + 자가수정"""
+        issues = []
+        fixes = []
+
+        try:
+            # 1. feedback_history.json 파일 존재 + 쓰기 가능 확인
+            fb_path = Path("data/feedback_history.json")
+            if not fb_path.exists():
+                issues.append("feedback_history.json 없음")
+                self.feedback._save()
+                fixes.append("feedback_history.json 재생성")
+
+            # 2. feedback 인스턴스 상태 확인
+            fb_total = self.feedback.feedback.get("total_analyzed", 0)
+            fb_recent = len(self.feedback.recent_trades)
+
+            # 3. DB 거래 기록 확인 (모드별)
+            db_counts = self.storage.get_trade_counts_by_mode(hours=24)
+            live_count_24h = db_counts.get("LIVE", 0)
+            paper_count_24h = db_counts.get("PAPER", 0)
+
+            # 4. StrategyOptimizer 상태 확인
+            live_opt_trades = sum(len(v) for v in self.strategy_optimizer_live.performance_history.values())
+            paper_opt_trades = sum(len(v) for v in self.strategy_optimizer_paper.performance_history.values())
+
+            # 5. SL/TP 콜백이 등록되어 있는지 확인
+            for name, om in self.order_managers.items():
+                if not getattr(om, '_on_sl_callback', None):
+                    issues.append(f"{name} SL 콜백 미등록")
+                    # 자가수정: 콜백 재등록
+                    def _make_trade_callback_fix(close_type: str):
+                        def on_triggered(result: dict):
+                            symbol = result.get("symbol", "?")
+                            pnl = result.get("pnl", 0)
+                            side = result.get("side", "?")
+                            regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "unknown"
+                            self.feedback.record_trade(
+                                {"pnl": pnl, "side": side, "symbol": symbol},
+                                {"regime": regime, "signal": 0, "confidence": 0,
+                                 "external_score": 0, "external_direction": "neutral"},
+                            )
+                            self.risk_manager.record_pnl(pnl)
+                            self.storage.save_trade({
+                                "exchange": "binance", "symbol": symbol, "side": "close",
+                                "price": result.get("exit_price", 0),
+                                "amount": result.get("size", 0),
+                                "pnl": pnl, "fee": 0,
+                                "strategy": f"{close_type.lower()}_triggered",
+                                "mode": "LIVE",
+                            })
+                            l_hash = self.strategy_optimizer_live._config_to_hash(
+                                self.strategy_optimizer_live.current_config
+                            )
+                            self.strategy_optimizer_live.record_trade(l_hash, {
+                                "pnl": pnl, "timestamp": datetime.utcnow(),
+                                "symbol": symbol, "hour": datetime.utcnow().hour,
+                            })
+                            logger.info(f"[{close_type}학습] {symbol} PnL: ${pnl:.2f} → 학습기록 완료")
+                            tg_notify(f"{'🛑' if close_type == 'SL' else '🎯'} {close_type} 체결 {symbol} PnL: ${pnl:+.2f}")
+                        return on_triggered
+
+                    om.set_sl_callback(_make_trade_callback_fix("SL"))
+                    om.set_tp_callback(_make_trade_callback_fix("TP"))
+                    fixes.append(f"{name} SL/TP 콜백 재등록")
+
+                if not getattr(om, '_on_tp_callback', None):
+                    issues.append(f"{name} TP 콜백 미등록")
+
+            # 6. LIVE 포지션이 있는데 SL/TP Algo 주문이 없으면 재설정
+            for name, om in self.order_managers.items():
+                for symbol, pos in om.positions.items():
+                    try:
+                        algo_orders = await om.exchange.get_algo_orders(symbol)
+                        if len(algo_orders) < 2:  # SL + TP = 2개여야 정상
+                            issues.append(f"{symbol} Algo 주문 {len(algo_orders)}건 (2건 필요)")
+                            # 자가수정: SL/TP 재설정
+                            await om.exchange.cancel_all_orders(symbol)
+                            close_side = "sell" if pos.side == "long" else "buy"
+                            await om.exchange.create_stop_loss(symbol, close_side, pos.size, pos.stop_loss)
+                            await om.exchange.create_take_profit(symbol, close_side, pos.size, pos.take_profit)
+                            fixes.append(f"{symbol} SL/TP Algo 재설정")
+                    except Exception as e:
+                        issues.append(f"{symbol} Algo 주문 확인 실패: {e}")
+
+            # 7. feedback의 recent_trades와 DB가 너무 차이나면 동기화 문제
+            total_db = sum(db_counts.values())
+            if fb_total > 0 and total_db == 0:
+                issues.append(f"feedback {fb_total}건 기록됨, DB 0건 — storage.save_trade 누락 가능")
+
+            # === 리포트 생성 ===
+            status = "✅ 정상" if not issues else f"⚠️ {len(issues)}건 문제 발견"
+            report_lines = [
+                f"🔍 <b>학습 자가진단</b> {status}",
+                f"━━━━━━━━━━━━━",
+                f"📊 피드백 총 분석: {fb_total}건 (메모리: {fb_recent}건)",
+                f"💾 DB 24h: LIVE {live_count_24h}건 | PAPER {paper_count_24h}건",
+                f"📈 Optimizer: LIVE {live_opt_trades}건 | PAPER {paper_opt_trades}건",
+            ]
+
+            if issues:
+                report_lines.append(f"\n❌ 문제점:")
+                for issue in issues:
+                    report_lines.append(f"  • {issue}")
+            if fixes:
+                report_lines.append(f"\n🔧 자가수정:")
+                for fix in fixes:
+                    report_lines.append(f"  • {fix}")
+
+            # LIVE 포지션 상태
+            live_pos_info = []
+            for name, om in self.order_managers.items():
+                for symbol, pos in om.positions.items():
+                    live_pos_info.append(f"  {pos.side} {symbol} @ {pos.entry_price:.4f}")
+            if live_pos_info:
+                report_lines.append(f"\n📍 LIVE 포지션:")
+                report_lines.extend(live_pos_info)
+
+            report_text = "\n".join(report_lines)
+            logger.info(f"[자가진단] {status} | FB:{fb_total} DB_LIVE:{live_count_24h} DB_PAPER:{paper_count_24h} | issues:{len(issues)} fixes:{len(fixes)}")
+            tg_notify(report_text, silent=len(issues) == 0)
+
+        except Exception as e:
+            logger.error(f"[자가진단] 실패: {e}")
+            tg_notify(f"⚠️ 학습 자가진단 실패: {e}")
 
     @staticmethod
     def _calculate_momentum(df) -> dict:

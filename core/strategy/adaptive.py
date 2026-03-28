@@ -180,8 +180,12 @@ class StrategyOptimizer:
                 "win_rate": perf["wins"] / total if total > 0 else 0,
                 "total_pnl": round(perf["total_pnl"], 2),
             }
+        total_trades = sum(c["trades"] for c in configs.values())
+        total_wins = sum(perf["wins"] for perf in self.config_performance.values())
         return {
             "total_configs": len(configs),
+            "total_trades": total_trades,
+            "current_win_rate": total_wins / total_trades if total_trades > 0 else 0,
             "configs": configs,
         }
 

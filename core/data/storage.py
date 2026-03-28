@@ -20,6 +20,7 @@ class Storage:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._create_tables()
+        self._migrate_tables()
 
     def _create_tables(self):
         cursor = self.conn.cursor()
@@ -48,6 +49,7 @@ class Storage:
                 pnl REAL,
                 fee REAL,
                 strategy TEXT,
+                mode TEXT DEFAULT '',
                 metadata TEXT
             );
 
@@ -80,6 +82,18 @@ class Storage:
         """)
         self.conn.commit()
 
+    def _migrate_tables(self):
+        """기존 DB 테이블에 새 컬럼 추가 (마이그레이션)"""
+        try:
+            cursor = self.conn.execute("PRAGMA table_info(trades)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "mode" not in columns:
+                self.conn.execute("ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT ''")
+                self.conn.commit()
+                logger.info("[Storage] trades 테이블에 mode 컬럼 추가 완료")
+        except Exception as e:
+            logger.warning(f"[Storage] 마이그레이션 실패: {e}")
+
     def save_candles(self, exchange: str, symbol: str, timeframe: str, df: pd.DataFrame):
         records = []
         for ts, row in df.iterrows():
@@ -110,14 +124,15 @@ class Storage:
 
     def save_trade(self, trade: dict):
         self.conn.execute(
-            "INSERT INTO trades (timestamp, exchange, symbol, side, price, amount, pnl, fee, strategy, metadata) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO trades (timestamp, exchange, symbol, side, price, amount, pnl, fee, strategy, mode, metadata) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 trade.get("timestamp", str(datetime.utcnow())),
                 trade["exchange"], trade["symbol"], trade["side"],
                 trade["price"], trade["amount"],
                 trade.get("pnl", 0), trade.get("fee", 0),
-                trade.get("strategy", ""), json.dumps(trade.get("metadata", {})),
+                trade.get("strategy", ""), trade.get("mode", ""),
+                json.dumps(trade.get("metadata", {})),
             ),
         )
         self.conn.commit()
@@ -143,6 +158,28 @@ class Storage:
             (str(datetime.utcnow()), model_name, accuracy, sharpe, win_rate, "{}"),
         )
         self.conn.commit()
+
+    def get_trade_counts_by_mode(self, hours: int = 24) -> dict:
+        """최근 N시간 내 모드별 거래 수 조회"""
+        cursor = self.conn.execute(
+            "SELECT mode, COUNT(*) FROM trades WHERE timestamp > datetime('now', ?) GROUP BY mode",
+            (f"-{hours} hours",),
+        )
+        result = {}
+        for row in cursor.fetchall():
+            result[row[0] or "unknown"] = row[1]
+        return result
+
+    def get_last_trade_time(self, mode: str = "") -> Optional[str]:
+        """마지막 거래 시간 조회"""
+        if mode:
+            cursor = self.conn.execute(
+                "SELECT timestamp FROM trades WHERE mode=? ORDER BY id DESC LIMIT 1", (mode,)
+            )
+        else:
+            cursor = self.conn.execute("SELECT timestamp FROM trades ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        return row[0] if row else None
 
     def close(self):
         self.conn.close()
