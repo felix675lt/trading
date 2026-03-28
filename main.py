@@ -177,12 +177,20 @@ class AutoTrader:
                 # 현재 시장 레짐 가져오기
                 regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "unknown"
 
-                # 피드백 학습에 기록
+                # 피드백 학습에 기록 (v4: exit_reason 추가)
                 self.feedback.record_trade(
                     {"pnl": pnl, "side": side, "symbol": symbol},
                     {"regime": regime, "signal": 0, "confidence": 0,
-                     "external_score": 0, "external_direction": "neutral"},
+                     "external_score": 0, "external_direction": "neutral",
+                     "exit_reason": close_type.lower(),
+                     "confirming_sources": [],
+                     "entry_path": "callback"},
                 )
+                # 손실/수익 학습에 전달 (StrategyManager 엄격화)
+                if pnl < 0:
+                    self.strategy_manager.record_loss()
+                else:
+                    self.strategy_manager.record_win()
                 self.risk_manager.record_pnl(pnl)
                 self.storage.save_trade({
                     "exchange": "binance", "symbol": symbol, "side": "close",
@@ -733,6 +741,7 @@ class AutoTrader:
                         leverage=dynamic_lev,
                         sl_pct=self.config["risk"]["stop_loss_pct"] * adaptive_params["stop_loss_mult"],
                         tp_pct=self.config["risk"]["take_profit_pct"],
+                        atr_pct=atr_pct,
                     )
                     logger.info(
                         f"[PAPER] {decision.action.upper()} {symbol} | "
@@ -757,7 +766,9 @@ class AutoTrader:
             if self.mode in ("live", "dual"):
                 om = self.order_managers.get(exchange_name)
                 if om and symbol not in getattr(om, "positions", {}):
-                    result = await om.open_position(symbol, decision.action, size, dynamic_lev)
+                    result = await om.open_position(
+                        symbol, decision.action, size, dynamic_lev, atr_pct=atr_pct,
+                    )
                     if result:
                         logger.info(
                             f"[LIVE] {decision.action.upper()} {symbol} | "
@@ -803,7 +814,14 @@ class AutoTrader:
                         "fee": result["fee"], "strategy": "hybrid",
                         "mode": "PAPER",
                     })
+                    trade_context["exit_reason"] = "strategy_close"
+                    trade_context["confirming_sources"] = getattr(decision, "confirming_sources", [])
+                    trade_context["entry_path"] = "+".join(sorted(getattr(decision, "confirming_sources", [])))
                     self.feedback.record_trade(result, trade_context)
+                    if result["pnl"] < 0:
+                        self.strategy_manager.record_loss()
+                    else:
+                        self.strategy_manager.record_win()
                     # Paper StrategyOptimizer 기록
                     p_hash = self.strategy_optimizer_paper._config_to_hash(
                         self.strategy_optimizer_paper.current_config
@@ -845,8 +863,15 @@ class AutoTrader:
                             {"regime": adaptive_params.get("regime", "unknown"),
                              "signal": ml_signal, "confidence": decision.confidence,
                              "external_score": ext_signal.get("score", 0) if isinstance(ext_signal, dict) else 0,
-                             "external_direction": ext_signal.get("direction", "neutral") if isinstance(ext_signal, dict) else "neutral"},
+                             "external_direction": ext_signal.get("direction", "neutral") if isinstance(ext_signal, dict) else "neutral",
+                             "exit_reason": "strategy_close",
+                             "confirming_sources": getattr(decision, "confirming_sources", []),
+                             "entry_path": "+".join(sorted(getattr(decision, "confirming_sources", [])))},
                         )
+                        if live_pnl < 0:
+                            self.strategy_manager.record_loss()
+                        else:
+                            self.strategy_manager.record_win()
                         self.storage.save_trade({
                             "exchange": exchange_name, "symbol": symbol, "side": "close",
                             "price": live_result.get("exit_price", 0),
@@ -944,11 +969,20 @@ class AutoTrader:
             mtf_signal = self.external_manager.multi_tf.get_signal_for_strategy()
             momentum_signal = self._calculate_momentum(df)
 
+            # ATR 값 추출 (동적 SL/TP용)
+            atr_pct = float(df["atr_pct"].iloc[-1]) if "atr_pct" in df.columns else 0.0
+            if atr_pct != atr_pct:  # NaN 체크
+                atr_pct = 0.0
+
+            # 피드백 블랙리스트 조회
+            fb_blacklist = self.feedback.get_entry_blacklist()
+
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
             decision = self.strategy_manager.decide(
                 ml_signal, rl_action, rl_confidence, current_position,
                 adaptive_params["regime"], external_signal=ext_signal,
                 momentum=momentum_signal,
+                feedback_blacklist=fb_blacklist,
             )
 
             # MTF 필터 적용
@@ -1076,6 +1110,9 @@ class AutoTrader:
                 "ml_signal": ml_signal,
                 "ext_signal": ext_signal,
                 "df": df,
+                "atr_pct": atr_pct,  # ATR 기반 동적 SL/TP
+                "confirming_sources": decision.confirming_sources,  # 다중확인 소스
+                "signal_strength": decision.signal_strength,  # 시그널 강도
             }
 
         except Exception as e:
@@ -1096,6 +1133,7 @@ class AutoTrader:
                     leverage=c["dynamic_lev"],
                     sl_pct=sl_pct * c["adaptive_params"]["stop_loss_mult"],
                     tp_pct=tp_pct,
+                    atr_pct=c.get("atr_pct", 0),
                 )
                 logger.info(
                     f"[PAPER] {c['action'].upper()} {symbol} | "
@@ -1177,7 +1215,11 @@ class AutoTrader:
             except Exception as e:
                 logger.warning(f"[LIVE] 잔고 조회 실패: {e}")
 
-            result = await om.open_position(symbol, c["action"], c["size"], c["dynamic_lev"])
+            result = await om.open_position(
+                symbol, c["action"], c["size"], c["dynamic_lev"],
+                sl_pct=c.get("sl_pct"), tp_pct=c.get("tp_pct"),
+                atr_pct=c.get("atr_pct", 0),
+            )
             if result:
                 coin = symbol.split("/")[0]
                 logger.info(
@@ -1221,8 +1263,15 @@ class AutoTrader:
                      "signal": c.get("ml_signal", 0),
                      "confidence": c.get("confidence", 0),
                      "external_score": c.get("ext_signal", {}).get("score", 0) if isinstance(c.get("ext_signal"), dict) else 0,
-                     "external_direction": c.get("ext_signal", {}).get("direction", "neutral") if isinstance(c.get("ext_signal"), dict) else "neutral"},
+                     "external_direction": c.get("ext_signal", {}).get("direction", "neutral") if isinstance(c.get("ext_signal"), dict) else "neutral",
+                     "exit_reason": "strategy_close",
+                     "confirming_sources": c.get("confirming_sources", []),
+                     "entry_path": "+".join(sorted(c.get("confirming_sources", [])))},
                 )
+                if live_pnl < 0:
+                    self.strategy_manager.record_loss()
+                else:
+                    self.strategy_manager.record_win()
                 self.storage.save_trade({
                     "exchange": exchange_name, "symbol": symbol, "side": "close",
                     "price": live_result.get("exit_price", 0),
@@ -1290,8 +1339,15 @@ class AutoTrader:
                             self.feedback.record_trade(
                                 {"pnl": pnl, "side": side, "symbol": symbol},
                                 {"regime": regime, "signal": 0, "confidence": 0,
-                                 "external_score": 0, "external_direction": "neutral"},
+                                 "external_score": 0, "external_direction": "neutral",
+                                 "exit_reason": close_type.lower(),
+                                 "confirming_sources": [],
+                                 "entry_path": "callback"},
                             )
+                            if pnl < 0:
+                                self.strategy_manager.record_loss()
+                            else:
+                                self.strategy_manager.record_win()
                             self.risk_manager.record_pnl(pnl)
                             self.storage.save_trade({
                                 "exchange": "binance", "symbol": symbol, "side": "close",

@@ -41,7 +41,7 @@ class PaperTrader:
 
     def open_position(self, symbol: str, side: str, size_usdt: float,
                       price: float, leverage: int = 5, sl_pct: float = 0.02,
-                      tp_pct: float = 0.04) -> PaperPosition | None:
+                      tp_pct: float = 0.04, atr_pct: float = 0.0) -> PaperPosition | None:
         if symbol in self.positions:
             logger.warning(f"[Paper] {symbol} 이미 포지션 보유")
             return None
@@ -50,12 +50,24 @@ class PaperTrader:
         fee = size_usdt * self.commission
         self.equity -= fee
 
-        if side == "long":
-            sl = price * (1 - sl_pct)
-            tp = price * (1 + tp_pct)
+        # ATR 기반 동적 SL/TP (atr_pct가 유효하면 사용)
+        if atr_pct and atr_pct > 0 and atr_pct == atr_pct:  # NaN 체크
+            atr_sl_mult = 2.0
+            atr_tp_mult = 3.5
+            sl_floor = 0.005
+            sl_cap = 0.030
+            final_sl = max(sl_floor, min(sl_cap, atr_pct * atr_sl_mult))
+            final_tp = max(final_sl * 1.5, atr_pct * atr_tp_mult)
         else:
-            sl = price * (1 + sl_pct)
-            tp = price * (1 - tp_pct)
+            final_sl = sl_pct
+            final_tp = tp_pct
+
+        if side == "long":
+            sl = price * (1 - final_sl)
+            tp = price * (1 + final_tp)
+        else:
+            sl = price * (1 + final_sl)
+            tp = price * (1 - final_tp)
 
         pos = PaperPosition(
             symbol=symbol, side=side, size=amount,

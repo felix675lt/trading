@@ -36,7 +36,17 @@ class TradeFeedbackAnalyzer:
     def _load(self) -> dict:
         if self.feedback_path.exists():
             with open(self.feedback_path) as f:
-                return json.load(f)
+                data = json.load(f)
+            # 신규 필드 마이그레이션
+            if "entry_path_performance" not in data:
+                data["entry_path_performance"] = {}
+            if "exit_reason_analysis" not in data:
+                data["exit_reason_analysis"] = {}
+            if "entry_blacklist" not in data:
+                data["entry_blacklist"] = []
+            if "loss_patterns" not in data:
+                data["loss_patterns"] = {}
+            return data
         return {
             "pattern_scores": {},        # 조건별 성과 점수
             "hourly_performance": {},    # 시간대별 승률
@@ -45,6 +55,10 @@ class TradeFeedbackAnalyzer:
             "direction_performance": {}, # 롱/숏별 승률
             "signal_accuracy": {},       # 시그널 강도별 적중률
             "external_accuracy": {},     # 외부 신호별 적중률
+            "entry_path_performance": {},  # 진입 시그널 조합별 성과 (v4)
+            "exit_reason_analysis": {},    # 청산 사유별 분석 (v4)
+            "entry_blacklist": [],         # 진입 차단 패턴 (v4)
+            "loss_patterns": {},           # 손실 패턴 분석 (v4)
             "lessons": [],               # 학습된 교훈 (규칙)
             "adjustments": {},           # 자동 조정된 파라미터
             "total_analyzed": 0,
@@ -59,7 +73,8 @@ class TradeFeedbackAnalyzer:
         거래 결과 기록 및 즉시 분석
 
         trade: {symbol, side, entry_price, exit_price, pnl, reason, ...}
-        market_context: {regime, signal_strength, confidence, hour, volatility, ...}
+        market_context: {regime, signal_strength, confidence, hour, volatility,
+                         entry_path, exit_reason, confirming_sources, atr_at_entry, ...}
         """
         enriched = {
             **trade,
@@ -70,6 +85,10 @@ class TradeFeedbackAnalyzer:
             "volatility": market_context.get("volatility", 0),
             "external_score": market_context.get("external_score", 0),
             "external_direction": market_context.get("external_direction", "neutral"),
+            "entry_path": market_context.get("entry_path", "unknown"),  # 진입 시그널 조합 (v4)
+            "exit_reason": market_context.get("exit_reason", "unknown"),  # 청산 사유 (v4)
+            "confirming_sources": market_context.get("confirming_sources", []),  # 합의 소스 (v4)
+            "atr_at_entry": market_context.get("atr_at_entry", 0),  # 진입 시 ATR (v4)
             "analyzed_at": str(datetime.utcnow()),
         }
         self.recent_trades.append(enriched)
@@ -93,6 +112,9 @@ class TradeFeedbackAnalyzer:
         self._update_direction(enriched)
         self._update_signal_accuracy(enriched)
         self._update_external_accuracy(enriched)
+        self._update_entry_path(enriched)       # v4: 진입 경로별 성과
+        self._update_exit_reason(enriched)       # v4: 청산 사유별 분석
+        self._update_loss_patterns(enriched)     # v4: 손실 패턴 분석
 
         # 패턴 분석 및 교훈 도출
         self._detect_patterns()
@@ -217,6 +239,107 @@ class TradeFeedbackAnalyzer:
         else:
             s["losses"] += 1
         s["total_pnl"] += trade.get("pnl", 0)
+
+    def _update_entry_path(self, trade: dict):
+        """v4: 진입 시그널 조합별 성과 추적"""
+        sources = trade.get("confirming_sources", [])
+        if not sources:
+            return
+        # 정렬된 조합 키 생성 (예: "EXT+ML+MOM")
+        combo_key = "+".join(sorted(set(s.split("_")[0] for s in sources)))
+        ep = self.feedback["entry_path_performance"]
+        if combo_key not in ep:
+            ep[combo_key] = {"wins": 0, "losses": 0, "total_pnl": 0, "trades": []}
+        if trade["pnl"] > 0:
+            ep[combo_key]["wins"] += 1
+        else:
+            ep[combo_key]["losses"] += 1
+        ep[combo_key]["total_pnl"] += trade["pnl"]
+        ep[combo_key]["trades"].append({
+            "pnl": round(trade["pnl"], 4),
+            "time": str(datetime.utcnow()),
+        })
+        # 최근 30건만 유지
+        if len(ep[combo_key]["trades"]) > 30:
+            ep[combo_key]["trades"] = ep[combo_key]["trades"][-30:]
+
+    def _update_exit_reason(self, trade: dict):
+        """v4: 청산 사유별 분석 (SL히트율 → SL 조정 근거)"""
+        exit_reason = trade.get("exit_reason", "unknown")
+        er = self.feedback["exit_reason_analysis"]
+        if exit_reason not in er:
+            er[exit_reason] = {"count": 0, "total_pnl": 0, "avg_pnl": 0}
+        er[exit_reason]["count"] += 1
+        er[exit_reason]["total_pnl"] += trade["pnl"]
+        er[exit_reason]["avg_pnl"] = er[exit_reason]["total_pnl"] / er[exit_reason]["count"]
+
+    def _update_loss_patterns(self, trade: dict):
+        """v4: 손실 패턴 분석 — 어떤 조건에서 반복 손실이 발생하는지 추적"""
+        if trade["pnl"] >= 0:
+            return  # 수익 거래는 무시
+
+        # 복합 키 생성: regime_side_시간대
+        regime = trade.get("regime", "unknown")
+        side = trade.get("side", "unknown")
+        hour_bucket = "asia" if 0 <= trade["hour"] < 8 else "europe" if 8 <= trade["hour"] < 16 else "us"
+        pattern_key = f"{regime}_{side}_{hour_bucket}"
+
+        lp = self.feedback["loss_patterns"]
+        if pattern_key not in lp:
+            lp[pattern_key] = {"count": 0, "total_loss": 0}
+        lp[pattern_key]["count"] += 1
+        lp[pattern_key]["total_loss"] += trade["pnl"]
+
+    def get_entry_blacklist(self) -> list[str]:
+        """v4: 반복 실패하는 시그널 조합을 블랙리스트로 반환"""
+        blacklist = []
+        for combo, perf in self.feedback.get("entry_path_performance", {}).items():
+            total = perf["wins"] + perf["losses"]
+            if total >= 5:  # 최소 5건 이상
+                win_rate = perf["wins"] / total
+                if win_rate < 0.25 and perf["total_pnl"] < 0:
+                    blacklist.append(combo)
+                    if combo not in self.feedback.get("entry_blacklist", []):
+                        self.feedback["entry_blacklist"].append(combo)
+                        lesson = f"시그널조합 '{combo}' 승률 {win_rate:.0%} → 블랙리스트"
+                        self.feedback["lessons"].append(lesson)
+                        logger.warning(f"[Feedback] {lesson}")
+        return blacklist
+
+    def get_sl_adjustment_suggestion(self) -> dict:
+        """v4: SL 히트율 분석 → SL 조정 제안"""
+        er = self.feedback.get("exit_reason_analysis", {})
+        sl_data = er.get("sl", er.get("sl_triggered", {}))
+        tp_data = er.get("tp", er.get("tp_triggered", {}))
+
+        sl_count = sl_data.get("count", 0) if isinstance(sl_data, dict) else 0
+        tp_count = tp_data.get("count", 0) if isinstance(tp_data, dict) else 0
+        total = sl_count + tp_count
+
+        if total < 5:
+            return {"suggestion": "데이터 부족", "sl_hit_rate": 0}
+
+        sl_hit_rate = sl_count / total
+        suggestion = {}
+        if sl_hit_rate > 0.65:
+            suggestion = {
+                "suggestion": "SL 확대 필요 (히트율 과다)",
+                "sl_hit_rate": round(sl_hit_rate, 2),
+                "recommended_action": "atr_sl_multiplier +0.5",
+            }
+        elif sl_hit_rate < 0.30:
+            suggestion = {
+                "suggestion": "SL 적정 또는 축소 가능",
+                "sl_hit_rate": round(sl_hit_rate, 2),
+                "recommended_action": "현재 유지",
+            }
+        else:
+            suggestion = {
+                "suggestion": "SL 적정 범위",
+                "sl_hit_rate": round(sl_hit_rate, 2),
+                "recommended_action": "현재 유지",
+            }
+        return suggestion
 
     def _detect_patterns(self):
         """패턴 감지 및 자동 교훈 생성"""

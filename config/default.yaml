@@ -31,8 +31,9 @@ trading:
     - "4h"
   leverage: 3
   mode: "dual"  # backtest / paper / live / dual (Paper+Live 동시)
-  min_confidence: 0.30     # 최소 확신도 (적응형: 장기 hold 시 0.15까지 자동 하향)
-  signal_threshold: 0.08   # ML 시그널 방향 결정 임계값
+  min_confidence: 0.40     # 최소 확신도 (적응형: 장기 hold 시 0.25까지 하향)
+  signal_threshold: 0.10   # ML 시그널 방향 결정 임계값
+  min_confirming_signals: 2  # 최소 2개 시그널 합의 필요 (다중확인)
 
   # === 집중 매매 모드 ===
   # 소시드($188)에서는 분산 X → 가장 강한 신호 1개에 풀시드 집중
@@ -45,34 +46,41 @@ risk:
   min_order_notional: 5         # 알트코인 최소 $5
   max_daily_loss_pct: 0.05      # 일 최대 손실 5%
   max_drawdown_pct: 0.15        # MDD 15%
-  stop_loss_pct: 0.008          # 0.8% SL (3x → 실질 2.4% 손실)
-  take_profit_pct: 0.012        # 1.2% TP (3x → 실질 3.6% 수익)
+  stop_loss_pct: 0.015          # 1.5% SL (fallback — ATR 없을 때만)
+  take_profit_pct: 0.025        # 2.5% TP (fallback — ATR 없을 때만)
   max_open_positions: 1         # LIVE 1포지션 제한
   cooldown_after_losses: 2
   cooldown_minutes: 30
+
+  # === ATR 기반 동적 SL/TP (핵심) ===
+  atr_sl_multiplier: 2.0        # SL = ATR(14) × 2.0 (노이즈 회피)
+  atr_tp_multiplier: 3.5        # TP = ATR(14) × 3.5 (RR 1.75:1)
+  sl_floor_pct: 0.005           # SL 최소 0.5% (슬리피지 보호)
+  sl_cap_pct: 0.030             # SL 최대 3.0% (최대 손실 제한)
+
   dynamic_leverage:
     enabled: true
     base: 3                     # $188 × 3x = $564 notional
     min: 2                      # 약한 시그널: 2x ($376)
     max: 5                      # 강한 시그널: 5x ($940)
 
-  # === 종목별 스캘핑 프로파일 ===
+  # === 종목별 스캘핑 프로파일 (ATR fallback용) ===
   scalp_profiles:
     BTC:
-      tp_pct: 0.010       # 1.0% TP (안정)
-      sl_pct: 0.007       # 0.7% SL
-      priority: 2          # 2순위 (변동성 낮음)
+      tp_pct: 0.018       # 1.8% TP
+      sl_pct: 0.010       # 1.0% SL (RR 1.8:1)
+      priority: 2
     ETH:
-      tp_pct: 0.012       # 1.2% TP
-      sl_pct: 0.008       # 0.8% SL
+      tp_pct: 0.020       # 2.0% TP
+      sl_pct: 0.012       # 1.2% SL (RR 1.67:1)
       priority: 3
     SOL:
-      tp_pct: 0.015       # 1.5% TP (공격적)
-      sl_pct: 0.010       # 1.0% SL
-      priority: 1          # 1순위 (변동성 높고 유동성 충분)
+      tp_pct: 0.025       # 2.5% TP
+      sl_pct: 0.015       # 1.5% SL (RR 1.67:1)
+      priority: 1
     DOGE:
-      tp_pct: 0.015       # 1.5% TP
-      sl_pct: 0.010       # 1.0% SL
+      tp_pct: 0.025       # 2.5% TP
+      sl_pct: 0.015       # 1.5% SL (RR 1.67:1)
       priority: 4
     # 상장 시그널 코인
     LISTING:

@@ -172,8 +172,11 @@ class OrderManager:
         side: str,
         size_usdt: float,
         leverage: int = 5,
+        sl_pct: float | None = None,
+        tp_pct: float | None = None,
+        atr_pct: float | None = None,
     ) -> Position | None:
-        """포지션 개시"""
+        """포지션 개시 — ATR 기반 동적 SL/TP 지원"""
         if symbol in self.positions:
             logger.warning(f"{symbol} 이미 포지션 보유 중")
             return None
@@ -213,16 +216,33 @@ class OrderManager:
             order = await self.exchange.create_market_order(symbol, "buy" if side == "long" else "sell", amount)
             fill_price = float(order.get("average", price))
 
-            # 스탑로스/TP 계산
-            sl_pct = self.risk_config.get("stop_loss_pct", 0.02)
-            tp_pct = self.risk_config.get("take_profit_pct", 0.04)
+            # === ATR 기반 동적 SL/TP 계산 ===
+            sl_floor = self.risk_config.get("sl_floor_pct", 0.005)
+            sl_cap = self.risk_config.get("sl_cap_pct", 0.030)
+
+            if atr_pct and atr_pct > 0 and not (atr_pct != atr_pct):  # NaN 체크
+                # ATR 기반: 실제 시장 변동성에 맞춤
+                atr_sl_mult = self.risk_config.get("atr_sl_multiplier", 2.0)
+                atr_tp_mult = self.risk_config.get("atr_tp_multiplier", 3.5)
+                final_sl_pct = max(sl_floor, min(sl_cap, atr_pct * atr_sl_mult))
+                final_tp_pct = max(final_sl_pct * 1.5, atr_pct * atr_tp_mult)  # 최소 RR 1.5:1
+                logger.info(
+                    f"[ATR-SL/TP] {symbol} ATR={atr_pct*100:.2f}% → "
+                    f"SL={final_sl_pct*100:.2f}% TP={final_tp_pct*100:.2f}% "
+                    f"(RR {final_tp_pct/final_sl_pct:.1f}:1)"
+                )
+            else:
+                # fallback: 전달된 값 또는 config 기본값
+                final_sl_pct = sl_pct or self.risk_config.get("stop_loss_pct", 0.015)
+                final_tp_pct = tp_pct or self.risk_config.get("take_profit_pct", 0.025)
+                final_sl_pct = max(sl_floor, min(sl_cap, final_sl_pct))
 
             if side == "long":
-                stop_loss = fill_price * (1 - sl_pct)
-                take_profit = fill_price * (1 + tp_pct)
+                stop_loss = fill_price * (1 - final_sl_pct)
+                take_profit = fill_price * (1 + final_tp_pct)
             else:
-                stop_loss = fill_price * (1 + sl_pct)
-                take_profit = fill_price * (1 - tp_pct)
+                stop_loss = fill_price * (1 + final_sl_pct)
+                take_profit = fill_price * (1 - final_tp_pct)
 
             # 스탑로스 + 테이크프로핏 주문 (거래소 Algo Order)
             sl_side = "sell" if side == "long" else "buy"
