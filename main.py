@@ -143,7 +143,10 @@ class AutoTrader:
             for name, cfg in self.config["exchanges"].items():
                 client = ExchangeClient(name, cfg)
                 self.exchange_clients[name] = client
-                self.order_managers[name] = OrderManager(client, self.config["risk"])
+                self.order_managers[name] = OrderManager(
+                    client, self.config["risk"],
+                    trailing_config=self.config.get("trailing_stop", {}),
+                )
 
         # 기존 모델 로드 시도
         if self.ensemble.load_all():
@@ -397,10 +400,15 @@ class AutoTrader:
                     for c in candidates:
                         await self._execute_paper(c)
 
-                    # LIVE: 포지션 없을 때만, 가장 강한 시그널 1개 선택
+                    # LIVE: 기존 포지션 트레일링/SL/TP 관리 (매 루프)
                     live_positions = sum(
                         len(om.positions) for om in self.order_managers.values()
                     )
+                    if live_positions > 0:
+                        for om in self.order_managers.values():
+                            await om.update_positions()
+
+                    # LIVE: 포지션 여유 있을 때만 신규 진입
                     if live_positions < max_live and candidates:
                         # 확신도 × (1 - priority/10) 로 최종 순위 결정
                         best = max(
@@ -408,10 +416,6 @@ class AutoTrader:
                             key=lambda c: c["confidence"] * (1 - c["priority"] / 10),
                         )
                         await self._execute_live(exchange_name, best)
-                    elif live_positions >= max_live:
-                        # 기존 LIVE 포지션 관리 (TP/SL 체크)
-                        for om in self.order_managers.values():
-                            await om.update_positions()
                 else:
                     # 기존 모드: 각 심볼 독립 매매
                     for symbol in symbols:

@@ -19,16 +19,25 @@ class Position:
     take_profit: float = 0.0
     opened_at: str = ""
     unrealized_pnl: float = 0.0
+    # 트레일링 스탑 상태
+    highest_price: float = 0.0   # 진입 후 최고가 (롱)
+    lowest_price: float = 0.0    # 진입 후 최저가 (숏)
+    trailing_activated: bool = False
 
     def __post_init__(self):
         if not self.opened_at:
             self.opened_at = str(datetime.utcnow())
+        if self.highest_price == 0.0:
+            self.highest_price = self.entry_price
+        if self.lowest_price == 0.0:
+            self.lowest_price = self.entry_price
 
 
 class OrderManager:
     """주문 실행 및 포지션 라이프사이클 관리"""
 
-    def __init__(self, exchange: ExchangeClient, risk_config: dict):
+    def __init__(self, exchange: ExchangeClient, risk_config: dict,
+                 trailing_config: dict | None = None):
         self.exchange = exchange
         self.risk_config = risk_config
         self.positions: dict[str, Position] = {}
@@ -39,6 +48,12 @@ class OrderManager:
         self._last_close_side: dict[str, str] = {}  # 심볼별 마지막 포지션 방향
         self._consecutive_sl: dict[str, int] = {}  # 심볼별 연속 SL 횟수
         self._min_reentry_minutes = 5  # SL 후 최소 재진입 대기 시간
+
+        # 트레일링 스탑 설정 (PaperTrader와 동일)
+        tc = trailing_config or {}
+        self.trailing_activate_pct = tc.get("activate_pct", 0.015)
+        self.trailing_distance_pct = tc.get("distance_pct", 0.008)
+        self.trailing_step_pct = tc.get("step_pct", 0.004)
 
     def set_sl_callback(self, callback):
         """SL/자동청산 감지 시 호출할 콜백 등록 (피드백 학습용)"""
@@ -393,15 +408,120 @@ class OrderManager:
                     del self.positions[symbol]
                     continue
 
-                # 3. 현재가 조회 및 PnL 업데이트
+                # 3. 현재가 조회 및 PnL 업데이트 + 트레일링 스탑
                 price = await self.exchange.get_ticker_price(symbol)
 
                 if pos.side == "long":
                     pos.unrealized_pnl = (price - pos.entry_price) / pos.entry_price
-                else:
+                    pos.highest_price = max(pos.highest_price, price)
+                    profit_pct = (price - pos.entry_price) / pos.entry_price
+
+                    # 트레일링 활성화 체크
+                    if profit_pct >= self.trailing_activate_pct and not pos.trailing_activated:
+                        pos.trailing_activated = True
+                        new_sl = pos.highest_price * (1 - self.trailing_distance_pct)
+                        if new_sl > pos.stop_loss:
+                            old_sl = pos.stop_loss
+                            pos.stop_loss = new_sl
+                            await self._update_exchange_sl(symbol, pos)
+                            logger.info(
+                                f"[Trailing-LIVE] {symbol} 롱 트레일링 활성화 | "
+                                f"수익 {profit_pct:.2%} | SL {old_sl:.4f} → {pos.stop_loss:.4f}"
+                            )
+
+                    # 트레일링 활성 중: 최고가 갱신 시 SL 끌어올림
+                    if pos.trailing_activated:
+                        new_sl = pos.highest_price * (1 - self.trailing_distance_pct)
+                        if new_sl > pos.stop_loss + (pos.entry_price * self.trailing_step_pct):
+                            old_sl = pos.stop_loss
+                            pos.stop_loss = new_sl
+                            await self._update_exchange_sl(symbol, pos)
+                            logger.info(
+                                f"[Trailing-LIVE] {symbol} 롱 SL 상향 | "
+                                f"{old_sl:.4f} → {pos.stop_loss:.4f} | 최고가: {pos.highest_price:.4f}"
+                            )
+
+                    # TP 도달 → 트레일링으로 전환 (즉시 청산 안 함)
+                    if price >= pos.take_profit and not pos.trailing_activated:
+                        pos.trailing_activated = True
+                        old_sl = pos.stop_loss
+                        pos.stop_loss = pos.entry_price * (1 + self.trailing_activate_pct)
+                        pos.take_profit = pos.entry_price * (1 + 0.20)  # TP를 아주 높게 → 실질 무한
+                        await self._update_exchange_sl_tp(symbol, pos)
+                        logger.info(
+                            f"[Trailing-LIVE] {symbol} 롱 TP 도달 → 트레일링 전환 | "
+                            f"수익확보선: {pos.stop_loss:.4f} (이전SL: {old_sl:.4f})"
+                        )
+
+                else:  # short
                     pos.unrealized_pnl = (pos.entry_price - price) / pos.entry_price
+                    pos.lowest_price = min(pos.lowest_price, price) if pos.lowest_price > 0 else price
+                    profit_pct = (pos.entry_price - price) / pos.entry_price
+
+                    # 트레일링 활성화 체크
+                    if profit_pct >= self.trailing_activate_pct and not pos.trailing_activated:
+                        pos.trailing_activated = True
+                        new_sl = pos.lowest_price * (1 + self.trailing_distance_pct)
+                        if new_sl < pos.stop_loss:
+                            old_sl = pos.stop_loss
+                            pos.stop_loss = new_sl
+                            await self._update_exchange_sl(symbol, pos)
+                            logger.info(
+                                f"[Trailing-LIVE] {symbol} 숏 트레일링 활성화 | "
+                                f"수익 {profit_pct:.2%} | SL {old_sl:.4f} → {pos.stop_loss:.4f}"
+                            )
+
+                    # 트레일링 활성 중: 최저가 갱신 시 SL 끌어내림
+                    if pos.trailing_activated:
+                        new_sl = pos.lowest_price * (1 + self.trailing_distance_pct)
+                        if new_sl < pos.stop_loss - (pos.entry_price * self.trailing_step_pct):
+                            old_sl = pos.stop_loss
+                            pos.stop_loss = new_sl
+                            await self._update_exchange_sl(symbol, pos)
+                            logger.info(
+                                f"[Trailing-LIVE] {symbol} 숏 SL 하향 | "
+                                f"{old_sl:.4f} → {pos.stop_loss:.4f} | 최저가: {pos.lowest_price:.4f}"
+                            )
+
+                    # TP 도달 → 트레일링으로 전환
+                    if price <= pos.take_profit and not pos.trailing_activated:
+                        pos.trailing_activated = True
+                        old_sl = pos.stop_loss
+                        pos.stop_loss = pos.entry_price * (1 - self.trailing_activate_pct)
+                        pos.take_profit = pos.entry_price * (1 - 0.20)  # TP를 아주 낮게 → 실질 무한
+                        await self._update_exchange_sl_tp(symbol, pos)
+                        logger.info(
+                            f"[Trailing-LIVE] {symbol} 숏 TP 도달 → 트레일링 전환 | "
+                            f"수익확보선: {pos.stop_loss:.4f} (이전SL: {old_sl:.4f})"
+                        )
+
             except Exception as e:
                 logger.warning(f"포지션 업데이트 실패 ({symbol}): {e}")
+
+    async def _update_exchange_sl(self, symbol: str, pos: Position):
+        """거래소 SL 주문을 취소 후 새 가격으로 재설정"""
+        try:
+            close_side = "sell" if pos.side == "long" else "buy"
+            # 기존 주문 전부 취소
+            await self.exchange.cancel_all_orders(symbol)
+            # SL 재설정
+            await self.exchange.create_stop_loss(symbol, close_side, pos.size, pos.stop_loss)
+            # TP 유지 (take_profit이 inf가 아닌 경우)
+            if pos.take_profit > 0 and pos.take_profit < pos.entry_price * 5:
+                await self.exchange.create_take_profit(symbol, close_side, pos.size, pos.take_profit)
+        except Exception as e:
+            logger.error(f"[Trailing-LIVE] {symbol} SL 거래소 업데이트 실패: {e}")
+
+    async def _update_exchange_sl_tp(self, symbol: str, pos: Position):
+        """거래소 SL + TP 모두 취소 후 새 값으로 재설정"""
+        try:
+            close_side = "sell" if pos.side == "long" else "buy"
+            await self.exchange.cancel_all_orders(symbol)
+            await self.exchange.create_stop_loss(symbol, close_side, pos.size, pos.stop_loss)
+            # TP 전환된 경우에도 아주 먼 TP를 설정 (안전장치)
+            await self.exchange.create_take_profit(symbol, close_side, pos.size, pos.take_profit)
+        except Exception as e:
+            logger.error(f"[Trailing-LIVE] {symbol} SL/TP 거래소 업데이트 실패: {e}")
 
     def get_all_positions(self) -> list[dict]:
         return [
