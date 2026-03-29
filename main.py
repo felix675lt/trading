@@ -92,6 +92,9 @@ class AutoTrader:
             commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
             trailing_config=self.config.get("trailing_stop", {}),
         )
+        # PAPER 자동청산 콜백 (SL/TP/트레일링 → DB 저장 + 학습)
+        self.paper_trader.set_auto_close_callback(self._on_paper_auto_close)
+
         self.exchange_clients: dict[str, ExchangeClient] = {}
         self.order_managers: dict[str, OrderManager] = {}
 
@@ -1288,6 +1291,61 @@ class AutoTrader:
                     "reason": c["reason"],
                 })
                 tg_notify(format_trade_close("🔥LIVE", symbol, live_pnl, c["reason"]))
+
+    # ========== PAPER 자동청산 콜백 ==========
+
+    def _on_paper_auto_close(self, trade: dict):
+        """PaperTrader SL/TP/트레일링 자동 청산 시 호출 → DB 저장 + 학습"""
+        try:
+            symbol = trade.get("symbol", "?")
+            pnl = trade.get("pnl", 0)
+            reason = trade.get("reason", "auto")
+            side = trade.get("side", "")
+
+            # DB 저장
+            self.storage.save_trade({
+                "exchange": "paper", "symbol": symbol, "side": "close",
+                "price": trade.get("exit_price", 0),
+                "amount": trade.get("size", 0),
+                "pnl": pnl, "fee": trade.get("fee", 0),
+                "strategy": f"paper_{reason.replace(' ', '_')}",
+                "mode": "PAPER",
+            })
+
+            # 학습 기록
+            regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "unknown"
+            self.feedback.record_trade(
+                {"pnl": pnl, "side": side, "symbol": symbol},
+                {"regime": regime, "signal": 0, "confidence": 0,
+                 "external_score": 0, "external_direction": "neutral",
+                 "exit_reason": reason},
+            )
+            self.risk_manager.record_pnl(pnl)
+            if pnl < 0:
+                self.strategy_manager.record_loss()
+            else:
+                self.strategy_manager.record_win()
+
+            # StrategyOptimizer 기록
+            p_hash = self.strategy_optimizer_paper._config_to_hash(
+                self.strategy_optimizer_paper.current_config
+            )
+            self.strategy_optimizer_paper.record_trade(p_hash, {
+                "pnl": pnl, "timestamp": datetime.utcnow(),
+                "symbol": symbol, "hour": datetime.utcnow().hour,
+            })
+
+            add_live_log({
+                "time": datetime.utcnow().strftime("%H:%M:%S"),
+                "type": "trade_close", "mode": "PAPER",
+                "symbol": symbol, "pnl": round(pnl, 2),
+                "reason": reason,
+            })
+            logger.info(f"[PAPER-Auto] {reason} {symbol} {side} | PnL: ${pnl:+.2f} → DB+학습 저장")
+            tg_notify(format_trade_close("PAPER", symbol, pnl, reason), silent=True)
+
+        except Exception as e:
+            logger.error(f"[PAPER-Auto] 콜백 실패: {e}")
 
     # ========== 자가진단 시스템 v2 ==========
 

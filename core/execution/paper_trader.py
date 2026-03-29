@@ -39,6 +39,15 @@ class PaperTrader:
         self.trailing_distance_pct = tc.get("distance_pct", 0.015)  # 최고점에서 1.5% 하락 시 청산
         self.trailing_step_pct = tc.get("step_pct", 0.005)          # SL을 0.5% 단위로 끌어올림
 
+        # 자동 청산 콜백 (SL/TP/트레일링으로 청산 시 호출)
+        self._on_auto_close_callback = None
+
+    def set_auto_close_callback(self, callback):
+        """SL/TP/트레일링 자동 청산 시 호출할 콜백 등록
+        callback(trade: dict) — trade는 close_position 반환값과 동일
+        """
+        self._on_auto_close_callback = callback
+
     def open_position(self, symbol: str, side: str, size_usdt: float,
                       price: float, leverage: int = 5, sl_pct: float = 0.02,
                       tp_pct: float = 0.04, atr_pct: float = 0.0) -> PaperPosition | None:
@@ -112,6 +121,8 @@ class PaperTrader:
 
     def update_prices(self, prices: dict[str, float]):
         """현재가 업데이트 + 트레일링 스탑 + SL/TP 체크"""
+        auto_closed = []  # (symbol, close_price, reason) — 루프 후 처리
+
         for symbol, price in prices.items():
             if symbol not in self.positions:
                 continue
@@ -130,7 +141,6 @@ class PaperTrader:
                     logger.info(f"[Trailing] {symbol} 트레일링 활성화 | 수익 {profit_pct:.2%} | SL → {pos.stop_loss:.2f}")
 
                 if pos.trailing_activated:
-                    # 신고가 갱신될 때마다 SL을 끌어올림
                     new_sl = pos.highest_price * (1 - self.trailing_distance_pct)
                     if new_sl > pos.stop_loss + (pos.entry_price * self.trailing_step_pct):
                         old_sl = pos.stop_loss
@@ -140,12 +150,11 @@ class PaperTrader:
                 # SL/TP 체크
                 if price <= pos.stop_loss:
                     reason = "트레일링 SL 도달" if pos.trailing_activated else "SL 도달"
-                    self.close_position(symbol, pos.stop_loss, reason)
+                    auto_closed.append((symbol, pos.stop_loss, reason))
                 elif price >= pos.take_profit and not pos.trailing_activated:
-                    # TP 도달 시 → 바로 청산하지 않고 트레일링으로 전환
                     pos.trailing_activated = True
-                    pos.stop_loss = pos.entry_price * (1 + self.trailing_activate_pct)  # 최소 수익 확보
-                    pos.take_profit = float("inf")  # TP 해제, 트레일링으로 추세 끝까지
+                    pos.stop_loss = pos.entry_price * (1 + self.trailing_activate_pct)
+                    pos.take_profit = float("inf")
                     logger.info(f"[Trailing] {symbol} TP 도달 → 트레일링 전환 | 수익 확보선: {pos.stop_loss:.2f}")
 
             else:  # short
@@ -169,12 +178,21 @@ class PaperTrader:
 
                 if price >= pos.stop_loss:
                     reason = "트레일링 SL 도달" if pos.trailing_activated else "SL 도달"
-                    self.close_position(symbol, pos.stop_loss, reason)
+                    auto_closed.append((symbol, pos.stop_loss, reason))
                 elif price <= pos.take_profit and not pos.trailing_activated:
                     pos.trailing_activated = True
                     pos.stop_loss = pos.entry_price * (1 - self.trailing_activate_pct)
                     pos.take_profit = 0.0
                     logger.info(f"[Trailing] {symbol} 숏 TP 도달 → 트레일링 전환 | 수익 확보선: {pos.stop_loss:.2f}")
+
+        # 루프 밖에서 청산 처리 (dict 변경 안전)
+        for symbol, close_price, reason in auto_closed:
+            trade = self.close_position(symbol, close_price, reason)
+            if trade and self._on_auto_close_callback:
+                try:
+                    self._on_auto_close_callback(trade)
+                except Exception as e:
+                    logger.error(f"[Paper] 자동청산 콜백 실패 {symbol}: {e}")
 
         self.equity_history.append({
             "timestamp": str(datetime.utcnow()),
