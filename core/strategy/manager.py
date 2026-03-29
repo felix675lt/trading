@@ -148,6 +148,8 @@ class StrategyManager:
         external_signal: dict | None = None,
         momentum: dict | None = None,
         feedback_blacklist: list | None = None,
+        funding_rate: float = 0.0,
+        fear_greed_index: float = 50.0,
     ) -> TradeDecision:
         """최종 트레이딩 결정 (v4 - 다중확인 시스템)"""
         action_map = {0: "hold", 1: "long", 2: "short", 3: "close"}
@@ -277,7 +279,19 @@ class StrategyManager:
                 final_action = "hold"
                 reason = f"고임팩트-숏차단 (ext={ext_score:.2f})"
 
-        # 2.8. 피드백 블랙리스트 필터
+        # 2.8. 레짐 방향 바이어스 (펀딩비 + 공포탐욕 + 가격추세 종합)
+        if final_action in ["long", "short"]:
+            direction_block = self._regime_direction_bias(
+                final_action, funding_rate, fear_greed_index, mom_direction, mom_rsi,
+            )
+            if direction_block:
+                old_action = final_action
+                final_action = "hold"
+                confidence = 0.0
+                reason = direction_block
+                confirming = []
+
+        # 2.9. 피드백 블랙리스트 필터
         if final_action in ["long", "short"] and feedback_blacklist:
             combo_key = "+".join(sorted(confirming))
             if combo_key in feedback_blacklist:
@@ -333,6 +347,10 @@ class StrategyManager:
                     "long": [(s, round(w, 3)) for s, w in long_votes],
                     "short": [(s, round(w, 3)) for s, w in short_votes],
                 },
+                "regime_bias": {
+                    "funding_rate": round(funding_rate, 3),
+                    "fear_greed": round(fear_greed, 1),
+                },
                 "adaptive": {
                     "min_confidence": round(self.min_confidence, 3),
                     "consecutive_holds": self._consecutive_holds,
@@ -359,7 +377,41 @@ class StrategyManager:
 
         return decision
 
-    def get_diagnostics(self) -> dict:
+    def _regime_direction_bias(
+        self, action: str, funding_rate: float, fear_greed: float,
+        mom_direction: str, mom_rsi: float,
+    ) -> str | None:
+        """레짐 기반 방향 필터 — 시장 상태와 반대 방향 진입 차단
+
+        Returns: 차단 사유 문자열 (None이면 통과)
+
+        로직:
+        - 극도의 공포(< 20) + 음펀비(< -0.3bp) + 반등 시그널 → 숏 차단 (롱 유리)
+        - 극도의 탐욕(> 80) + 양펀비(> 1.5bp) + 과매수 → 롱 차단 (숏 유리)
+        - 강한 음펀비(< -1bp)에서 숏 → 무조건 차단 (숏스퀴즈 리스크)
+        - 강한 양펀비(> 3bp)에서 롱 → 무조건 차단 (롱스퀴즈 리스크)
+        """
+        # 1. 극단 펀딩비 → 무조건 차단
+        if action == "short" and funding_rate < -1.0:
+            return f"레짐차단: 강한음펀비({funding_rate:.1f}bp)→숏스퀴즈위험"
+        if action == "long" and funding_rate > 3.0:
+            return f"레짐차단: 강한양펀비({funding_rate:.1f}bp)→롱스퀴즈위험"
+
+        # 2. 극도의 공포 + 음펀비 + 반등 조합 → 숏 차단
+        if (action == "short" and fear_greed < 20 and funding_rate < -0.3
+                and (mom_direction == "long" or mom_rsi < 30)):
+            return (f"레짐차단: 극공포({fear_greed:.0f})+음펀비({funding_rate:.1f}bp)"
+                    f"+반등시그널→숏차단")
+
+        # 3. 극도의 탐욕 + 양펀비 + 과매수 → 롱 차단
+        if (action == "long" and fear_greed > 80 and funding_rate > 1.5
+                and (mom_direction == "short" or mom_rsi > 70)):
+            return (f"레짐차단: 극탐욕({fear_greed:.0f})+양펀비({funding_rate:.1f}bp)"
+                    f"+과매수→롱차단")
+
+        return None
+
+
         """자기진단 상태 반환"""
         return {
             "consecutive_holds": self._consecutive_holds,

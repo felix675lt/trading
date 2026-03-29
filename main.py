@@ -502,6 +502,10 @@ class AutoTrader:
                 if loop_count % 240 == 0 and loop_count > 0:
                     await self._learning_health_check()
 
+                # === 4시간마다 전략 자체 리뷰 (480 루프 × 30초 ≈ 4시간) ===
+                if loop_count % 480 == 0 and loop_count > 0:
+                    await self._strategic_self_review()
+
                 # 대기
                 await asyncio.sleep(30)
 
@@ -547,7 +551,11 @@ class AutoTrader:
         # 4.7. 모멘텀 시그널 계산 (ML/RL 무반응 시 fallback)
         momentum_signal = self._calculate_momentum(df)
 
-        # 5. 전략 결정 (ML + RL + 외부 요인 + MTF + 모멘텀 통합)
+        # 5. 전략 결정 (ML + RL + 외부 요인 + MTF + 모멘텀 + 레짐 바이어스 통합)
+        ext_features_all = self.external_manager.get_all_features()
+        funding_rate = ext_features_all.get("deriv_funding_rate", 0)
+        fear_greed = ext_features_all.get("fg_value", 50)
+
         current_position = 0.0
         if self.mode in ("paper", "dual"):
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
@@ -555,6 +563,8 @@ class AutoTrader:
             ml_signal, rl_action, rl_confidence, current_position,
             adaptive_params["regime"], external_signal=ext_signal,
             momentum=momentum_signal,
+            funding_rate=funding_rate,
+            fear_greed_index=fear_greed,
         )
 
         # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
@@ -599,27 +609,6 @@ class AutoTrader:
             elif mtf_signal.get("higher_tf_conflict"):
                 decision.confidence *= 0.85
                 decision.reason += " ! TF충돌"
-
-        # === 펀딩비 필터 (_process_symbol 경로) ===
-        if decision.action in ("long", "short"):
-            ext_features_all = self.external_manager.get_all_features()
-            funding_rate = ext_features_all.get("deriv_funding_rate", 0)
-
-            if decision.action == "short" and funding_rate < -0.5:
-                old_conf = decision.confidence
-                decision.confidence *= 0.5
-                decision.reason += f" !음펀비({funding_rate:.1f}bp)숏감액"
-                if decision.confidence < self.strategy_manager.min_confidence:
-                    decision.action = "hold"
-                    decision.size = 0.0
-                    decision.reason += " →차단"
-                logger.info(
-                    f"[FundingFilter] {symbol} 음펀비 {funding_rate:.2f}bp + SHORT "
-                    f"→ conf {old_conf:.2f}→{decision.confidence:.2f}"
-                )
-            elif decision.action == "long" and funding_rate > 2.0:
-                decision.confidence *= 0.7
-                decision.reason += f" !양펀비({funding_rate:.1f}bp)롱감액"
 
         self.last_signals = {
             "symbol": symbol,
@@ -990,12 +979,19 @@ class AutoTrader:
             # 피드백 블랙리스트 조회
             fb_blacklist = self.feedback.get_entry_blacklist()
 
+            # 펀딩비 + 공포탐욕 지수 (레짐 바이어스용)
+            ext_features = self.external_manager.get_all_features()
+            funding_rate = ext_features.get("deriv_funding_rate", 0)
+            fear_greed = ext_features.get("fg_value", 50)
+
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
             decision = self.strategy_manager.decide(
                 ml_signal, rl_action, rl_confidence, current_position,
                 adaptive_params["regime"], external_signal=ext_signal,
                 momentum=momentum_signal,
                 feedback_blacklist=fb_blacklist,
+                funding_rate=funding_rate,
+                fear_greed_index=fear_greed,
             )
 
             # MTF 필터 적용
@@ -1017,29 +1013,6 @@ class AutoTrader:
                     decision.confidence *= 0.6
                 elif action_agrees_mtf and mtf_agreement > 0.7:
                     decision.confidence = min(decision.confidence * 1.15, 1.0)
-
-            # === 펀딩비 필터: 음펀비에서 숏 진입 차단 ===
-            # 음펀비 = 시장 과매도 → 반등 확률↑ → 숏 SL 확률↑
-            if decision.action in ("long", "short"):
-                ext_features = self.external_manager.get_all_features()
-                funding_rate = ext_features.get("deriv_funding_rate", 0)  # bp 단위
-
-                if decision.action == "short" and funding_rate < -0.5:
-                    # 음펀비 -0.5bp 이하에서 숏 → 확신도 50% 감소
-                    old_conf = decision.confidence
-                    decision.confidence *= 0.5
-                    decision.reason += f" !음펀비({funding_rate:.1f}bp)숏감액"
-                    if decision.confidence < self.strategy_manager.min_confidence:
-                        decision.action = "hold"
-                        decision.reason += " →차단"
-                    logger.info(
-                        f"[FundingFilter] {symbol} 음펀비 {funding_rate:.2f}bp + SHORT "
-                        f"→ conf {old_conf:.2f}→{decision.confidence:.2f}"
-                    )
-                elif decision.action == "long" and funding_rate > 2.0:
-                    # 양펀비 +2bp 이상에서 롱 → 확신도 30% 감소 (과열)
-                    decision.confidence *= 0.7
-                    decision.reason += f" !양펀비({funding_rate:.1f}bp)롱감액"
 
             price = float(df["close"].iloc[-1])
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
@@ -1794,6 +1767,170 @@ class AutoTrader:
             logger.debug(f"[진단] 연속 손실 체크 실패: {e}")
 
         return None
+
+    async def _strategic_self_review(self):
+        """4시간마다 실행 — 자체 거래 패턴 분석 + 전략 자동 조정
+
+        분석 항목:
+        1. 펀딩비 vs 방향별 승패 패턴
+        2. 레짐별 승률 분석
+        3. 시간대별 성과
+        4. 패턴 기반 자동 블랙리스트 / 파라미터 조정
+        """
+        try:
+            recent_trades = self.storage.get_recent_trades(limit=50)
+            if len(recent_trades) < 5:
+                logger.info("[SelfReview] 거래 수 부족 (5건 미만) — 스킵")
+                return
+
+            # === 1. 방향별 승패 분석 ===
+            long_trades = [t for t in recent_trades if t.get("side") == "long" or t.get("strategy", "").startswith("long")]
+            short_trades = [t for t in recent_trades if t.get("side") == "short" or t.get("strategy", "").startswith("short")]
+
+            # entry 거래만 분석 (close 거래의 pnl로 판단)
+            close_trades = [t for t in recent_trades if t.get("side") == "close" and t.get("pnl") is not None]
+
+            if not close_trades:
+                logger.info("[SelfReview] 청산 거래 없음 — 스킵")
+                return
+
+            wins = [t for t in close_trades if (t.get("pnl") or 0) > 0]
+            losses = [t for t in close_trades if (t.get("pnl") or 0) < 0]
+            total_pnl = sum(t.get("pnl", 0) for t in close_trades)
+            win_rate = len(wins) / len(close_trades) if close_trades else 0
+
+            # === 2. 모드별 분석 ===
+            live_closes = [t for t in close_trades if t.get("mode") == "LIVE"]
+            paper_closes = [t for t in close_trades if t.get("mode") == "PAPER"]
+
+            live_wr = (sum(1 for t in live_closes if (t.get("pnl") or 0) > 0) / len(live_closes)) if live_closes else 0
+            paper_wr = (sum(1 for t in paper_closes if (t.get("pnl") or 0) > 0) / len(paper_closes)) if paper_closes else 0
+            live_pnl = sum(t.get("pnl", 0) for t in live_closes)
+            paper_pnl = sum(t.get("pnl", 0) for t in paper_closes)
+
+            # === 3. 전략별 손실 패턴 분석 ===
+            strategy_stats = {}
+            for t in close_trades:
+                strat = t.get("strategy", "unknown")
+                if strat not in strategy_stats:
+                    strategy_stats[strat] = {"wins": 0, "losses": 0, "pnl": 0}
+                if (t.get("pnl") or 0) > 0:
+                    strategy_stats[strat]["wins"] += 1
+                elif (t.get("pnl") or 0) < 0:
+                    strategy_stats[strat]["losses"] += 1
+                strategy_stats[strat]["pnl"] += t.get("pnl", 0)
+
+            # === 4. 시간대별 분석 ===
+            hour_stats = {}
+            for t in close_trades:
+                try:
+                    ts = t.get("timestamp", "")
+                    if ts:
+                        hour = datetime.fromisoformat(ts.replace("Z", "+00:00")).hour if "T" in ts else int(ts.split(" ")[1].split(":")[0])
+                    else:
+                        hour = -1
+                except Exception:
+                    hour = -1
+                if hour >= 0:
+                    if hour not in hour_stats:
+                        hour_stats[hour] = {"wins": 0, "losses": 0, "pnl": 0}
+                    if (t.get("pnl") or 0) > 0:
+                        hour_stats[hour]["wins"] += 1
+                    else:
+                        hour_stats[hour]["losses"] += 1
+                    hour_stats[hour]["pnl"] += t.get("pnl", 0)
+
+            # === 5. 자동 조정 로직 ===
+            adjustments = []
+
+            # 5a. SL 적중률 너무 높으면 SL 여유 확대 제안
+            sl_trades = [t for t in close_trades if "sl" in (t.get("strategy") or "").lower()]
+            if len(sl_trades) >= 3 and len(close_trades) > 0:
+                sl_ratio = len(sl_trades) / len(close_trades)
+                if sl_ratio > 0.6:
+                    adjustments.append(f"SL 적중률 {sl_ratio:.0%} — SL 여유 확대 필요")
+
+            # 5b. LIVE vs PAPER 괴리 감지
+            if len(live_closes) >= 3 and len(paper_closes) >= 3:
+                gap = abs(live_wr - paper_wr)
+                if gap > 0.25:
+                    adjustments.append(
+                        f"LIVE({live_wr:.0%}) vs PAPER({paper_wr:.0%}) 승률 괴리 {gap:.0%} — 실행 차이 점검"
+                    )
+
+            # 5c. 특정 시간대 손실 집중
+            bad_hours = []
+            for h, stats in hour_stats.items():
+                total = stats["wins"] + stats["losses"]
+                if total >= 3 and stats["losses"] > stats["wins"] * 2:
+                    bad_hours.append(f"{h}시({stats['losses']}패/{total}건)")
+            if bad_hours:
+                adjustments.append(f"손실 집중 시간대: {', '.join(bad_hours)}")
+
+            # 5d. 연속 손실 후 min_confidence 자동 상향
+            consecutive_losses = 0
+            for t in close_trades[:10]:  # 최근 10건
+                if (t.get("pnl") or 0) < 0:
+                    consecutive_losses += 1
+                else:
+                    break
+            if consecutive_losses >= 3:
+                old_conf = self.strategy_manager.base_min_confidence
+                new_conf = min(old_conf + 0.05, 0.60)
+                if new_conf != old_conf:
+                    self.strategy_manager.base_min_confidence = new_conf
+                    adjustments.append(
+                        f"연속 {consecutive_losses}패 → min_confidence {old_conf:.2f}→{new_conf:.2f} 상향"
+                    )
+
+            # 5e. 승률 좋으면 min_confidence 완화
+            if win_rate > 0.65 and len(close_trades) >= 10 and consecutive_losses == 0:
+                old_conf = self.strategy_manager.base_min_confidence
+                new_conf = max(old_conf - 0.02, 0.35)
+                if new_conf != old_conf:
+                    self.strategy_manager.base_min_confidence = new_conf
+                    adjustments.append(
+                        f"승률 {win_rate:.0%} 양호 → min_confidence {old_conf:.2f}→{new_conf:.2f} 완화"
+                    )
+
+            # === 6. 리포트 생성 ===
+            report_lines = [
+                f"🧠 <b>전략 자체 리뷰</b>",
+                f"━━━━━━━━━━━━━",
+                f"📊 최근 {len(close_trades)}건 | 승률: {win_rate:.0%} | PnL: ${total_pnl:+.2f}",
+            ]
+            if live_closes:
+                report_lines.append(f"🔥 LIVE: {len(live_closes)}건 승률 {live_wr:.0%} PnL ${live_pnl:+.2f}")
+            if paper_closes:
+                report_lines.append(f"📝 PAPER: {len(paper_closes)}건 승률 {paper_wr:.0%} PnL ${paper_pnl:+.2f}")
+
+            # 전략별 요약
+            if strategy_stats:
+                report_lines.append(f"\n📐 <b>전략별 성과</b>")
+                for strat, stats in sorted(strategy_stats.items(), key=lambda x: x[1]["pnl"]):
+                    total = stats["wins"] + stats["losses"]
+                    wr = stats["wins"] / total if total > 0 else 0
+                    report_lines.append(f"  {strat}: {total}건 승률 {wr:.0%} PnL ${stats['pnl']:+.2f}")
+
+            if adjustments:
+                report_lines.append(f"\n🔧 <b>자동 조정</b>")
+                for adj in adjustments:
+                    report_lines.append(f"  • {adj}")
+            else:
+                report_lines.append(f"\n✅ 특이 패턴 없음 — 현행 유지")
+
+            # 현재 전략 파라미터
+            report_lines.append(
+                f"\n⚙️ min_conf: {self.strategy_manager.base_min_confidence:.2f} | "
+                f"min_confirm: {self.strategy_manager.min_confirming}"
+            )
+
+            report_text = "\n".join(report_lines)
+            logger.info(f"[SelfReview] 완료 | {len(close_trades)}건 승률 {win_rate:.0%} PnL ${total_pnl:+.2f} | 조정 {len(adjustments)}건")
+            tg_notify(report_text, silent=len(adjustments) == 0)
+
+        except Exception as e:
+            logger.error(f"[SelfReview] 실패: {e}")
 
     def _check_code_version(self) -> str | None:
         """git commit 시간 vs 프로세스 시작 시간 비교"""
