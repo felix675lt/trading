@@ -411,7 +411,7 @@ class StrategyManager:
 
         return None
 
-
+    def get_diagnostics(self) -> dict:
         """자기진단 상태 반환"""
         return {
             "consecutive_holds": self._consecutive_holds,
