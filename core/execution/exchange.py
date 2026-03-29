@@ -182,6 +182,31 @@ class ExchangeClient:
         market = self.exchange.markets.get(symbol, {})
         return market.get("limits", {}).get("cost", {}).get("min", 5.0)
 
+    async def get_all_positions(self) -> list[dict]:
+        """거래소의 모든 오픈 포지션 조회 (심볼 무관)"""
+        try:
+            positions = await self.exchange.fetch_positions()
+            result = []
+            for pos in positions:
+                contracts = pos.get("contracts", 0) or 0
+                if float(contracts) > 0:
+                    lev = pos.get("leverage")
+                    leverage = int(lev) if lev is not None else 1
+                    entry = pos.get("entryPrice") or 0
+                    upnl = pos.get("unrealizedPnl") or 0
+                    result.append({
+                        "symbol": pos.get("symbol", ""),
+                        "side": pos.get("side", ""),
+                        "size": float(contracts),
+                        "entry_price": float(entry),
+                        "unrealized_pnl": float(upnl),
+                        "leverage": leverage,
+                    })
+            return result
+        except Exception as e:
+            logger.error(f"전체 포지션 조회 실패: {e}")
+            return []
+
     async def get_ticker_price(self, symbol: str) -> float:
         ticker = await self.exchange.fetch_ticker(symbol)
         return float(ticker["last"])

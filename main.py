@@ -113,6 +113,11 @@ class AutoTrader:
         self.last_external = {}
         self.is_running = False
 
+        # 자가진단 LIVE 일시정지 상태
+        self._live_paused = False
+        self._live_pause_reason = ""
+        self._live_pause_time = None
+
     def _load_config(self, path: str) -> dict:
         with open(path) as f:
             config = yaml.safe_load(f)
@@ -485,7 +490,11 @@ class AutoTrader:
                                 f"거래: {report['total_trades']}"
                             )
 
-                # === 2시간마다 학습 자가진단 (240 루프 × 30초 ≈ 2시간) ===
+                # === 30분마다 긴급 자가진단 (60 루프 × 30초 ≈ 30분) ===
+                if loop_count % 60 == 0 and loop_count > 0:
+                    await self._critical_health_check()
+
+                # === 2시간마다 종합 자가진단 (240 루프 × 30초 ≈ 2시간) ===
                 if loop_count % 240 == 0 and loop_count > 0:
                     await self._learning_health_check()
 
@@ -1187,6 +1196,10 @@ class AutoTrader:
         """LIVE 포지션 실행 — 가장 강한 시그널에만"""
         if self.mode not in ("live", "dual"):
             return
+        # 자가진단에 의한 LIVE 일시정지 상태면 신규 진입 차단
+        if getattr(self, '_live_paused', False):
+            logger.info(f"[LIVE] 일시정지 상태 — 신규 진입 차단 (사유: {getattr(self, '_live_pause_reason', '?')})")
+            return
         symbol = c["symbol"]
         om = self.order_managers.get(exchange_name)
         if not om:
@@ -1299,119 +1312,183 @@ class AutoTrader:
                 })
                 tg_notify(format_trade_close("🔥LIVE", symbol, live_pnl, c["reason"]))
 
-    async def _learning_health_check(self):
-        """2시간마다 학습 시스템 자가진단 + 자가수정"""
+    # ========== 자가진단 시스템 v2 ==========
+
+    async def _critical_health_check(self):
+        """30분마다 실행 — 즉시 대응 필요한 치명적 문제만 검사"""
         issues = []
         fixes = []
 
         try:
-            # 1. feedback_history.json 파일 존재 + 쓰기 가능 확인
+            # ──── 1. 텔레그램 실제 전송 테스트 ────
+            tg_working = await self._check_telegram()
+            if not tg_working:
+                issues.append("텔레그램 전송 불가")
+                fix = await self._fix_telegram()
+                if fix:
+                    fixes.append(fix)
+
+            # ──── 2. 거래소 고아 포지션 감지 (내부 추적 없는 포지션) ────
+            orphan_fixes = await self._check_orphan_positions()
+            for item in orphan_fixes:
+                if item["type"] == "issue":
+                    issues.append(item["msg"])
+                else:
+                    fixes.append(item["msg"])
+
+            # ──── 3. 모든 LIVE 포지션에 SL/TP Algo 주문 존재 확인 ────
+            algo_fixes = await self._check_algo_orders()
+            for item in algo_fixes:
+                if item["type"] == "issue":
+                    issues.append(item["msg"])
+                else:
+                    fixes.append(item["msg"])
+
+            # ──── 4. 연속 손실 / 승률 감시 → 자동 일시정지 ────
+            loss_result = self._check_consecutive_losses()
+            if loss_result:
+                issues.append(loss_result)
+
+            # ──── 5. SL/TP 콜백 등록 확인 ────
+            cb_fixes = self._check_callbacks()
+            for item in cb_fixes:
+                if item["type"] == "issue":
+                    issues.append(item["msg"])
+                else:
+                    fixes.append(item["msg"])
+
+            # 리포트
+            if issues:
+                status = f"🚨 {len(issues)}건 치명적 문제"
+                report_lines = [
+                    f"🚨 <b>긴급 자가진단</b>",
+                    f"━━━━━━━━━━━━━",
+                    f"❌ 문제점:",
+                ]
+                for issue in issues:
+                    report_lines.append(f"  • {issue}")
+                if fixes:
+                    report_lines.append(f"\n🔧 자동수정:")
+                    for fix in fixes:
+                        report_lines.append(f"  • {fix}")
+                report_text = "\n".join(report_lines)
+                logger.warning(f"[긴급진단] {status} | issues: {issues} | fixes: {fixes}")
+                tg_notify(report_text)
+            else:
+                logger.info("[긴급진단] ✅ 치명적 문제 없음")
+
+        except Exception as e:
+            logger.error(f"[긴급진단] 실행 실패: {e}")
+
+    async def _learning_health_check(self):
+        """2시간마다 학습 시스템 종합 진단 + 리포트"""
+        issues = []
+        fixes = []
+
+        try:
+            # ──── 기본 진단 (기존 항목) ────
             fb_path = Path("data/feedback_history.json")
             if not fb_path.exists():
                 issues.append("feedback_history.json 없음")
                 self.feedback._save()
                 fixes.append("feedback_history.json 재생성")
 
-            # 2. feedback 인스턴스 상태 확인
             fb_total = self.feedback.feedback.get("total_analyzed", 0)
             fb_recent = len(self.feedback.recent_trades)
 
-            # 3. DB 거래 기록 확인 (모드별)
             db_counts = self.storage.get_trade_counts_by_mode(hours=24)
             live_count_24h = db_counts.get("LIVE", 0)
             paper_count_24h = db_counts.get("PAPER", 0)
 
-            # 4. StrategyOptimizer 상태 확인
             live_opt_trades = sum(len(v) for v in self.strategy_optimizer_live.performance_history.values())
             paper_opt_trades = sum(len(v) for v in self.strategy_optimizer_paper.performance_history.values())
 
-            # 5. SL/TP 콜백이 등록되어 있는지 확인
-            for name, om in self.order_managers.items():
-                if not getattr(om, '_on_sl_callback', None):
-                    issues.append(f"{name} SL 콜백 미등록")
-                    # 자가수정: 콜백 재등록
-                    def _make_trade_callback_fix(close_type: str):
-                        def on_triggered(result: dict):
-                            symbol = result.get("symbol", "?")
-                            pnl = result.get("pnl", 0)
-                            side = result.get("side", "?")
-                            regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "unknown"
-                            self.feedback.record_trade(
-                                {"pnl": pnl, "side": side, "symbol": symbol},
-                                {"regime": regime, "signal": 0, "confidence": 0,
-                                 "external_score": 0, "external_direction": "neutral",
-                                 "exit_reason": close_type.lower(),
-                                 "confirming_sources": [],
-                                 "entry_path": "callback"},
-                            )
-                            if pnl < 0:
-                                self.strategy_manager.record_loss()
-                            else:
-                                self.strategy_manager.record_win()
-                            self.risk_manager.record_pnl(pnl)
-                            self.storage.save_trade({
-                                "exchange": "binance", "symbol": symbol, "side": "close",
-                                "price": result.get("exit_price", 0),
-                                "amount": result.get("size", 0),
-                                "pnl": pnl, "fee": 0,
-                                "strategy": f"{close_type.lower()}_triggered",
-                                "mode": "LIVE",
-                            })
-                            l_hash = self.strategy_optimizer_live._config_to_hash(
-                                self.strategy_optimizer_live.current_config
-                            )
-                            self.strategy_optimizer_live.record_trade(l_hash, {
-                                "pnl": pnl, "timestamp": datetime.utcnow(),
-                                "symbol": symbol, "hour": datetime.utcnow().hour,
-                            })
-                            logger.info(f"[{close_type}학습] {symbol} PnL: ${pnl:.2f} → 학습기록 완료")
-                            tg_notify(f"{'🛑' if close_type == 'SL' else '🎯'} {close_type} 체결 {symbol} PnL: ${pnl:+.2f}")
-                        return on_triggered
-
-                    om.set_sl_callback(_make_trade_callback_fix("SL"))
-                    om.set_tp_callback(_make_trade_callback_fix("TP"))
-                    fixes.append(f"{name} SL/TP 콜백 재등록")
-
-                if not getattr(om, '_on_tp_callback', None):
-                    issues.append(f"{name} TP 콜백 미등록")
-
-            # 6. LIVE 포지션이 있는데 SL/TP Algo 주문이 없으면 재설정
-            for name, om in self.order_managers.items():
-                for symbol, pos in om.positions.items():
-                    try:
-                        algo_orders = await om.exchange.get_algo_orders(symbol)
-                        if len(algo_orders) < 2:  # SL + TP = 2개여야 정상
-                            issues.append(f"{symbol} Algo 주문 {len(algo_orders)}건 (2건 필요)")
-                            # 자가수정: SL/TP 재설정
-                            await om.exchange.cancel_all_orders(symbol)
-                            close_side = "sell" if pos.side == "long" else "buy"
-                            await om.exchange.create_stop_loss(symbol, close_side, pos.size, pos.stop_loss)
-                            await om.exchange.create_take_profit(symbol, close_side, pos.size, pos.take_profit)
-                            fixes.append(f"{symbol} SL/TP Algo 재설정")
-                    except Exception as e:
-                        issues.append(f"{symbol} Algo 주문 확인 실패: {e}")
-
-            # 7. feedback의 recent_trades와 DB가 너무 차이나면 동기화 문제
             total_db = sum(db_counts.values())
             if fb_total > 0 and total_db == 0:
-                issues.append(f"feedback {fb_total}건 기록됨, DB 0건 — storage.save_trade 누락 가능")
+                issues.append(f"feedback {fb_total}건, DB 0건 — save_trade 누락 가능")
+
+            # ──── 텔레그램 체크 ────
+            tg_working = await self._check_telegram()
+            if not tg_working:
+                issues.append("텔레그램 전송 불가")
+                fix = await self._fix_telegram()
+                if fix:
+                    fixes.append(fix)
+
+            # ──── 거래소 고아 포지션 ────
+            orphan_fixes = await self._check_orphan_positions()
+            for item in orphan_fixes:
+                if item["type"] == "issue":
+                    issues.append(item["msg"])
+                else:
+                    fixes.append(item["msg"])
+
+            # ──── Algo 주문 확인 ────
+            algo_fixes = await self._check_algo_orders()
+            for item in algo_fixes:
+                if item["type"] == "issue":
+                    issues.append(item["msg"])
+                else:
+                    fixes.append(item["msg"])
+
+            # ──── 콜백 확인 ────
+            cb_fixes = self._check_callbacks()
+            for item in cb_fixes:
+                if item["type"] == "issue":
+                    issues.append(item["msg"])
+                else:
+                    fixes.append(item["msg"])
+
+            # ──── 연속 손실 / 승률 ────
+            loss_result = self._check_consecutive_losses()
+            if loss_result:
+                issues.append(loss_result)
+
+            # ──── 코드 버전 확인 (git commit vs 프로세스 시작 시간) ────
+            version_issue = self._check_code_version()
+            if version_issue:
+                issues.append(version_issue)
+
+            # ──── SL 적중률 분석 → 자동 조정 제안 ────
+            sl_suggestion = self.feedback.get_sl_adjustment_suggestion()
+            sl_note = ""
+            if sl_suggestion and sl_suggestion.get("action"):
+                sl_note = f"SL제안: {sl_suggestion['action']} (적중률 {sl_suggestion.get('sl_hit_rate', 0):.0%})"
+
+            # ──── 프로세스 가동시간 ────
+            uptime = datetime.utcnow() - self.start_time
+            uptime_str = f"{uptime.days}일 {uptime.seconds // 3600}시간"
+
+            # ──── 잔고 체크 ────
+            balance_info = ""
+            for name, client in self.exchange_clients.items():
+                try:
+                    bal = await client.get_balance()
+                    balance_info = f"${bal.get('total', 0):,.2f} (가용: ${bal.get('free', 0):,.2f})"
+                except Exception:
+                    balance_info = "조회 실패"
 
             # === 리포트 생성 ===
-            status = "✅ 정상" if not issues else f"⚠️ {len(issues)}건 문제 발견"
+            status = "✅ 정상" if not issues else f"⚠️ {len(issues)}건 문제"
             report_lines = [
-                f"🔍 <b>학습 자가진단</b> {status}",
+                f"🔍 <b>종합 자가진단</b> {status}",
                 f"━━━━━━━━━━━━━",
-                f"📊 피드백 총 분석: {fb_total}건 (메모리: {fb_recent}건)",
-                f"💾 DB 24h: LIVE {live_count_24h}건 | PAPER {paper_count_24h}건",
-                f"📈 Optimizer: LIVE {live_opt_trades}건 | PAPER {paper_opt_trades}건",
+                f"⏱ 가동: {uptime_str}",
+                f"💰 잔고: {balance_info}",
+                f"📊 피드백: {fb_total}건 (메모리: {fb_recent}건)",
+                f"💾 DB 24h: LIVE {live_count_24h} | PAPER {paper_count_24h}",
+                f"📈 Optimizer: LIVE {live_opt_trades} | PAPER {paper_opt_trades}",
+                f"📡 텔레그램: {'✅' if tg_working else '❌'}",
             ]
+            if sl_note:
+                report_lines.append(f"📐 {sl_note}")
 
             if issues:
                 report_lines.append(f"\n❌ 문제점:")
                 for issue in issues:
                     report_lines.append(f"  • {issue}")
             if fixes:
-                report_lines.append(f"\n🔧 자가수정:")
+                report_lines.append(f"\n🔧 자동수정:")
                 for fix in fixes:
                     report_lines.append(f"  • {fix}")
 
@@ -1424,13 +1501,332 @@ class AutoTrader:
                 report_lines.append(f"\n📍 LIVE 포지션:")
                 report_lines.extend(live_pos_info)
 
+            # 연속손실 현황
+            loss_penalty = getattr(self.strategy_manager, '_loss_penalty', 0)
+            consec = getattr(self.strategy_manager, '_consecutive_losses', 0)
+            if consec > 0:
+                report_lines.append(f"\n⚡ 연속손실: {consec}회 (확신도 +{loss_penalty:.2f})")
+
             report_text = "\n".join(report_lines)
-            logger.info(f"[자가진단] {status} | FB:{fb_total} DB_LIVE:{live_count_24h} DB_PAPER:{paper_count_24h} | issues:{len(issues)} fixes:{len(fixes)}")
+            logger.info(f"[종합진단] {status} | FB:{fb_total} DB_LIVE:{live_count_24h} DB_PAPER:{paper_count_24h} | issues:{len(issues)} fixes:{len(fixes)}")
             tg_notify(report_text, silent=len(issues) == 0)
 
         except Exception as e:
-            logger.error(f"[자가진단] 실패: {e}")
-            tg_notify(f"⚠️ 학습 자가진단 실패: {e}")
+            logger.error(f"[종합진단] 실패: {e}")
+            tg_notify(f"⚠️ 종합 자가진단 실패: {e}")
+
+    # ──── 개별 진단 모듈들 ────
+
+    async def _check_telegram(self) -> bool:
+        """텔레그램 실제 전송 테스트 (빈 메시지 아닌 실제 API 호출)"""
+        global _tg_ok
+        try:
+            # 1. 모듈 임포트 가능한지
+            from scripts.telegram_bot import send_message as _test_send, BOT_TOKEN, CHAT_ID
+            if not BOT_TOKEN or not CHAT_ID:
+                logger.warning("[진단] 텔레그램 BOT_TOKEN 또는 CHAT_ID 미설정")
+                return False
+
+            # 2. 실제 API 호출 테스트 (getMe — 메시지 전송 없이 봇 상태 확인)
+            import urllib.request
+            import json
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+            req = urllib.request.Request(url, method="GET")
+            resp = urllib.request.urlopen(req, timeout=10)
+            result = json.loads(resp.read())
+            if result.get("ok"):
+                _tg_ok = True
+                return True
+            else:
+                logger.warning(f"[진단] 텔레그램 getMe 실패: {result}")
+                return False
+        except Exception as e:
+            logger.warning(f"[진단] 텔레그램 테스트 실패: {e}")
+            return False
+
+    async def _fix_telegram(self) -> str:
+        """텔레그램 복구 시도"""
+        global _tg_ok
+        try:
+            # telegram_bot.py 파일 존재 확인
+            tg_path = Path(__file__).parent / "scripts" / "telegram_bot.py"
+            if not tg_path.exists():
+                logger.error(f"[자가수정] telegram_bot.py 파일 없음: {tg_path}")
+                return "telegram_bot.py 파일 없음 — 수동 복원 필요"
+
+            # 모듈 리임포트 시도
+            import importlib
+            import scripts.telegram_bot as tg_mod
+            importlib.reload(tg_mod)
+            from scripts.telegram_bot import send_message as tg_send_new
+            # 글로벌 참조 업데이트
+            import builtins
+            globals_main = sys.modules[__name__]
+            if hasattr(globals_main, 'tg_send'):
+                # tg_send를 직접 교체할 수는 없으므로, _tg_ok 플래그만 복원
+                pass
+            _tg_ok = True
+            return "텔레그램 모듈 리로드 완료"
+        except Exception as e:
+            logger.error(f"[자가수정] 텔레그램 복구 실패: {e}")
+            return f"텔레그램 복구 실패: {e}"
+
+    async def _check_orphan_positions(self) -> list[dict]:
+        """거래소에는 포지션이 있지만 내부 추적에 없는 '고아 포지션' 감지 + 복구"""
+        results = []
+        trading_symbols = self.config.get("trading", {}).get("symbols", [])
+
+        for name, client in self.exchange_clients.items():
+            try:
+                exchange_positions = await client.get_all_positions()
+                om = self.order_managers.get(name)
+                if not om:
+                    continue
+
+                internal_symbols = set(om.positions.keys())
+
+                for epos in exchange_positions:
+                    sym = epos["symbol"]
+                    if sym not in internal_symbols:
+                        # 고아 포지션 발견!
+                        results.append({
+                            "type": "issue",
+                            "msg": f"고아 포지션 발견: {sym} {epos['side']} {epos['size']}개 @ {epos['entry_price']:.4f} (내부 추적 없음)"
+                        })
+
+                        # 자가수정: recover_positions으로 복구
+                        try:
+                            if sym in trading_symbols:
+                                recovered = await om.recover_positions([sym])
+                                if recovered:
+                                    results.append({
+                                        "type": "fix",
+                                        "msg": f"{sym} 고아 포지션 복구 완료 (SL/TP 재설정)"
+                                    })
+                                    tg_notify(
+                                        f"🔄 <b>고아 포지션 자동복구</b>\n"
+                                        f"━━━━━━━━━━━━━\n"
+                                        f"종목: {sym}\n"
+                                        f"방향: {epos['side']}\n"
+                                        f"수량: {epos['size']}\n"
+                                        f"진입가: ${epos['entry_price']:.4f}\n"
+                                        f"⚠️ SL/TP 자동 재설정됨"
+                                    )
+                            else:
+                                # 추적 대상이 아닌 심볼 → 경고만
+                                results.append({
+                                    "type": "issue",
+                                    "msg": f"{sym} 비추적 심볼 고아 포지션 — 수동 확인 필요"
+                                })
+                        except Exception as e:
+                            results.append({
+                                "type": "issue",
+                                "msg": f"{sym} 고아 포지션 복구 실패: {e}"
+                            })
+
+                # 반대도 확인: 내부에는 있지만 거래소에 없는 유령 포지션
+                exchange_symbols = {epos["symbol"] for epos in exchange_positions}
+                for internal_sym in internal_symbols:
+                    if internal_sym not in exchange_symbols:
+                        results.append({
+                            "type": "issue",
+                            "msg": f"유령 포지션: {internal_sym} 내부 추적 있지만 거래소에 없음"
+                        })
+                        # 자가수정: 내부 포지션 제거
+                        try:
+                            del om.positions[internal_sym]
+                            results.append({
+                                "type": "fix",
+                                "msg": f"{internal_sym} 유령 포지션 내부 추적 제거"
+                            })
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                results.append({
+                    "type": "issue",
+                    "msg": f"{name} 거래소 포지션 전체 조회 실패: {e}"
+                })
+
+        return results
+
+    async def _check_algo_orders(self) -> list[dict]:
+        """모든 LIVE 포지션의 SL/TP Algo 주문 존재 여부 확인 + 자가수정"""
+        results = []
+        for name, om in self.order_managers.items():
+            for symbol, pos in list(om.positions.items()):
+                try:
+                    algo_orders = await om.exchange.get_algo_orders(symbol)
+                    if len(algo_orders) < 2:
+                        results.append({
+                            "type": "issue",
+                            "msg": f"{symbol} Algo 주문 {len(algo_orders)}건 (2건 필요)"
+                        })
+                        # 자가수정
+                        await om.exchange.cancel_all_orders(symbol)
+                        close_side = "sell" if pos.side == "long" else "buy"
+                        await om.exchange.create_stop_loss(symbol, close_side, pos.size, pos.stop_loss)
+                        await om.exchange.create_take_profit(symbol, close_side, pos.size, pos.take_profit)
+                        results.append({
+                            "type": "fix",
+                            "msg": f"{symbol} SL({pos.stop_loss:.4f})/TP({pos.take_profit:.4f}) 재설정"
+                        })
+                except Exception as e:
+                    results.append({
+                        "type": "issue",
+                        "msg": f"{symbol} Algo 확인 실패: {e}"
+                    })
+        return results
+
+    def _check_callbacks(self) -> list[dict]:
+        """SL/TP 콜백 등록 확인 + 자가수정"""
+        results = []
+        for name, om in self.order_managers.items():
+            sl_ok = getattr(om, '_on_sl_callback', None) is not None
+            tp_ok = getattr(om, '_on_tp_callback', None) is not None
+
+            if not sl_ok or not tp_ok:
+                missing = []
+                if not sl_ok:
+                    missing.append("SL")
+                if not tp_ok:
+                    missing.append("TP")
+                results.append({
+                    "type": "issue",
+                    "msg": f"{name} {'/'.join(missing)} 콜백 미등록"
+                })
+
+                # 자가수정: 콜백 재등록
+                def _make_trade_callback_fix(close_type: str):
+                    def on_triggered(result: dict):
+                        symbol = result.get("symbol", "?")
+                        pnl = result.get("pnl", 0)
+                        side = result.get("side", "?")
+                        regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "unknown"
+                        self.feedback.record_trade(
+                            {"pnl": pnl, "side": side, "symbol": symbol},
+                            {"regime": regime, "signal": 0, "confidence": 0,
+                             "external_score": 0, "external_direction": "neutral",
+                             "exit_reason": close_type.lower(),
+                             "confirming_sources": [],
+                             "entry_path": "callback"},
+                        )
+                        if pnl < 0:
+                            self.strategy_manager.record_loss()
+                        else:
+                            self.strategy_manager.record_win()
+                        self.risk_manager.record_pnl(pnl)
+                        self.storage.save_trade({
+                            "exchange": "binance", "symbol": symbol, "side": "close",
+                            "price": result.get("exit_price", 0),
+                            "amount": result.get("size", 0),
+                            "pnl": pnl, "fee": 0,
+                            "strategy": f"{close_type.lower()}_triggered",
+                            "mode": "LIVE",
+                        })
+                        l_hash = self.strategy_optimizer_live._config_to_hash(
+                            self.strategy_optimizer_live.current_config
+                        )
+                        self.strategy_optimizer_live.record_trade(l_hash, {
+                            "pnl": pnl, "timestamp": datetime.utcnow(),
+                            "symbol": symbol, "hour": datetime.utcnow().hour,
+                        })
+                        logger.info(f"[{close_type}학습] {symbol} PnL: ${pnl:.2f} → 학습기록 완료")
+                        tg_notify(f"{'🛑' if close_type == 'SL' else '🎯'} {close_type} 체결 {symbol} PnL: ${pnl:+.2f}")
+                    return on_triggered
+
+                om.set_sl_callback(_make_trade_callback_fix("SL"))
+                om.set_tp_callback(_make_trade_callback_fix("TP"))
+                results.append({
+                    "type": "fix",
+                    "msg": f"{name} SL/TP 콜백 재등록 완료"
+                })
+
+        return results
+
+    def _check_consecutive_losses(self) -> str | None:
+        """연속 손실 / 승률 감시 → LIVE 자동 일시정지"""
+        # 최근 LIVE 거래 승률 확인
+        try:
+            recent_live = self.storage.get_recent_trades(mode="LIVE", limit=10)
+            if len(recent_live) >= 5:
+                wins = sum(1 for t in recent_live if (t.get("pnl") or 0) > 0)
+                win_rate = wins / len(recent_live)
+
+                if win_rate == 0 and len(recent_live) >= 5:
+                    # 최근 5건 이상 전패 → LIVE 일시정지
+                    if not getattr(self, '_live_paused', False):
+                        self._live_paused = True
+                        self._live_pause_reason = f"최근 {len(recent_live)}건 전패 (승률 0%)"
+                        self._live_pause_time = datetime.utcnow()
+                        logger.warning(f"[자가진단] ⛔ LIVE 자동 일시정지: {self._live_pause_reason}")
+                        tg_notify(
+                            f"⛔ <b>LIVE 자동 일시정지</b>\n"
+                            f"━━━━━━━━━━━━━\n"
+                            f"사유: {self._live_pause_reason}\n"
+                            f"최근 {len(recent_live)}건 PnL: {[round(t.get('pnl', 0), 2) for t in recent_live]}\n"
+                            f"📝 PAPER 모드는 계속 학습 중\n"
+                            f"🔄 승률 개선 시 자동 재개"
+                        )
+                    return f"LIVE 일시정지: 최근 {len(recent_live)}건 전패"
+
+                elif win_rate > 0 and getattr(self, '_live_paused', False):
+                    # 승률 회복 → 재개
+                    self._live_paused = False
+                    pause_duration = datetime.utcnow() - getattr(self, '_live_pause_time', datetime.utcnow())
+                    logger.info(f"[자가진단] ✅ LIVE 재개 (승률 {win_rate:.0%}, 정지 {pause_duration})")
+                    tg_notify(
+                        f"✅ <b>LIVE 자동 재개</b>\n"
+                        f"━━━━━━━━━━━━━\n"
+                        f"승률 회복: {win_rate:.0%} ({wins}/{len(recent_live)}건)\n"
+                        f"정지 기간: {pause_duration}"
+                    )
+                    return None
+
+                elif win_rate < 0.25 and len(recent_live) >= 8:
+                    return f"LIVE 저조: 최근 {len(recent_live)}건 승률 {win_rate:.0%}"
+
+        except Exception as e:
+            logger.debug(f"[진단] 연속 손실 체크 실패: {e}")
+
+        return None
+
+    def _check_code_version(self) -> str | None:
+        """git commit 시간 vs 프로세스 시작 시간 비교"""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "log", "-1", "--format=%ct"],
+                capture_output=True, text=True, timeout=5,
+                cwd=str(Path(__file__).parent)
+            )
+            if result.returncode == 0:
+                last_commit_ts = int(result.stdout.strip())
+                last_commit_time = datetime.utcfromtimestamp(last_commit_ts)
+                process_start = self.start_time
+
+                if last_commit_time > process_start:
+                    diff = last_commit_time - process_start
+                    diff_min = diff.total_seconds() / 60
+                    if diff_min > 5:  # 5분 이상 차이
+                        msg = (
+                            f"코드 버전 불일치! 커밋: {last_commit_time.strftime('%H:%M')} > "
+                            f"프로세스: {process_start.strftime('%H:%M')} "
+                            f"({diff_min:.0f}분 차이) — 재시작 필요"
+                        )
+                        logger.warning(f"[진단] {msg}")
+                        tg_notify(
+                            f"⚠️ <b>코드 버전 불일치</b>\n"
+                            f"━━━━━━━━━━━━━\n"
+                            f"최신 커밋: {last_commit_time.strftime('%Y-%m-%d %H:%M')}\n"
+                            f"프로세스 시작: {process_start.strftime('%Y-%m-%d %H:%M')}\n"
+                            f"⏱ {diff_min:.0f}분 차이\n"
+                            f"🔄 새 코드 적용 위해 재시작 필요"
+                        )
+                        return msg
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _calculate_momentum(df) -> dict:

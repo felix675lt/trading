@@ -170,6 +170,23 @@ class Storage:
             result[row[0] or "unknown"] = row[1]
         return result
 
+    def get_recent_trades(self, mode: str = "", limit: int = 10) -> list[dict]:
+        """최근 거래 목록 조회 (최신순)"""
+        if mode:
+            cursor = self.conn.execute(
+                "SELECT symbol, side, price, amount, pnl, fee, strategy, mode, timestamp "
+                "FROM trades WHERE mode=? ORDER BY id DESC LIMIT ?",
+                (mode, limit),
+            )
+        else:
+            cursor = self.conn.execute(
+                "SELECT symbol, side, price, amount, pnl, fee, strategy, mode, timestamp "
+                "FROM trades ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+        cols = ["symbol", "side", "price", "amount", "pnl", "fee", "strategy", "mode", "timestamp"]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
     def get_last_trade_time(self, mode: str = "") -> Optional[str]:
         """마지막 거래 시간 조회"""
         if mode:
