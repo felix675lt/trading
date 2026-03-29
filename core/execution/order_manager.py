@@ -345,6 +345,9 @@ class OrderManager:
         """모든 포지션의 미실현 PnL 업데이트 및 TP 확인
         + 거래소에서 이미 청산된 포지션(SL 체결 등) 감지 → 내부 정리 + 잔여 주문 취소
         """
+        if self.positions:
+            logger.info(f"[Trailing] update_positions 시작: {list(self.positions.keys())}")
+
         for symbol, pos in list(self.positions.items()):
             try:
                 # 1. 거래소 실제 포지션 확인
@@ -410,6 +413,12 @@ class OrderManager:
 
                 # 3. 현재가 조회 및 PnL 업데이트 + 트레일링 스탑
                 price = await self.exchange.get_ticker_price(symbol)
+                logger.info(
+                    f"[Trailing] {symbol} {pos.side} | 현재가: {price:.5f} | "
+                    f"진입가: {pos.entry_price:.5f} | SL: {pos.stop_loss:.5f} | "
+                    f"trailing: {pos.trailing_activated} | "
+                    f"highest: {pos.highest_price:.5f} | lowest: {pos.lowest_price:.5f}"
+                )
 
                 if pos.side == "long":
                     pos.unrealized_pnl = (price - pos.entry_price) / pos.entry_price
@@ -496,7 +505,8 @@ class OrderManager:
                         )
 
             except Exception as e:
-                logger.warning(f"포지션 업데이트 실패 ({symbol}): {e}")
+                import traceback
+                logger.error(f"포지션 업데이트 실패 ({symbol}): {e}\n{traceback.format_exc()}")
 
     async def _update_exchange_sl(self, symbol: str, pos: Position):
         """거래소 SL 주문을 취소 후 새 가격으로 재설정"""

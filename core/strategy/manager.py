@@ -349,7 +349,7 @@ class StrategyManager:
                 },
                 "regime_bias": {
                     "funding_rate": round(funding_rate, 3),
-                    "fear_greed": round(fear_greed, 1),
+                    "fear_greed": round(fear_greed_index, 1),
                 },
                 "adaptive": {
                     "min_confidence": round(self.min_confidence, 3),
