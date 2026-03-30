@@ -25,6 +25,7 @@ class TradeDecision:
     signals: dict = field(default_factory=dict)
     confirming_sources: list = field(default_factory=list)  # 합의한 시그널 소스 목록
     signal_strength: str = "weak"  # "strong" (3+), "moderate" (2), "weak" (1)
+    trade_type: str = "scalp"  # "scalp" or "swing"
 
     def __post_init__(self):
         if not self.timestamp:
@@ -34,8 +35,9 @@ class TradeDecision:
 class StrategyManager:
     """ML + RL + 외부 요인 + 모멘텀 통합 의사결정 (v4 - 다중확인 시스템)"""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, trade_profiles: dict | None = None):
         self.config = config
+        self.trade_profiles = trade_profiles or {}
         self.base_min_confidence = config.get("min_confidence", 0.40)
         self.min_confidence = self.base_min_confidence
         self.signal_threshold = config.get("signal_threshold", 0.10)
@@ -85,6 +87,29 @@ class StrategyManager:
             adjusted = max(base - decay, self._min_floor)
             return adjusted
         return base
+
+    def _classify_trade_type(self, confirming_sources: list[str]) -> str:
+        """투표 소스 기반으로 scalp/swing 분류"""
+        scalp_sources = set(
+            self.trade_profiles.get("scalp", {}).get(
+                "sources", ["ML", "ML_val", "MOM", "RSI_extreme"]
+            )
+        )
+        swing_sources = set(
+            self.trade_profiles.get("swing", {}).get(
+                "sources", ["EXT", "EXT_boost", "RL"]
+            )
+        )
+        confirming_set = set(confirming_sources)
+        scalp_count = len(confirming_set & scalp_sources)
+        swing_count = len(confirming_set & swing_sources)
+
+        trade_type = "swing" if swing_count > scalp_count else "scalp"
+        logger.info(
+            f"[TradeType] {trade_type} | 소스: {confirming_sources} | "
+            f"scalp={scalp_count} swing={swing_count}"
+        )
+        return trade_type
 
     def _count_signal_votes(
         self,
@@ -323,6 +348,11 @@ class StrategyManager:
         confidence = min(confidence, 1.0)
         size = confidence if final_action in ["long", "short"] else 0.0
 
+        # 5.5 트레이드 타입 분류 (scalp vs swing)
+        trade_type = "scalp"
+        if final_action in ("long", "short"):
+            trade_type = self._classify_trade_type(confirming)
+
         # 자기진단: hold 카운터
         if final_action == "hold":
             self._consecutive_holds += 1
@@ -338,6 +368,7 @@ class StrategyManager:
             reason=reason,
             confirming_sources=confirming,
             signal_strength=signal_str,
+            trade_type=trade_type,
             signals={
                 "ml": ml_signal,
                 "rl": {"action": rl_direction, "confidence": rl_confidence},

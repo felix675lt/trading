@@ -23,6 +23,7 @@ class Position:
     highest_price: float = 0.0   # 진입 후 최고가 (롱)
     lowest_price: float = 0.0    # 진입 후 최저가 (숏)
     trailing_activated: bool = False
+    trade_type: str = "scalp"    # "scalp" or "swing"
 
     def __post_init__(self):
         if not self.opened_at:
@@ -37,9 +38,11 @@ class OrderManager:
     """주문 실행 및 포지션 라이프사이클 관리"""
 
     def __init__(self, exchange: ExchangeClient, risk_config: dict,
-                 trailing_config: dict | None = None):
+                 trailing_config: dict | None = None,
+                 trade_profiles: dict | None = None):
         self.exchange = exchange
         self.risk_config = risk_config
+        self.trade_profiles = trade_profiles or {}
         self.positions: dict[str, Position] = {}
         self._failed_attempts: dict[str, int] = {}  # 연속 실패 횟수
         self._on_sl_callback = None  # SL 소멸 감지 콜백
@@ -49,11 +52,25 @@ class OrderManager:
         self._consecutive_sl: dict[str, int] = {}  # 심볼별 연속 SL 횟수
         self._min_reentry_minutes = 5  # SL 후 최소 재진입 대기 시간
 
-        # 트레일링 스탑 설정 (PaperTrader와 동일)
+        # 트레일링 스탑 기본값 (fallback)
         tc = trailing_config or {}
         self.trailing_activate_pct = tc.get("activate_pct", 0.015)
         self.trailing_distance_pct = tc.get("distance_pct", 0.008)
         self.trailing_step_pct = tc.get("step_pct", 0.004)
+
+    def _get_profile(self, trade_type: str) -> dict:
+        """trade_type에 맞는 프로파일 반환 (fallback: risk_config)"""
+        return self.trade_profiles.get(trade_type, {})
+
+    def _get_trailing_params(self, trade_type: str) -> tuple[float, float, float]:
+        """trade_type별 트레일링 파라미터 (activate, distance, step)"""
+        profile = self._get_profile(trade_type)
+        tc = profile.get("trailing", {})
+        return (
+            tc.get("activate_pct", self.trailing_activate_pct),
+            tc.get("distance_pct", self.trailing_distance_pct),
+            tc.get("step_pct", self.trailing_step_pct),
+        )
 
     def set_sl_callback(self, callback):
         """SL/자동청산 감지 시 호출할 콜백 등록 (피드백 학습용)"""
@@ -190,8 +207,9 @@ class OrderManager:
         sl_pct: float | None = None,
         tp_pct: float | None = None,
         atr_pct: float | None = None,
+        trade_type: str = "scalp",
     ) -> Position | None:
-        """포지션 개시 — ATR 기반 동적 SL/TP 지원"""
+        """포지션 개시 — ATR 기반 동적 SL/TP + trade_type별 프로파일"""
         if symbol in self.positions:
             logger.warning(f"{symbol} 이미 포지션 보유 중")
             return None
@@ -231,14 +249,15 @@ class OrderManager:
             order = await self.exchange.create_market_order(symbol, "buy" if side == "long" else "sell", amount)
             fill_price = float(order.get("average", price))
 
-            # === ATR 기반 동적 SL/TP 계산 ===
-            sl_floor = self.risk_config.get("sl_floor_pct", 0.005)
-            sl_cap = self.risk_config.get("sl_cap_pct", 0.030)
+            # === ATR 기반 동적 SL/TP 계산 (trade_type 프로파일 적용) ===
+            profile = self._get_profile(trade_type)
+            sl_floor = profile.get("sl_floor_pct", self.risk_config.get("sl_floor_pct", 0.005))
+            sl_cap = profile.get("sl_cap_pct", self.risk_config.get("sl_cap_pct", 0.030))
 
             if atr_pct and atr_pct > 0 and not (atr_pct != atr_pct):  # NaN 체크
                 # ATR 기반: 실제 시장 변동성에 맞춤
-                atr_sl_mult = self.risk_config.get("atr_sl_multiplier", 2.0)
-                atr_tp_mult = self.risk_config.get("atr_tp_multiplier", 3.5)
+                atr_sl_mult = profile.get("atr_sl_multiplier", self.risk_config.get("atr_sl_multiplier", 2.0))
+                atr_tp_mult = profile.get("atr_tp_multiplier", self.risk_config.get("atr_tp_multiplier", 3.5))
                 final_sl_pct = max(sl_floor, min(sl_cap, atr_pct * atr_sl_mult))
                 final_tp_pct = max(final_sl_pct * 1.5, atr_pct * atr_tp_mult)  # 최소 RR 1.5:1
                 logger.info(
@@ -247,9 +266,9 @@ class OrderManager:
                     f"(RR {final_tp_pct/final_sl_pct:.1f}:1)"
                 )
             else:
-                # fallback: 전달된 값 또는 config 기본값
-                final_sl_pct = sl_pct or self.risk_config.get("stop_loss_pct", 0.015)
-                final_tp_pct = tp_pct or self.risk_config.get("take_profit_pct", 0.025)
+                # fallback: 전달된 값 → 프로파일 값 → config 기본값
+                final_sl_pct = sl_pct or profile.get("sl_pct", self.risk_config.get("stop_loss_pct", 0.015))
+                final_tp_pct = tp_pct or profile.get("tp_pct", self.risk_config.get("take_profit_pct", 0.025))
                 final_sl_pct = max(sl_floor, min(sl_cap, final_sl_pct))
 
             if side == "long":
@@ -271,10 +290,14 @@ class OrderManager:
                 entry_price=fill_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                trade_type=trade_type,
             )
             self.positions[symbol] = position
             self._failed_attempts.pop(symbol, None)
-            logger.info(f"포지션 개시: {side} {amount:.6f} {symbol} @ {fill_price:.2f} | SL: {stop_loss:.2f} TP: {take_profit:.2f}")
+            logger.info(
+                f"포지션 개시: {side} {amount:.6f} {symbol} @ {fill_price:.2f} | "
+                f"SL: {stop_loss:.2f} TP: {take_profit:.2f} | 타입: {trade_type}"
+            )
             return position
 
         except Exception as e:
@@ -413,11 +436,15 @@ class OrderManager:
 
                 # 3. 현재가 조회 및 PnL 업데이트 + 트레일링 스탑
                 price = await self.exchange.get_ticker_price(symbol)
+
+                # trade_type별 트레일링 파라미터
+                t_activate, t_distance, t_step = self._get_trailing_params(pos.trade_type)
+
                 logger.info(
-                    f"[Trailing] {symbol} {pos.side} | 현재가: {price:.5f} | "
-                    f"진입가: {pos.entry_price:.5f} | SL: {pos.stop_loss:.5f} | "
-                    f"trailing: {pos.trailing_activated} | "
-                    f"highest: {pos.highest_price:.5f} | lowest: {pos.lowest_price:.5f}"
+                    f"[Trailing] {symbol} {pos.side}({pos.trade_type}) | "
+                    f"현재가: {price:.5f} | 진입가: {pos.entry_price:.5f} | "
+                    f"SL: {pos.stop_loss:.5f} | trailing: {pos.trailing_activated} | "
+                    f"act={t_activate:.1%} dist={t_distance:.1%}"
                 )
 
                 if pos.side == "long":
@@ -426,27 +453,27 @@ class OrderManager:
                     profit_pct = (price - pos.entry_price) / pos.entry_price
 
                     # 트레일링 활성화 체크
-                    if profit_pct >= self.trailing_activate_pct and not pos.trailing_activated:
+                    if profit_pct >= t_activate and not pos.trailing_activated:
                         pos.trailing_activated = True
-                        new_sl = pos.highest_price * (1 - self.trailing_distance_pct)
+                        new_sl = pos.highest_price * (1 - t_distance)
                         if new_sl > pos.stop_loss:
                             old_sl = pos.stop_loss
                             pos.stop_loss = new_sl
                             await self._update_exchange_sl(symbol, pos)
                             logger.info(
-                                f"[Trailing-LIVE] {symbol} 롱 트레일링 활성화 | "
+                                f"[Trailing-LIVE] {symbol} 롱({pos.trade_type}) 트레일링 활성화 | "
                                 f"수익 {profit_pct:.2%} | SL {old_sl:.4f} → {pos.stop_loss:.4f}"
                             )
 
                     # 트레일링 활성 중: 최고가 갱신 시 SL 끌어올림
                     if pos.trailing_activated:
-                        new_sl = pos.highest_price * (1 - self.trailing_distance_pct)
-                        if new_sl > pos.stop_loss + (pos.entry_price * self.trailing_step_pct):
+                        new_sl = pos.highest_price * (1 - t_distance)
+                        if new_sl > pos.stop_loss + (pos.entry_price * t_step):
                             old_sl = pos.stop_loss
                             pos.stop_loss = new_sl
                             await self._update_exchange_sl(symbol, pos)
                             logger.info(
-                                f"[Trailing-LIVE] {symbol} 롱 SL 상향 | "
+                                f"[Trailing-LIVE] {symbol} 롱({pos.trade_type}) SL 상향 | "
                                 f"{old_sl:.4f} → {pos.stop_loss:.4f} | 최고가: {pos.highest_price:.4f}"
                             )
 
@@ -454,11 +481,11 @@ class OrderManager:
                     if price >= pos.take_profit and not pos.trailing_activated:
                         pos.trailing_activated = True
                         old_sl = pos.stop_loss
-                        pos.stop_loss = pos.entry_price * (1 + self.trailing_activate_pct)
-                        pos.take_profit = pos.entry_price * (1 + 0.20)  # TP를 아주 높게 → 실질 무한
+                        pos.stop_loss = pos.entry_price * (1 + t_activate)
+                        pos.take_profit = pos.entry_price * (1 + 0.20)
                         await self._update_exchange_sl_tp(symbol, pos)
                         logger.info(
-                            f"[Trailing-LIVE] {symbol} 롱 TP 도달 → 트레일링 전환 | "
+                            f"[Trailing-LIVE] {symbol} 롱({pos.trade_type}) TP 도달 → 트레일링 전환 | "
                             f"수익확보선: {pos.stop_loss:.4f} (이전SL: {old_sl:.4f})"
                         )
 
@@ -468,27 +495,27 @@ class OrderManager:
                     profit_pct = (pos.entry_price - price) / pos.entry_price
 
                     # 트레일링 활성화 체크
-                    if profit_pct >= self.trailing_activate_pct and not pos.trailing_activated:
+                    if profit_pct >= t_activate and not pos.trailing_activated:
                         pos.trailing_activated = True
-                        new_sl = pos.lowest_price * (1 + self.trailing_distance_pct)
+                        new_sl = pos.lowest_price * (1 + t_distance)
                         if new_sl < pos.stop_loss:
                             old_sl = pos.stop_loss
                             pos.stop_loss = new_sl
                             await self._update_exchange_sl(symbol, pos)
                             logger.info(
-                                f"[Trailing-LIVE] {symbol} 숏 트레일링 활성화 | "
+                                f"[Trailing-LIVE] {symbol} 숏({pos.trade_type}) 트레일링 활성화 | "
                                 f"수익 {profit_pct:.2%} | SL {old_sl:.4f} → {pos.stop_loss:.4f}"
                             )
 
                     # 트레일링 활성 중: 최저가 갱신 시 SL 끌어내림
                     if pos.trailing_activated:
-                        new_sl = pos.lowest_price * (1 + self.trailing_distance_pct)
-                        if new_sl < pos.stop_loss - (pos.entry_price * self.trailing_step_pct):
+                        new_sl = pos.lowest_price * (1 + t_distance)
+                        if new_sl < pos.stop_loss - (pos.entry_price * t_step):
                             old_sl = pos.stop_loss
                             pos.stop_loss = new_sl
                             await self._update_exchange_sl(symbol, pos)
                             logger.info(
-                                f"[Trailing-LIVE] {symbol} 숏 SL 하향 | "
+                                f"[Trailing-LIVE] {symbol} 숏({pos.trade_type}) SL 하향 | "
                                 f"{old_sl:.4f} → {pos.stop_loss:.4f} | 최저가: {pos.lowest_price:.4f}"
                             )
 
@@ -496,11 +523,11 @@ class OrderManager:
                     if price <= pos.take_profit and not pos.trailing_activated:
                         pos.trailing_activated = True
                         old_sl = pos.stop_loss
-                        pos.stop_loss = pos.entry_price * (1 - self.trailing_activate_pct)
-                        pos.take_profit = pos.entry_price * (1 - 0.20)  # TP를 아주 낮게 → 실질 무한
+                        pos.stop_loss = pos.entry_price * (1 - t_activate)
+                        pos.take_profit = pos.entry_price * (1 - 0.20)
                         await self._update_exchange_sl_tp(symbol, pos)
                         logger.info(
-                            f"[Trailing-LIVE] {symbol} 숏 TP 도달 → 트레일링 전환 | "
+                            f"[Trailing-LIVE] {symbol} 숏({pos.trade_type}) TP 도달 → 트레일링 전환 | "
                             f"수익확보선: {pos.stop_loss:.4f} (이전SL: {old_sl:.4f})"
                         )
 

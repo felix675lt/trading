@@ -78,7 +78,10 @@ class AutoTrader:
         self.ensemble = EnsembleSignalGenerator()
         self.rl_agent = RLAgent(self.config.get("rl", {}))
         self.risk_manager = RiskManager(self.config["risk"])
-        self.strategy_manager = StrategyManager(self.config.get("trading", {}))
+        self.strategy_manager = StrategyManager(
+            self.config.get("trading", {}),
+            trade_profiles=self.config.get("trade_profiles", {}),
+        )
         self.adaptive = AdaptiveOptimizer()
         self.feedback = TradeFeedbackAnalyzer()
         self.anomaly_detector = AnomalyDetector()
@@ -91,6 +94,7 @@ class AutoTrader:
             initial_capital=self.config.get("backtest", {}).get("initial_capital", 10000),
             commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
             trailing_config=self.config.get("trailing_stop", {}),
+            trade_profiles=self.config.get("trade_profiles", {}),
         )
         # PAPER 자동청산 콜백 (SL/TP/트레일링 → DB 저장 + 학습)
         self.paper_trader.set_auto_close_callback(self._on_paper_auto_close)
@@ -149,6 +153,7 @@ class AutoTrader:
                 self.order_managers[name] = OrderManager(
                     client, self.config["risk"],
                     trailing_config=self.config.get("trailing_stop", {}),
+                    trade_profiles=self.config.get("trade_profiles", {}),
                 )
 
         # 기존 모델 로드 시도
@@ -391,12 +396,18 @@ class AutoTrader:
                     for symbol in symbols:
                         result = await self._analyze_symbol(exchange_name, symbol, primary_tf)
                         if result and result.get("action") in ("long", "short"):
-                            # 종목별 프로파일로 TP/SL 동적 설정
-                            coin = symbol.split("/")[0]
-                            profile = scalp_profiles.get(coin, {})
-                            result["tp_pct"] = profile.get("tp_pct", self.config["risk"]["take_profit_pct"])
-                            result["sl_pct"] = profile.get("sl_pct", self.config["risk"]["stop_loss_pct"])
-                            result["priority"] = profile.get("priority", 5)
+                            # trade_type이 scalp인 경우만 종목별 스캘핑 프로파일 오버라이드
+                            trade_type = result.get("trade_type", "scalp")
+                            if trade_type == "scalp":
+                                coin = symbol.split("/")[0]
+                                coin_profile = scalp_profiles.get(coin, {})
+                                if coin_profile:
+                                    result["tp_pct"] = coin_profile.get("tp_pct", result["tp_pct"])
+                                    result["sl_pct"] = coin_profile.get("sl_pct", result["sl_pct"])
+                                result["priority"] = coin_profile.get("priority", 5) if coin_profile else 5
+                            else:
+                                # swing은 trade_profiles에서 이미 설정됨
+                                result["priority"] = 3  # swing은 중간 우선순위
                             candidates.append(result)
 
                     # PAPER: 모든 시그널 실행 (학습용)
@@ -747,6 +758,7 @@ class AutoTrader:
                         sl_pct=self.config["risk"]["stop_loss_pct"] * adaptive_params["stop_loss_mult"],
                         tp_pct=self.config["risk"]["take_profit_pct"],
                         atr_pct=atr_pct,
+                        trade_type=decision.trade_type,
                     )
                     logger.info(
                         f"[PAPER] {decision.action.upper()} {symbol} | "
@@ -772,7 +784,8 @@ class AutoTrader:
                 om = self.order_managers.get(exchange_name)
                 if om and symbol not in getattr(om, "positions", {}):
                     result = await om.open_position(
-                        symbol, decision.action, size, dynamic_lev, atr_pct=atr_pct,
+                        symbol, decision.action, size, dynamic_lev,
+                        atr_pct=atr_pct, trade_type=decision.trade_type,
                     )
                     if result:
                         logger.info(
@@ -1083,6 +1096,10 @@ class AutoTrader:
             if decision.action not in ("long", "short", "close"):
                 return None
 
+            # trade_type별 SL/TP 프로파일 적용
+            trade_type = decision.trade_type
+            tp_profile = self.config.get("trade_profiles", {}).get(trade_type, {})
+
             return {
                 "symbol": symbol,
                 "exchange_name": exchange_name,
@@ -1099,9 +1116,12 @@ class AutoTrader:
                 "ml_signal": ml_signal,
                 "ext_signal": ext_signal,
                 "df": df,
-                "atr_pct": atr_pct,  # ATR 기반 동적 SL/TP
-                "confirming_sources": decision.confirming_sources,  # 다중확인 소스
-                "signal_strength": decision.signal_strength,  # 시그널 강도
+                "atr_pct": atr_pct,
+                "confirming_sources": decision.confirming_sources,
+                "signal_strength": decision.signal_strength,
+                "trade_type": trade_type,
+                "tp_pct": tp_profile.get("tp_pct", self.config["risk"]["take_profit_pct"]),
+                "sl_pct": tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"]),
             }
 
         except Exception as e:
@@ -1123,9 +1143,10 @@ class AutoTrader:
                     sl_pct=sl_pct * c["adaptive_params"]["stop_loss_mult"],
                     tp_pct=tp_pct,
                     atr_pct=c.get("atr_pct", 0),
+                    trade_type=c.get("trade_type", "scalp"),
                 )
                 logger.info(
-                    f"[PAPER] {c['action'].upper()} {symbol} | "
+                    f"[PAPER] {c['action'].upper()} {symbol} [{c.get('trade_type','scalp').upper()}] | "
                     f"${c['size']:.2f} × {c['dynamic_lev']}x = ${c['notional']:.2f} | "
                     f"{c['reason']}"
                 )
@@ -1212,11 +1233,13 @@ class AutoTrader:
                 symbol, c["action"], c["size"], c["dynamic_lev"],
                 sl_pct=c.get("sl_pct"), tp_pct=c.get("tp_pct"),
                 atr_pct=c.get("atr_pct", 0),
+                trade_type=c.get("trade_type", "scalp"),
             )
             if result:
                 coin = symbol.split("/")[0]
+                trade_type = c.get("trade_type", "scalp")
                 logger.info(
-                    f"[LIVE🔥] {c['action'].upper()} {symbol} | "
+                    f"[LIVE🔥] {c['action'].upper()} {symbol} [{trade_type.upper()}] | "
                     f"${c['size']:.2f} × {c['dynamic_lev']}x = ${c['notional']:.2f} | "
                     f"TP: {c.get('tp_pct', 0.012)*100:.1f}% SL: {c.get('sl_pct', 0.008)*100:.1f}% | "
                     f"{c['reason']}"
