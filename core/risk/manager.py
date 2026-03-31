@@ -140,6 +140,29 @@ class RiskManager:
         self._last_leverage = leverage
         return leverage
 
+    def cap_leverage_by_risk(
+        self,
+        leverage: int,
+        sl_pct: float,
+        max_risk_pct: float = 0.05,
+    ) -> int:
+        """SL% × leverage ≤ max_risk_pct 되도록 레버리지 캡핑
+
+        예) SL 4%, max_risk 5% → max_leverage = 1x
+            SL 1.2%, max_risk 3% → max_leverage = 2x
+        """
+        if sl_pct <= 0:
+            return leverage
+        max_lev = max_risk_pct / sl_pct
+        capped = max(1, int(max_lev))  # 최소 1x
+        if capped < leverage:
+            logger.info(
+                f"[리스크] 레버리지 캡핑: {leverage}x → {capped}x "
+                f"(SL {sl_pct*100:.1f}% × {leverage}x = {sl_pct*leverage*100:.1f}% 손실 > "
+                f"허용 {max_risk_pct*100:.1f}%)"
+            )
+        return min(leverage, capped)
+
     def check_correlation(
         self,
         symbol: str,

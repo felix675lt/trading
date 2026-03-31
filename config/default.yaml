@@ -100,12 +100,13 @@ trade_profiles:
   scalp:
     # 진입 근거: 5분봉 기술지표 (ML on 5m, 모멘텀, RSI)
     sources: ["ML", "ML_val", "MOM", "RSI_extreme"]
-    sl_pct: 0.012          # 1.2% SL
-    tp_pct: 0.020          # 2.0% TP
+    max_risk_pct: 0.04     # 1거래 최대 손실 = 자본의 4%
+    sl_pct: 0.010          # 1.0% SL (→ 4%/1% = 최대 4x → 실질 3x 사용)
+    tp_pct: 0.020          # 2.0% TP (RR 2:1)
     sl_floor_pct: 0.005
-    sl_cap_pct: 0.020
+    sl_cap_pct: 0.015
     atr_sl_multiplier: 1.5
-    atr_tp_multiplier: 2.5
+    atr_tp_multiplier: 3.0
     trailing:
       activate_pct: 0.010  # 1% 수익 시 트레일링 활성화
       distance_pct: 0.005  # 최고점에서 0.5% 하락 시 청산
@@ -115,16 +116,17 @@ trade_profiles:
   swing:
     # 진입 근거: 외부지표 (공포탐욕, 센티먼트, 펀딩비) + 추세
     sources: ["EXT", "EXT_boost", "RL"]
-    sl_pct: 0.040          # 4% SL
-    tp_pct: 0.080          # 8% TP
-    sl_floor_pct: 0.020
-    sl_cap_pct: 0.060
-    atr_sl_multiplier: 3.0
-    atr_tp_multiplier: 5.0
+    max_risk_pct: 0.05     # 1거래 최대 손실 = 자본의 5%
+    sl_pct: 0.020          # 2% SL (→ 5%/2% = 최대 2x 레버리지)
+    tp_pct: 0.040          # 4% TP (RR 2:1 유지)
+    sl_floor_pct: 0.010
+    sl_cap_pct: 0.030
+    atr_sl_multiplier: 2.0
+    atr_tp_multiplier: 4.0
     trailing:
-      activate_pct: 0.030  # 3% 수익 시 트레일링 활성화
-      distance_pct: 0.015  # 최고점에서 1.5% 하락 시 청산
-      step_pct: 0.008
+      activate_pct: 0.020  # 2% 수익 시 트레일링 활성화
+      distance_pct: 0.010  # 최고점에서 1% 하락 시 청산
+      step_pct: 0.005
     max_hold_minutes: 2880  # 최대 48시간 보유
 
 ml:

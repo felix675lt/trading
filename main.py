@@ -237,6 +237,10 @@ class AutoTrader:
                     f"레짐: {regime}\n"
                     f"📝 피드백 학습에 기록됨"
                 )
+
+                # 손실 시 즉시 원인분석 리포트
+                if pnl < 0:
+                    self._generate_loss_report(result, mode="LIVE")
             return on_triggered
 
         for om in self.order_managers.values():
@@ -731,6 +735,14 @@ class AutoTrader:
                 external_agreement=ext_agrees,
             )
 
+            # === SL×레버리지 리스크 캡핑 ===
+            tp_profile = self.config.get("trade_profiles", {}).get(decision.trade_type, {})
+            sl_pct_for_cap = tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"])
+            max_risk_pct = tp_profile.get("max_risk_pct", 0.05)
+            dynamic_lev = self.risk_manager.cap_leverage_by_risk(
+                dynamic_lev, sl_pct_for_cap, max_risk_pct
+            )
+
             # 7.3. 피드백 기반 포지션 크기 조정
             fb_scale = self.feedback.get_position_scale(adaptive_params["regime"], decision.action)
             size = self.risk_manager.calculate_position_size(
@@ -755,8 +767,8 @@ class AutoTrader:
                     self.paper_trader.open_position(
                         symbol, decision.action, size, price,
                         leverage=dynamic_lev,
-                        sl_pct=self.config["risk"]["stop_loss_pct"] * adaptive_params["stop_loss_mult"],
-                        tp_pct=self.config["risk"]["take_profit_pct"],
+                        sl_pct=tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"]) * adaptive_params["stop_loss_mult"],
+                        tp_pct=tp_profile.get("tp_pct", self.config["risk"]["take_profit_pct"]),
                         atr_pct=atr_pct,
                         trade_type=decision.trade_type,
                     )
@@ -861,6 +873,8 @@ class AutoTrader:
                     })
                     logger.info(f"[PAPER] 청산 {symbol} | PnL: ${result['pnl']:.2f}")
                     tg_notify(format_trade_close("PAPER", symbol, result["pnl"], decision.reason, result.get("duration_minutes", 0)), silent=True)
+                    if result["pnl"] < 0:
+                        self._generate_loss_report(result, mode="PAPER")
 
             # === LIVE 청산 ===
             if self.mode in ("live", "dual"):
@@ -916,6 +930,8 @@ class AutoTrader:
                         })
                         logger.info(f"[LIVE] 청산 {symbol} | PnL: ${live_pnl:.2f} → 학습기록 완료")
                         tg_notify(format_trade_close("🔥LIVE", symbol, live_pnl, decision.reason))
+                        if live_pnl < 0 and isinstance(live_result, dict):
+                            self._generate_loss_report(live_result, mode="LIVE")
 
         # 페이퍼 트레이더 가격 업데이트 (paper / dual)
         if self.mode in ("paper", "dual"):
@@ -1043,6 +1059,17 @@ class AutoTrader:
                 volatility=volatility,
                 regime=adaptive_params["regime"],
                 external_agreement=ext_agrees,
+            )
+
+            # === SL×레버리지 리스크 캡핑 (핵심) ===
+            # trade_type별 max_risk_pct 기준으로 leverage 제한
+            # 예: swing SL 4% × 5x = 20% 손실 → max_risk 5%이면 1x로 캡핑
+            trade_type = decision.trade_type
+            tp_profile = self.config.get("trade_profiles", {}).get(trade_type, {})
+            sl_pct_for_cap = tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"])
+            max_risk_pct = tp_profile.get("max_risk_pct", 0.05)
+            dynamic_lev = self.risk_manager.cap_leverage_by_risk(
+                dynamic_lev, sl_pct_for_cap, max_risk_pct
             )
 
             # 포지션 크기 (풀시드)
@@ -1315,6 +1342,10 @@ class AutoTrader:
                 })
                 tg_notify(format_trade_close("🔥LIVE", symbol, live_pnl, c["reason"]))
 
+                # 손실 시 즉시 원인분석 리포트
+                if live_pnl < 0 and isinstance(live_result, dict):
+                    self._generate_loss_report(live_result, mode="LIVE")
+
     # ========== PAPER 자동청산 콜백 ==========
 
     def _on_paper_auto_close(self, trade: dict):
@@ -1367,8 +1398,140 @@ class AutoTrader:
             logger.info(f"[PAPER-Auto] {reason} {symbol} {side} | PnL: ${pnl:+.2f} → DB+학습 저장")
             tg_notify(format_trade_close("PAPER", symbol, pnl, reason), silent=True)
 
+            # 손실 시 즉시 원인분석 리포트
+            if pnl < 0:
+                self._generate_loss_report(trade, mode="PAPER")
+
         except Exception as e:
             logger.error(f"[PAPER-Auto] 콜백 실패: {e}")
+
+    # ========== 손실 자동 피드백 리포트 ==========
+
+    def _generate_loss_report(self, trade: dict, mode: str = "LIVE"):
+        """큰 손실 발생 시 즉시 원인 분석 리포트 → 텔레그램 전송
+
+        trade: close_position 반환값 (symbol, side, entry_price, exit_price, pnl, reason, ...)
+        equity 대비 2% 이상 손실 시 자동 발동
+        """
+        try:
+            pnl = trade.get("pnl", 0)
+            if pnl >= 0:
+                return  # 수익이면 스킵
+
+            # 손실 비율 계산
+            equity = self.equity if self.equity > 0 else self.initial_capital
+            loss_pct = abs(pnl) / equity * 100
+
+            # 2% 미만 소액 손실은 간략 로그만
+            if loss_pct < 2.0:
+                return
+
+            symbol = trade.get("symbol", "?")
+            side = trade.get("side", "?")
+            entry_price = trade.get("entry_price", 0)
+            exit_price = trade.get("exit_price", 0)
+            reason = trade.get("reason", "?")
+            size = trade.get("size", 0)
+
+            # === 1. 가격 변동 분석 ===
+            if entry_price > 0 and exit_price > 0:
+                price_move_pct = abs(exit_price - entry_price) / entry_price * 100
+            else:
+                price_move_pct = 0
+
+            # === 2. 레버리지 역산 (pnl / price_move로 추정) ===
+            if price_move_pct > 0 and size > 0:
+                notional = size * entry_price
+                expected_pnl_1x = notional * (price_move_pct / 100)
+                est_leverage = abs(pnl) / expected_pnl_1x if expected_pnl_1x > 0 else 0
+            else:
+                est_leverage = 0
+
+            # === 3. 최근 거래 패턴 (연패 확인) ===
+            recent = self.storage.get_recent_trades(mode=mode, limit=10)
+            recent_pnls = [t.get("pnl", 0) for t in recent if t.get("pnl") is not None]
+            consecutive_losses = 0
+            for p in recent_pnls:
+                if p < 0:
+                    consecutive_losses += 1
+                else:
+                    break
+
+            total_recent_pnl = sum(recent_pnls)
+            recent_wins = sum(1 for p in recent_pnls if p > 0)
+            recent_wr = recent_wins / len(recent_pnls) * 100 if recent_pnls else 0
+
+            # === 4. 현재 시장 상태 ===
+            regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "?"
+            risk_status = self.risk_manager.get_status()
+            drawdown = risk_status.get("current_drawdown", 0) * 100
+
+            # === 5. 원인 진단 ===
+            diagnosis = []
+            recommendations = []
+
+            if price_move_pct < 2.0 and loss_pct > 5.0:
+                diagnosis.append(f"가격 {price_move_pct:.1f}% 변동에 손실 {loss_pct:.1f}% → 과다 레버리지")
+                recommendations.append("레버리지 축소 필요")
+
+            if "SL" in reason:
+                diagnosis.append("SL 도달로 청산")
+                if price_move_pct < 1.5:
+                    diagnosis.append("SL이 너무 타이트했을 가능성")
+                    recommendations.append("ATR 기반 SL 확인 필요")
+
+            if consecutive_losses >= 3:
+                diagnosis.append(f"{consecutive_losses}연패 진행 중")
+                recommendations.append("쿨다운 또는 포지션 축소 권장")
+
+            if regime in ("extreme_volatility", "high_volume_breakout"):
+                diagnosis.append(f"고변동 장세({regime})에서 손실")
+                recommendations.append("변동성 장세에서 진입 자제")
+
+            if side == "short" and "bullish" in str(self.last_signals.get("momentum", {})):
+                diagnosis.append("숏 포지션 vs 상승 모멘텀 불일치")
+                recommendations.append("모멘텀 방향 확인 후 진입")
+
+            if not diagnosis:
+                diagnosis.append("구체적 원인 추가 분석 필요")
+
+            if not recommendations:
+                recommendations.append("다음 진입 시 확신도 기준 상향")
+
+            # === 리포트 생성 ===
+            report = (
+                f"🚨 <b>손실 분석 리포트</b> [{mode}]\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"종목: {symbol} ({side})\n"
+                f"진입: ${entry_price:,.2f} → 청산: ${exit_price:,.2f}\n"
+                f"가격변동: {price_move_pct:.2f}%\n"
+                f"손실: <b>${pnl:+.2f}</b> (자본의 {loss_pct:.1f}%)\n"
+                f"추정 레버리지: {est_leverage:.1f}x\n"
+                f"청산 사유: {reason}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📊 <b>원인 진단</b>\n"
+            )
+            for d in diagnosis:
+                report += f"  • {d}\n"
+
+            report += f"━━━━━━━━━━━━━━━━━━\n"
+            report += f"🔧 <b>개선 조치</b>\n"
+            for r in recommendations:
+                report += f"  • {r}\n"
+
+            report += (
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📈 최근 {len(recent_pnls)}건: 승률 {recent_wr:.0f}% | "
+                f"누적 ${total_recent_pnl:+.2f}\n"
+                f"연패: {consecutive_losses}회 | 레짐: {regime}\n"
+                f"DD: {drawdown:.1f}% | 잔고: ${equity:.2f}"
+            )
+
+            logger.warning(f"[손실리포트] {symbol} ${pnl:+.2f} ({loss_pct:.1f}%) | 진단: {'; '.join(diagnosis)}")
+            tg_notify(report)
+
+        except Exception as e:
+            logger.error(f"[손실리포트] 생성 실패: {e}")
 
     # ========== 자가진단 시스템 v2 ==========
 
