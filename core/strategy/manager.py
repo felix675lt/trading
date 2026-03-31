@@ -89,27 +89,8 @@ class StrategyManager:
         return base
 
     def _classify_trade_type(self, confirming_sources: list[str]) -> str:
-        """투표 소스 기반으로 scalp/swing 분류"""
-        scalp_sources = set(
-            self.trade_profiles.get("scalp", {}).get(
-                "sources", ["ML", "ML_val", "MOM", "RSI_extreme"]
-            )
-        )
-        swing_sources = set(
-            self.trade_profiles.get("swing", {}).get(
-                "sources", ["EXT", "EXT_boost", "RL"]
-            )
-        )
-        confirming_set = set(confirming_sources)
-        scalp_count = len(confirming_set & scalp_sources)
-        swing_count = len(confirming_set & swing_sources)
-
-        trade_type = "swing" if swing_count > scalp_count else "scalp"
-        logger.info(
-            f"[TradeType] {trade_type} | 소스: {confirming_sources} | "
-            f"scalp={scalp_count} swing={swing_count}"
-        )
-        return trade_type
+        """순수 스캘핑 모드 — 항상 scalp 반환"""
+        return "scalp"
 
     def _count_signal_votes(
         self,

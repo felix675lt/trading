@@ -1061,9 +1061,8 @@ class AutoTrader:
                 external_agreement=ext_agrees,
             )
 
-            # === SL×레버리지 리스크 캡핑 (핵심) ===
-            # trade_type별 max_risk_pct 기준으로 leverage 제한
-            # 예: swing SL 4% × 5x = 20% 손실 → max_risk 5%이면 1x로 캡핑
+            # === SL×레버리지 리스크 캡핑 ===
+            # SL% × leverage ≤ max_risk_pct 보장
             trade_type = decision.trade_type
             tp_profile = self.config.get("trade_profiles", {}).get(trade_type, {})
             sl_pct_for_cap = tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"])

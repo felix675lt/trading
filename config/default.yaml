@@ -94,14 +94,14 @@ trailing_stop:
   distance_pct: 0.008
   step_pct: 0.004
 
-# === 듀얼 전략: 스캘핑 + 스윙 ===
-# 진입 시 투표 소스 기반으로 자동 분류
+# === 순수 스캘핑 전략 ===
+# 모든 시그널(ML, RL, 모멘텀, 외부)이 방향 투표 → 합의 시 진입
+# 외부 시그널 = 방향 필터 역할 (진입 근거 X, 방향 확인용)
 trade_profiles:
   scalp:
-    # 진입 근거: 5분봉 기술지표 (ML on 5m, 모멘텀, RSI)
-    sources: ["ML", "ML_val", "MOM", "RSI_extreme"]
+    sources: ["ML", "ML_val", "MOM", "RSI_extreme", "RL", "EXT", "EXT_boost"]
     max_risk_pct: 0.04     # 1거래 최대 손실 = 자본의 4%
-    sl_pct: 0.010          # 1.0% SL (→ 4%/1% = 최대 4x → 실질 3x 사용)
+    sl_pct: 0.010          # 1.0% SL (→ 4%/1% = 최대 4x)
     tp_pct: 0.020          # 2.0% TP (RR 2:1)
     sl_floor_pct: 0.005
     sl_cap_pct: 0.015
@@ -112,22 +112,6 @@ trade_profiles:
       distance_pct: 0.005  # 최고점에서 0.5% 하락 시 청산
       step_pct: 0.003
     max_hold_minutes: 60   # 최대 1시간 보유
-
-  swing:
-    # 진입 근거: 외부지표 (공포탐욕, 센티먼트, 펀딩비) + 추세
-    sources: ["EXT", "EXT_boost", "RL"]
-    max_risk_pct: 0.05     # 1거래 최대 손실 = 자본의 5%
-    sl_pct: 0.020          # 2% SL (→ 5%/2% = 최대 2x 레버리지)
-    tp_pct: 0.040          # 4% TP (RR 2:1 유지)
-    sl_floor_pct: 0.010
-    sl_cap_pct: 0.030
-    atr_sl_multiplier: 2.0
-    atr_tp_multiplier: 4.0
-    trailing:
-      activate_pct: 0.020  # 2% 수익 시 트레일링 활성화
-      distance_pct: 0.010  # 최고점에서 1% 하락 시 청산
-      step_pct: 0.005
-    max_hold_minutes: 2880  # 최대 48시간 보유
 
 ml:
   retrain_interval_hours: 24
