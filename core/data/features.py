@@ -139,9 +139,14 @@ class FeatureEngineer:
 
     def _add_external_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """외부 요인 피처를 DataFrame에 추가 (모든 행에 동일한 값 적용)"""
+        ext_cols = {}
         for key, value in self.external_features.items():
             if isinstance(value, (int, float)):
-                df[f"ext_{key}"] = float(value)
+                ext_cols[f"ext_{key}"] = float(value)
+        if ext_cols:
+            import pandas as pd
+            ext_df = pd.DataFrame(ext_cols, index=df.index)
+            df = pd.concat([df, ext_df], axis=1)
         return df
 
     def get_feature_columns(self, df: pd.DataFrame) -> list[str]:

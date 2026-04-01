@@ -378,6 +378,54 @@ class AutoTrader:
 
                         # 외부 피처를 FeatureEngineer에 주입
                         ext_features = self.external_manager.get_all_features()
+
+                        # 퀀트 시그널을 ML 피처로 사전 주입 (예측 전에 계산)
+                        try:
+                            ob_data = await self.collector.fetch_orderbook(exchange_name, symbol, limit=20)
+                            ticker = await self.collector.fetch_ticker(exchange_name, symbol)
+                            _spot = ticker.get("last", 0)
+                            _futures = _spot  # 루프단에서는 근사치
+                            _taker_vol = ticker.get("quoteVolume", 0) or 0
+                            _bid_v = ob_data.get("bid_volume", 0)
+                            _ask_v = ob_data.get("ask_volume", 0)
+                            _total_v = _bid_v + _ask_v if (_bid_v + _ask_v) > 0 else 1
+                            _buy_v = _taker_vol * (_bid_v / _total_v)
+                            _sell_v = _taker_vol * (_ask_v / _total_v)
+
+                            qs_pre = self.quant_signals.get_all_signals(
+                                orderbook=ob_data, spot_price=_spot,
+                                futures_price=_futures,
+                                trades_volume=_taker_vol, buy_volume=_buy_v,
+                                sell_volume=_sell_v, returns=[],
+                                current_vol=0.01, avg_vol=0.01, df=None,
+                            )
+                            # 퀀트 피처를 ext_features에 병합 → ML이 학습 가능
+                            ext_features["quant_score"] = qs_pre.get("combined_score", 0)
+                            ext_features["quant_confidence"] = qs_pre.get("combined_confidence", 0)
+                            ext_features["quant_risk_scale"] = qs_pre.get("risk_scale", 1.0)
+                            ob_sig = qs_pre.get("orderbook", {})
+                            ext_features["quant_ob_imbalance"] = ob_sig.get("imbalance", 0)
+                            ext_features["quant_ob_score"] = ob_sig.get("score", 0)
+                            vpin_sig = qs_pre.get("vpin", {})
+                            ext_features["quant_vpin"] = vpin_sig.get("vpin", 0)
+                            ext_features["quant_vpin_risk"] = 1.0 - vpin_sig.get("position_scale", 1.0)
+                            basis_sig = qs_pre.get("basis", {})
+                            ext_features["quant_basis_pct"] = basis_sig.get("basis_pct", 0)
+                            ext_features["quant_basis_score"] = basis_sig.get("score", 0)
+                            crash_sig = qs_pre.get("crash", {})
+                            ext_features["quant_crash_prob"] = crash_sig.get("crash_risk", 0)
+                            ext_features["quant_crash_scale"] = crash_sig.get("position_scale", 1.0)
+                            alpha_sig = qs_pre.get("alpha", {})
+                            ext_features["quant_alpha_score"] = alpha_sig.get("score", 0)
+                            ext_features["quant_alpha_vwap"] = alpha_sig.get("alphas", {}).get("vwap_dev", 0)
+                            ext_features["quant_alpha_obv"] = alpha_sig.get("alphas", {}).get("obv_roc", 0)
+                            regime_sig = qs_pre.get("regime", {})
+                            ext_features["quant_regime_adx"] = regime_sig.get("adx", 0)
+                            ext_features["quant_regime_bb_width"] = regime_sig.get("bb_width", 0)
+                            ext_features["quant_regime_vol_ratio"] = regime_sig.get("vol_ratio", 0)
+                        except Exception as e:
+                            logger.debug(f"[Quant-ML] {symbol} 사전 피처 수집 실패: {e}")
+
                         self.feature_engineer.set_external_features(ext_features)
 
                 # 멀티타임프레임 분석 (각 타임프레임 데이터 수집 & 분석)
@@ -544,6 +592,13 @@ class AutoTrader:
 
         if len(df) < 60:
             return
+
+        # 1.5. 퀀트 ML 피처 확인 (최초 1회 로깅)
+        quant_cols = [c for c in df.columns if "quant" in c]
+        if quant_cols and not getattr(self, '_quant_feat_logged', False):
+            self._quant_feat_logged = True
+            sample = {c: round(float(df[c].iloc[-1]), 4) for c in quant_cols[:8]}
+            logger.info(f"[ML-Features] 퀀트 피처 {len(quant_cols)}개 주입됨: {sample}")
 
         # 2. 시장 레짐 감지
         prices = df["close"].values
@@ -1052,6 +1107,13 @@ class AutoTrader:
 
             if len(df) < 60:
                 return None
+
+            # 퀀트 ML 피처 확인 (최초 1회)
+            quant_cols = [c for c in df.columns if "quant" in c]
+            if quant_cols and not getattr(self, '_quant_feat_logged_analyze', False):
+                self._quant_feat_logged_analyze = True
+                sample = {c: round(float(df[c].iloc[-1]), 4) for c in quant_cols[:8]}
+                logger.info(f"[ML-Features] {symbol} 퀀트 피처 {len(quant_cols)}개: {sample}")
 
             prices = df["close"].values
             volumes = df["volume"].values
@@ -1793,6 +1855,15 @@ class AutoTrader:
             if fb_total > 0 and total_db == 0:
                 issues.append(f"feedback {fb_total}건, DB 0건 — save_trade 누락 가능")
 
+            # ──── 퀀트 시그널 + ML 피처 통합 체크 ────
+            quant_status = self._check_quant_integration()
+            if quant_status.get("issues"):
+                for qi in quant_status["issues"]:
+                    issues.append(qi)
+            if quant_status.get("fixes"):
+                for qf in quant_status["fixes"]:
+                    fixes.append(qf)
+
             # ──── 텔레그램 체크 ────
             tg_working = await self._check_telegram()
             if not tg_working:
@@ -1865,6 +1936,10 @@ class AutoTrader:
                 f"💾 DB 24h: LIVE {live_count_24h} | PAPER {paper_count_24h}",
                 f"📈 Optimizer: LIVE {live_opt_trades} | PAPER {paper_opt_trades}",
                 f"📡 텔레그램: {'✅' if tg_working else '❌'}",
+                f"🧬 퀀트: ML피처 {quant_status['status'].get('ml_quant_features', 0)}개 | "
+                f"OB={quant_status['status'].get('ob_history', 0)} "
+                f"VPIN={quant_status['status'].get('vpin_buckets', 0)} "
+                f"Basis={quant_status['status'].get('basis_history', 0)}",
             ]
             if sl_note:
                 report_lines.append(f"📐 {sl_note}")
@@ -2340,6 +2415,56 @@ class AutoTrader:
 
         except Exception as e:
             logger.error(f"[SelfReview] 실패: {e}")
+
+    def _check_quant_integration(self) -> dict:
+        """퀀트 시그널 10개 전략 + ML 피처 주입 통합 체크"""
+        result = {"issues": [], "fixes": [], "status": {}}
+        try:
+            # 1. QuantSignals 인스턴스 확인
+            if not hasattr(self, 'quant_signals'):
+                result["issues"].append("QuantSignals 미초기화")
+                return result
+
+            # 2. 오더북 히스토리 쌓이는지 (시그널이 실제로 호출되는 증거)
+            ob_len = len(self.quant_signals._ob_history)
+            if ob_len == 0:
+                result["issues"].append("오더북 임밸런스 히스토리 0건 — 시그널 미호출")
+            result["status"]["ob_history"] = ob_len
+
+            # 3. VPIN 버킷 쌓이는지
+            vpin_len = len(self.quant_signals._vpin_buckets)
+            result["status"]["vpin_buckets"] = vpin_len
+
+            # 4. 베이시스 히스토리
+            basis_len = len(self.quant_signals._basis_history)
+            result["status"]["basis_history"] = basis_len
+
+            # 5. ML 피처에 퀀트 컬럼 존재 확인
+            ext_feats = self.feature_engineer.external_features
+            quant_keys = [k for k in ext_feats if "quant" in k]
+            if len(quant_keys) < 10:
+                result["issues"].append(
+                    f"ML 퀀트 피처 {len(quant_keys)}/17개만 주입됨 — 사전 수집 실패 가능"
+                )
+            result["status"]["ml_quant_features"] = len(quant_keys)
+
+            # 6. 퀀트 피처 값이 전부 0이면 문제
+            all_zero = all(ext_feats.get(k, 0) == 0 for k in quant_keys)
+            if quant_keys and all_zero:
+                result["issues"].append("퀀트 ML 피처 전부 0 — 오더북/티커 수집 실패 가능")
+
+            # 로그
+            if not result["issues"]:
+                logger.info(
+                    f"[퀀트체크] ✅ 정상 | OB={ob_len} VPIN={vpin_len} "
+                    f"Basis={basis_len} ML피처={len(quant_keys)}개"
+                )
+            else:
+                logger.warning(f"[퀀트체크] ⚠️ {result['issues']}")
+
+        except Exception as e:
+            result["issues"].append(f"퀀트 체크 실패: {e}")
+        return result
 
     def _check_code_version(self) -> str | None:
         """git commit 시간 vs 프로세스 시작 시간 비교"""
