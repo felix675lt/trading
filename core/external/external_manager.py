@@ -22,6 +22,7 @@ from .derivatives_data import DerivativesDataCollector
 from .multi_timeframe import MultiTimeframeAnalyzer
 from .crypto_twitter import CryptoTwitterCollector
 from .polymarket import PolymarketCollector
+from .real_macro_collector import RealMacroCollector
 
 
 class ExternalDataManager:
@@ -59,6 +60,9 @@ class ExternalDataManager:
         # 예측 시장 (Polymarket 내부자 베팅 패턴)
         self.polymarket = PolymarketCollector()
 
+        # 실제 매크로 (Yahoo Finance: 유가/금/DXY/VIX/국채/S&P500)
+        self.real_macro = RealMacroCollector()
+
         self.enabled = config.get("enabled", True)
         self.weight = config.get("weight", 0.3)
 
@@ -88,6 +92,7 @@ class ExternalDataManager:
                 self.derivatives.collect(binance_symbol),
                 self.crypto_twitter.fetch(short_symbol),
                 self.polymarket.fetch(),
+                self.real_macro.fetch(),
                 return_exceptions=True,
             )
 
@@ -118,6 +123,9 @@ class ExternalDataManager:
             # Polymarket 시그널
             polymarket_features = self.polymarket.get_features()
 
+            # 실제 매크로 피처 (유가/금/DXY/VIX/국채/S&P500)
+            real_macro_features = self.real_macro.get_features()
+
             # 계절 시그널 업데이트
             self.seasonal.get_seasonal_signal()
 
@@ -133,6 +141,7 @@ class ExternalDataManager:
                 **derivatives_features,
                 **twitter_features,
                 **polymarket_features,
+                **real_macro_features,
             }
 
             # 종합 외부 신호 계산
@@ -140,7 +149,7 @@ class ExternalDataManager:
                 fg_features, onchain_features, macro_features,
                 sentiment_features, news_features, social_features,
                 seasonal_features, derivatives_features, twitter_features,
-                polymarket_features,
+                polymarket_features, real_macro_features,
             )
 
             self.last_update = datetime.utcnow()
@@ -153,6 +162,7 @@ class ExternalDataManager:
             poly_sig = self.polymarket.get_signal()
             poly_markets = poly_sig.get("polymarket_markets_monitored", 0)
             poly_sc = poly_sig.get("polymarket_score", 0)
+            rm_sig = self.real_macro.get_signal()
             logger.info(
                 f"[External] 종합신호: {self.composite_signal['score']:.2f} | "
                 f"공포탐욕: {fg_features.get('fg_value', 50):.0f} | "
@@ -162,7 +172,8 @@ class ExternalDataManager:
                 f"롱숏비: {derivatives_features.get('deriv_global_ls_ratio', 1):.2f} | "
                 f"계절: {seasonal_sig.get('direction', '?')}({seasonal_sig.get('score', 0):.2f}) | "
                 f"반감기: {seasonal_sig.get('halving_phase', '?')} | "
-                f"PM: {poly_sc:.2f}({poly_markets}건)"
+                f"PM: {poly_sc:.2f}({poly_markets}건) | "
+                f"매크로: WTI${rm_sig.get('oil', 0):.0f} DXY{rm_sig.get('dxy', 0):.1f} VIX{rm_sig.get('vix', 0):.1f} 점수{rm_sig.get('score', 0):.2f}"
             )
 
             return self.composite_signal
@@ -183,24 +194,27 @@ class ExternalDataManager:
         self, fg: dict, onchain: dict, macro: dict,
         sentiment: dict, news: dict, social: dict,
         seasonal: dict, derivatives: dict, twitter: dict | None = None,
-        polymarket: dict | None = None,
+        polymarket: dict | None = None, real_macro: dict | None = None,
     ) -> dict:
         """
-        종합 외부 신호 계산 (v4 - Polymarket 내부자 시그널 추가)
+        종합 외부 신호 계산 (v5 - 실제 매크로 데이터 추가)
 
         가중치 (총 100%):
-        - 파생상품 (펀딩비/OI/롱숏): 18% ← 선물 핵심
-        - 크립토 트위터/Stocktwits:   18% ← 실시간 소셜
-        - Polymarket 예측 시장:        8% ← 내부자 베팅 패턴 (신규)
-        - 계절 사이클:                10% ← 10년 검증 패턴
-        - Fear & Greed:              12% (역발상 + 순방향)
-        - NLP 센티먼트:              10%
-        - 매크로:                     8%
-        - 온체인:                     8%
-        - Reddit 소셜:               8%
+        - 파생상품 (펀딩비/OI/롱숏): 16% ← 선물 핵심
+        - 크립토 트위터/Stocktwits:   14% ← 실시간 소셜
+        - 실제 매크로 (유가/DXY/VIX): 12% ← 전통 금융 (신규)
+        - Polymarket 예측 시장:        7% ← 내부자 베팅 패턴
+        - 계절 사이클:                 8% ← 10년 검증 패턴
+        - Fear & Greed:              10% (역발상 + 순방향)
+        - NLP 센티먼트:               9%
+        - 매크로 (CoinGecko):         6%
+        - 온체인:                      8%
+        - Reddit 소셜:                6%
+        - 뉴스:                        4%
         """
         twitter = twitter or {}
         polymarket = polymarket or {}
+        real_macro = real_macro or {}
 
         # 각 카테고리 점수 (-1 ~ 1)
         fg_score = fg.get("fg_normalized", 0)
@@ -229,19 +243,29 @@ class ExternalDataManager:
         poly_score = polymarket.get("polymarket_score", 0)
         poly_confidence = polymarket.get("polymarket_confidence", 0)
 
-        # 가중 평균 (v4 - Polymarket 추가)
+        # 실제 매크로 시그널 (유가/금/DXY/VIX/국채/S&P500)
+        real_macro_score = real_macro.get("real_macro_composite_score", 0)
+        geo_risk = real_macro.get("real_macro_geo_risk", 0)
+
+        # 가중 평균 (v5 - 실제 매크로 추가)
         composite = (
-            deriv_score * 0.18 +             # 파생상품
-            twitter_score * 0.18 +           # 크립토 트위터
-            poly_score * 0.08 +              # Polymarket 예측 시장 (신규)
-            seasonal_score * 0.10 +          # 계절 사이클
-            fg_contrarian * 0.07 +           # 역발상 공포탐욕
-            fg_score * 0.05 +                # 순방향 공포탐욕
-            sentiment_score * 0.10 +         # NLP 센티먼트
-            macro_score * 0.08 +             # 매크로
+            deriv_score * 0.16 +             # 파생상품
+            twitter_score * 0.14 +           # 크립토 트위터
+            real_macro_score * 0.12 +        # 실제 매크로 (신규)
+            poly_score * 0.07 +              # Polymarket 예측 시장
+            seasonal_score * 0.08 +          # 계절 사이클
+            fg_contrarian * 0.06 +           # 역발상 공포탐욕
+            fg_score * 0.04 +                # 순방향 공포탐욕
+            sentiment_score * 0.09 +         # NLP 센티먼트
+            macro_score * 0.06 +             # 매크로 (CoinGecko)
             onchain_score * 0.08 +           # 온체인
-            social_score * 0.08              # Reddit 소셜
+            social_score * 0.06 +            # Reddit 소셜
+            0.0 * 0.04                       # 뉴스 (이벤트 임팩트로 반영)
         )
+
+        # 지정학 리스크가 높으면 변동성 증가 → 포지션 축소 시그널
+        if geo_risk > 0.6:
+            composite *= (1 - geo_risk * 0.2)  # 지정학 리스크 높으면 시그널 약화
 
         # Polymarket 강한 시그널 시 추가 부스트
         # (확신도 높고 방향 일치하면 composite 강화)
@@ -293,6 +317,7 @@ class ExternalDataManager:
             "components": {
                 "derivatives": round(deriv_score, 3),
                 "twitter": round(twitter_score, 3),
+                "real_macro": round(real_macro_score, 3),
                 "polymarket": round(poly_score, 3),
                 "seasonal": round(seasonal_score, 3),
                 "fear_greed": round(fg_score, 3),
@@ -300,6 +325,7 @@ class ExternalDataManager:
                 "macro": round(macro_score, 3),
                 "onchain": round(onchain_score, 3),
                 "social": round(social_score, 3),
+                "geo_risk": round(geo_risk, 3),
             },
             "high_impact_events": high_impact > 0,
             "confidence": min(abs(composite) * 2, 1.0),
@@ -342,5 +368,6 @@ class ExternalDataManager:
             "seasonal": self.seasonal.get_report(),
             "multi_timeframe": self.multi_tf.get_report(),
             "polymarket": self.polymarket.get_report(),
+            "real_macro": self.real_macro.get_report(),
             "feature_count": len(self.all_features),
         }

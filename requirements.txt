@@ -27,6 +27,10 @@ aiohttp>=3.9.0
 # NLP / Sentiment
 nltk>=3.8.0
 
+# Macro Data (Yahoo Finance)
+yfinance>=0.2.0
+lxml>=4.9.0
+
 # Utils
 python-dotenv>=1.0.0
 loguru>=0.7.0
