@@ -484,6 +484,8 @@ class TradeFeedbackAnalyzer:
         scale *= adj.get(f"regime_scale_{regime}", 1.0)
         # 방향 스케일
         scale *= adj.get(f"direction_scale_{side}", 1.0)
+        # 과다 레버리지 감지 스케일
+        scale *= adj.get("overlev_scale", 1.0)
 
         return max(0.1, min(2.0, scale))
 

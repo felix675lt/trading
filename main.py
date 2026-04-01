@@ -1618,6 +1618,45 @@ class AutoTrader:
             if not recommendations:
                 recommendations.append("다음 진입 시 확신도 기준 상향")
 
+            # === 6. 자동 조치 실행 (리포트 + 실제 파라미터 변경) ===
+            auto_actions = []
+
+            # 6a. 과다 레버리지 → 다음 진입 포지션 축소 (feedback adjustments 반영)
+            if price_move_pct < 2.0 and loss_pct > 5.0:
+                adj = self.feedback.feedback.get("adjustments", {})
+                old_scale = adj.get("overlev_scale", 1.0)
+                new_scale = max(0.3, old_scale * 0.7)
+                adj["overlev_scale"] = new_scale
+                self.feedback._save()
+                auto_actions.append(f"과다레버리지 감지 → 포지션 스케일 {old_scale:.0%}→{new_scale:.0%}")
+
+            # 6b. 연패 → strategy_manager에 즉시 반영
+            if consecutive_losses >= 2:
+                self.strategy_manager.record_loss()
+                auto_actions.append(
+                    f"연패 {consecutive_losses}회 → 확신도 +{self.strategy_manager._loss_confidence_boost:.2f} 상향"
+                )
+
+            # 6c. 고변동 레짐 손실 → 해당 레짐 스케일 축소
+            if regime in ("extreme_volatility", "high_volume_breakout"):
+                adj = self.feedback.feedback.get("adjustments", {})
+                key = f"regime_scale_{regime}"
+                old_scale = adj.get(key, 1.0)
+                new_scale = max(0.2, old_scale * 0.6)
+                adj[key] = new_scale
+                self.feedback._save()
+                auto_actions.append(f"고변동 레짐 '{regime}' → 스케일 {old_scale:.0%}→{new_scale:.0%}")
+
+            # 6d. 큰 손실(5%+) → 즉시 쿨다운 (3분간 진입 차단)
+            if loss_pct >= 5.0:
+                self.strategy_manager._loss_penalty_holds = max(
+                    self.strategy_manager._loss_penalty_holds, 6  # 6루프 = 3분
+                )
+                self.strategy_manager._loss_confidence_boost = max(
+                    self.strategy_manager._loss_confidence_boost, 0.10
+                )
+                auto_actions.append(f"큰 손실 {loss_pct:.1f}% → 3분 쿨다운 + 확신도 +0.10")
+
             # === 리포트 생성 ===
             report = (
                 f"🚨 <b>손실 분석 리포트</b> [{mode}]\n"
@@ -1635,9 +1674,15 @@ class AutoTrader:
                 report += f"  • {d}\n"
 
             report += f"━━━━━━━━━━━━━━━━━━\n"
-            report += f"🔧 <b>개선 조치</b>\n"
+            report += f"🔧 <b>개선 권고</b>\n"
             for r in recommendations:
                 report += f"  • {r}\n"
+
+            if auto_actions:
+                report += f"━━━━━━━━━━━━━━━━━━\n"
+                report += f"⚡ <b>자동 조치 실행</b>\n"
+                for a in auto_actions:
+                    report += f"  ✅ {a}\n"
 
             report += (
                 f"━━━━━━━━━━━━━━━━━━\n"
