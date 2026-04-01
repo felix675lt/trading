@@ -30,6 +30,7 @@ from core.learning.feedback import AnomalyDetector, TradeFeedbackAnalyzer
 from core.strategy.adaptive import AdaptiveOptimizer, StrategyOptimizer
 from core.strategy.manager import StrategyManager
 from core.external.listing_detector import ListingDetector
+from core.quant_signals import QuantSignals
 from dashboard.app import app as dashboard_app, set_state, add_live_log
 
 # Telegram 알림 (실패해도 트레이딩에 영향 없음)
@@ -105,6 +106,9 @@ class AutoTrader:
         # StrategyOptimizer — Paper/Live 각각 독립 추적
         self.strategy_optimizer_paper = StrategyOptimizer()
         self.strategy_optimizer_live = StrategyOptimizer()
+
+        # 퀀트 시그널 (오더북, VPIN, 베이시스, 크래시보호, 알파, 레짐)
+        self.quant_signals = QuantSignals()
 
         # 최소 주문 notional (거래소 최소수량 충족용)
         self.min_order_notional = self.config["risk"].get("min_order_notional", 100)
@@ -715,6 +719,60 @@ class AutoTrader:
         if decision.action in ["long", "short"]:
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
 
+            # 7.0. 퀀트 시그널 계산 (오더북, VPIN, 베이시스, 크래시보호, 알파, 레짐)
+            try:
+                ob_data = await self.collector.fetch_orderbook(exchange_name, symbol, limit=20)
+                ticker = await self.collector.fetch_ticker(exchange_name, symbol)
+                spot_price = ticker.get("last", price)
+                futures_price = float(df["close"].iloc[-1])
+                returns_list = df["returns_1"].dropna().tolist() if "returns_1" in df.columns else []
+                avg_vol = df["returns_1"].std() if "returns_1" in df.columns else 0.01
+                taker_vol = ticker.get("quoteVolume", 0) or 0
+                # 간이 buy/sell 추정 (오더북 불균형 기반)
+                bid_vol = ob_data.get("bid_volume", 0)
+                ask_vol = ob_data.get("ask_volume", 0)
+                total_vol = bid_vol + ask_vol if (bid_vol + ask_vol) > 0 else 1
+                buy_vol = taker_vol * (bid_vol / total_vol)
+                sell_vol = taker_vol * (ask_vol / total_vol)
+
+                qs = self.quant_signals.get_all_signals(
+                    orderbook=ob_data, spot_price=spot_price,
+                    futures_price=futures_price,
+                    trades_volume=taker_vol, buy_volume=buy_vol,
+                    sell_volume=sell_vol, returns=returns_list,
+                    current_vol=volatility, avg_vol=avg_vol, df=df,
+                )
+                quant_risk_scale = qs.get("risk_scale", 1.0)
+                quant_regime = qs.get("regime", {})
+                quant_score = qs.get("combined_score", 0)
+
+                # 퀀트 레짐이 ranging이면 추가 확신도 감소
+                if quant_regime.get("regime") == "ranging":
+                    decision.confidence *= 0.6
+                    decision.reason += " !퀀트횡보장"
+                    if decision.confidence < self.strategy_manager.min_confidence:
+                        decision.action = "hold"
+                        decision.size = 0.0
+                        decision.reason += " → 진입차단"
+                        return
+
+                # 퀀트 시그널 방향 불일치 시 감액
+                if quant_score != 0:
+                    quant_agrees = (
+                        (decision.action == "long" and quant_score > 0) or
+                        (decision.action == "short" and quant_score < 0)
+                    )
+                    if not quant_agrees and abs(quant_score) > 0.3:
+                        decision.confidence *= 0.7
+                        decision.reason += f" !퀀트반대({quant_score:+.2f})"
+                    elif quant_agrees and abs(quant_score) > 0.3:
+                        decision.confidence = min(decision.confidence * 1.15, 1.0)
+                        decision.reason += f" +퀀트합류({quant_score:+.2f})"
+
+            except Exception as e:
+                logger.debug(f"[Quant] {symbol} 시그널 수집 실패: {e}")
+                quant_risk_scale = 1.0
+
             # 7.1. 포지션 상관관계 체크
             current_positions = {
                 s: {"side": p.side} for s, p in self.paper_trader.positions.items()
@@ -743,11 +801,11 @@ class AutoTrader:
                 dynamic_lev, sl_pct_for_cap, max_risk_pct
             )
 
-            # 7.3. 피드백 기반 포지션 크기 조정
+            # 7.3. 피드백 기반 포지션 크기 조정 + 퀀트 리스크 스케일
             fb_scale = self.feedback.get_position_scale(adaptive_params["regime"], decision.action)
             size = self.risk_manager.calculate_position_size(
                 self.equity, decision.confidence, volatility,
-                adaptive_params["position_scale"] * fb_scale * corr_mult,
+                adaptive_params["position_scale"] * fb_scale * corr_mult * quant_risk_scale,
             )
 
             # 7.4. 최소 주문 notional 보장 (Binance 최소 $100 + 여유분)
@@ -1049,6 +1107,52 @@ class AutoTrader:
             price = float(df["close"].iloc[-1])
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
 
+            # === 퀀트 시그널 계산 ===
+            quant_risk_scale = 1.0
+            try:
+                ob_data = await self.collector.fetch_orderbook(exchange_name, symbol, limit=20)
+                ticker = await self.collector.fetch_ticker(exchange_name, symbol)
+                spot_price = ticker.get("last", price)
+                returns_list = df["returns_1"].dropna().tolist() if "returns_1" in df.columns else []
+                avg_vol = volatility
+                taker_vol = ticker.get("quoteVolume", 0) or 0
+                bid_vol = ob_data.get("bid_volume", 0)
+                ask_vol = ob_data.get("ask_volume", 0)
+                total_vol = bid_vol + ask_vol if (bid_vol + ask_vol) > 0 else 1
+                buy_vol = taker_vol * (bid_vol / total_vol)
+                sell_vol = taker_vol * (ask_vol / total_vol)
+
+                qs = self.quant_signals.get_all_signals(
+                    orderbook=ob_data, spot_price=spot_price,
+                    futures_price=price,
+                    trades_volume=taker_vol, buy_volume=buy_vol,
+                    sell_volume=sell_vol, returns=returns_list,
+                    current_vol=volatility, avg_vol=avg_vol, df=df,
+                )
+                quant_risk_scale = qs.get("risk_scale", 1.0)
+                quant_regime = qs.get("regime", {})
+                quant_score = qs.get("combined_score", 0)
+
+                # 퀀트 레짐 횡보 → 진입 차단
+                if quant_regime.get("regime") == "ranging" and decision.action in ("long", "short"):
+                    decision.confidence *= 0.6
+                    decision.reason += " !퀀트횡보장"
+
+                # 퀀트 시그널 방향 확인
+                if quant_score != 0 and decision.action in ("long", "short"):
+                    quant_agrees = (
+                        (decision.action == "long" and quant_score > 0) or
+                        (decision.action == "short" and quant_score < 0)
+                    )
+                    if not quant_agrees and abs(quant_score) > 0.3:
+                        decision.confidence *= 0.7
+                        decision.reason += f" !퀀트반대({quant_score:+.2f})"
+                    elif quant_agrees and abs(quant_score) > 0.3:
+                        decision.confidence = min(decision.confidence * 1.15, 1.0)
+                        decision.reason += f" +퀀트합류({quant_score:+.2f})"
+            except Exception as e:
+                logger.debug(f"[Quant] {symbol} 시그널 실패: {e}")
+
             # 동적 레버리지
             ext_agrees = (
                 (decision.action == "long" and ext_signal.get("direction") == "bullish") or
@@ -1062,7 +1166,6 @@ class AutoTrader:
             )
 
             # === SL×레버리지 리스크 캡핑 ===
-            # SL% × leverage ≤ max_risk_pct 보장
             trade_type = decision.trade_type
             tp_profile = self.config.get("trade_profiles", {}).get(trade_type, {})
             sl_pct_for_cap = tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"])
@@ -1071,11 +1174,11 @@ class AutoTrader:
                 dynamic_lev, sl_pct_for_cap, max_risk_pct
             )
 
-            # 포지션 크기 (풀시드)
+            # 포지션 크기 (풀시드) + 퀀트 리스크 스케일
             fb_scale = self.feedback.get_position_scale(adaptive_params["regime"], decision.action)
             size = self.risk_manager.calculate_position_size(
                 self.equity, decision.confidence, volatility,
-                adaptive_params["position_scale"] * fb_scale,
+                adaptive_params["position_scale"] * fb_scale * quant_risk_scale,
             )
 
             # 최소 notional 보장
