@@ -245,65 +245,69 @@ class AutoTrader:
                 }))
                 _mark_alerted("macro_shift")
 
-            # === 2. 뉴스 기반 알림 (high-impact 키워드) ===
-            if _can_alert("breaking_news", cooldown_min=20):
-                news_list = self.external_manager.news.news
-                high_impact_headlines = []
-                geo_headlines = []
+            # === 2. 뉴스 기반 알림 — 쿨다운 없음 (속보는 즉시 전달) ===
+            # 중복 방지는 alerted_headlines(제목 기반)으로만 처리
+            news_list = self.external_manager.news.news
+            geo_headlines = []
+            crypto_headlines = []
 
-                GEO_KEYWORDS = [
-                    "war", "iran", "sanctions", "tariff", "missile", "ceasefire",
-                    "peace", "invasion", "nuclear", "troops", "military",
-                    "oil price", "opec", "embargo", "strait", "hormuz",
-                ]
-                CRYPTO_IMPACT_KEYWORDS = [
-                    "etf approved", "etf approval", "sec", "ban", "regulation",
-                    "hack", "exploit", "bankruptcy", "liquidation",
-                    "rate cut", "rate hike", "fed", "fomc",
-                    "bitcoin reserve", "stablecoin bill",
-                ]
+            GEO_KEYWORDS = [
+                "war", "iran", "sanctions", "tariff", "missile", "ceasefire",
+                "peace", "invasion", "nuclear", "troops", "military",
+                "oil price", "opec", "embargo", "strait", "hormuz",
+                "conflict", "airstrike", "escalat", "de-escalat",
+                "negotiate", "deal", "treaty", "withdraw",
+            ]
+            CRYPTO_IMPACT_KEYWORDS = [
+                "etf approved", "etf approval", "etf rejected", "etf denied",
+                "sec", "ban", "regulation", "crackdown",
+                "hack", "hacked", "exploit", "vulnerability",
+                "bankruptcy", "bankrupt", "liquidation", "insolvent",
+                "rate cut", "rate hike", "fed", "fomc", "powell",
+                "bitcoin reserve", "stablecoin bill", "crypto bill",
+                "whale", "dump", "crash", "surge", "soar", "plunge",
+                "delisting", "listing", "blackrock",
+            ]
 
-                for n in news_list[:30]:
-                    title = n.get("title", "")
-                    title_lower = title.lower()
-                    title_short = title[:80]
+            for n in news_list[:50]:
+                title = n.get("title", "")
+                title_lower = title.lower()
+                title_key = title[:80]
 
-                    # 이미 알린 뉴스 건너뛰기
-                    if title_short in st["alerted_headlines"]:
-                        continue
+                # 이미 알린 뉴스는 건너뛰기 (같은 제목 중복만 방지)
+                if title_key in st["alerted_headlines"]:
+                    continue
 
-                    # 지정학 키워드 감지
-                    geo_hit = [kw for kw in GEO_KEYWORDS if kw in title_lower]
-                    if geo_hit:
-                        geo_headlines.append(title)
-                        st["alerted_headlines"].add(title_short)
+                # 지정학 키워드 감지
+                geo_hit = [kw for kw in GEO_KEYWORDS if kw in title_lower]
+                if geo_hit:
+                    geo_headlines.append(f"{title} [{', '.join(geo_hit[:3])}]")
+                    st["alerted_headlines"].add(title_key)
 
-                    # 크립토 직접 영향 키워드 감지
-                    crypto_hit = [kw for kw in CRYPTO_IMPACT_KEYWORDS if kw in title_lower]
-                    if crypto_hit:
-                        high_impact_headlines.append(title)
-                        st["alerted_headlines"].add(title_short)
+                # 크립토 직접 영향 키워드 감지
+                crypto_hit = [kw for kw in CRYPTO_IMPACT_KEYWORDS if kw in title_lower]
+                if crypto_hit:
+                    crypto_headlines.append(f"{title} [{', '.join(crypto_hit[:3])}]")
+                    st["alerted_headlines"].add(title_key)
 
-                # 지정학 뉴스 알림
-                if geo_headlines and _can_alert("geopolitical", cooldown_min=30):
-                    geo_risk = rm.get_features().get("real_macro_geo_risk", 0)
-                    tg_notify(format_external_alert("geopolitical", {
-                        "events": geo_headlines[:5],
-                        "geo_risk": geo_risk,
-                    }))
-                    _mark_alerted("geopolitical")
+            # 지정학 뉴스 → 즉시 발송 (건별)
+            if geo_headlines:
+                geo_risk = rm.get_features().get("real_macro_geo_risk", 0)
+                tg_notify(format_external_alert("geopolitical", {
+                    "events": geo_headlines[:8],
+                    "geo_risk": geo_risk,
+                }))
 
-                # 크립토 영향 뉴스 알림
-                if high_impact_headlines:
-                    tg_notify(format_external_alert("breaking_news", {
-                        "headlines": high_impact_headlines[:5],
-                        "impact": "high",
-                    }))
-                    _mark_alerted("breaking_news")
+            # 크립토 영향 뉴스 → 즉시 발송 (건별)
+            if crypto_headlines:
+                tg_notify(format_external_alert("breaking_news", {
+                    "headlines": crypto_headlines[:8],
+                    "impact": "high",
+                }))
 
-                # 알림 히스토리 정리 (100개 이상이면 오래된 것 제거)
-                if len(st["alerted_headlines"]) > 200:
-                    st["alerted_headlines"] = set(list(st["alerted_headlines"])[-100:])
+            # 알림 히스토리 정리 (너무 커지면 오래된 것 제거)
+            if len(st["alerted_headlines"]) > 500:
+                st["alerted_headlines"] = set(list(st["alerted_headlines"])[-300:])
 
             # === 3. 종합 신호 급변 (방향 전환) ===
             cs = self.external_manager.composite_signal
