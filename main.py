@@ -35,7 +35,10 @@ from dashboard.app import app as dashboard_app, set_state, add_live_log
 
 # Telegram 알림 (실패해도 트레이딩에 영향 없음)
 try:
-    from scripts.telegram_bot import send_message as tg_send, format_trade_open, format_trade_close, format_system_alert
+    from scripts.telegram_bot import (
+        send_message as tg_send, format_trade_open, format_trade_close,
+        format_system_alert, format_external_alert,
+    )
     _tg_ok = True
 except Exception:
     _tg_ok = False
@@ -46,6 +49,8 @@ except Exception:
         return f"{mode} 청산 {symbol} PnL: ${pnl:+.2f} | {reason}"
     def format_system_alert(msg):
         return f"⚠️ {msg}"
+    def format_external_alert(alert_type, data):
+        return f"📢 {alert_type}: {data}"
 
 def tg_notify(text, silent=False):
     """비동기 안전 텔레그램 알림 (실패 무시)"""
@@ -128,6 +133,244 @@ class AutoTrader:
         self._live_paused = False
         self._live_pause_reason = ""
         self._live_pause_time = None
+
+        # 외부 요인 알림 상태 추적
+        self._ext_alert_state = {
+            "last_composite_score": 0.0,
+            "last_macro_score": 0.0,
+            "last_fg_value": 50,
+            "last_oil_price": 0.0,
+            "last_dxy": 0.0,
+            "last_vix": 0.0,
+            "last_sentiment": 0.0,
+            "last_alert_time": {},       # alert_type → timestamp
+            "alerted_headlines": set(),  # 이미 알린 뉴스 제목
+        }
+
+    def _check_external_alerts(self):
+        """외부 요인 변동 감지 → 텔레그램 알림 발송"""
+        try:
+            st = self._ext_alert_state
+            now = datetime.utcnow()
+
+            # 쿨다운 체크 함수 (같은 유형 알림 최소 30분 간격)
+            def _can_alert(alert_type, cooldown_min=30):
+                last = st["last_alert_time"].get(alert_type)
+                if last and (now - last).total_seconds() < cooldown_min * 60:
+                    return False
+                return True
+
+            def _mark_alerted(alert_type):
+                st["last_alert_time"][alert_type] = now
+
+            # === 1. 매크로 지표 급변 (유가/DXY/VIX) ===
+            rm = self.external_manager.real_macro
+            rm_sig = rm.get_signal()
+            rm_score = rm.get_features().get("real_macro_composite_score", 0)
+            oil = rm_sig.get("oil", 0)
+            dxy = rm_sig.get("dxy", 0)
+            vix = rm_sig.get("vix", 0)
+            gold = rm_sig.get("gold", 0)
+
+            # 유가 5%+ 급변
+            if oil > 0 and st["last_oil_price"] > 0 and _can_alert("oil_move"):
+                oil_change = (oil - st["last_oil_price"]) / st["last_oil_price"]
+                if abs(oil_change) >= 0.03:  # 3%+
+                    brent = rm.data.get("brent_oil_price", 0)
+                    impl = ""
+                    if oil_change < -0.03:
+                        impl = "유가 하락 → 지정학 긴장 완화 or 수요 부진. 크립토 불확실성 감소 가능"
+                    elif oil_change > 0.05:
+                        impl = "유가 급등 → 지정학 리스크 확대. 위험자산 회피 가능"
+                    elif oil_change > 0.03:
+                        impl = "유가 상승 → 인플레이션 우려. 금리인하 기대 약화 가능"
+                    tg_notify(format_external_alert("oil_move", {
+                        "price": oil, "change": oil_change, "brent": brent,
+                        "implication": impl,
+                    }))
+                    _mark_alerted("oil_move")
+
+            # DXY 0.5%+ 급변
+            if dxy > 0 and st["last_dxy"] > 0 and _can_alert("dxy_move"):
+                dxy_change = (dxy - st["last_dxy"]) / st["last_dxy"]
+                if abs(dxy_change) >= 0.004:  # 0.4%+
+                    tg_notify(format_external_alert("dxy_move", {
+                        "dxy": dxy, "change": dxy_change,
+                    }))
+                    _mark_alerted("dxy_move")
+
+            # VIX 급등 (25+ 이상 진입 or 30+ 돌파)
+            if vix > 0 and _can_alert("vix_spike", cooldown_min=60):
+                if vix >= 30 and st.get("last_vix", 0) < 30:
+                    tg_notify(format_external_alert("macro_shift", {
+                        "score": rm_score,
+                        "changes": [
+                            f"⚠️ VIX {vix:.1f} — 극단적 공포 구간 진입",
+                            f"  WTI: ${oil:.1f} | Gold: ${gold:.0f} | DXY: {dxy:.1f}",
+                            f"  💡 VIX 30+ = 시장 패닉. 단기 변동성 극대화 주의",
+                        ],
+                    }))
+                    _mark_alerted("vix_spike")
+                elif vix >= 25 and (st.get("last_vix", 0) < 25 or st.get("last_vix", 0) == 0):
+                    tg_notify(format_external_alert("macro_shift", {
+                        "score": rm_score,
+                        "changes": [
+                            f"🟡 VIX {vix:.1f} — 경계 구간 진입",
+                            f"  WTI: ${oil:.1f} | Gold: ${gold:.0f} | DXY: {dxy:.1f}",
+                        ],
+                    }))
+                    _mark_alerted("vix_spike")
+
+            # 매크로 종합 점수 큰 변화 (0.3+ 변동)
+            if abs(rm_score - st["last_macro_score"]) >= 0.25 and _can_alert("macro_shift"):
+                changes = []
+                if oil > 0:
+                    changes.append(f"🛢️ WTI: ${oil:.1f}")
+                if gold > 0:
+                    changes.append(f"🥇 Gold: ${gold:.0f}")
+                if dxy > 0:
+                    changes.append(f"💵 DXY: {dxy:.1f}")
+                if vix > 0:
+                    changes.append(f"😰 VIX: {vix:.1f}")
+
+                sp_chg = rm.data.get("sp500_change_1d", 0)
+                nq_chg = rm.data.get("nasdaq_change_1d", 0)
+                if sp_chg:
+                    changes.append(f"📈 S&P500: {sp_chg:+.1%}")
+                if nq_chg:
+                    changes.append(f"📈 나스닥: {nq_chg:+.1%}")
+
+                tg_notify(format_external_alert("macro_shift", {
+                    "score": rm_score, "changes": changes,
+                }))
+                _mark_alerted("macro_shift")
+
+            # === 2. 뉴스 기반 알림 (high-impact 키워드) ===
+            if _can_alert("breaking_news", cooldown_min=20):
+                news_list = self.external_manager.news.news
+                high_impact_headlines = []
+                geo_headlines = []
+
+                GEO_KEYWORDS = [
+                    "war", "iran", "sanctions", "tariff", "missile", "ceasefire",
+                    "peace", "invasion", "nuclear", "troops", "military",
+                    "oil price", "opec", "embargo", "strait", "hormuz",
+                ]
+                CRYPTO_IMPACT_KEYWORDS = [
+                    "etf approved", "etf approval", "sec", "ban", "regulation",
+                    "hack", "exploit", "bankruptcy", "liquidation",
+                    "rate cut", "rate hike", "fed", "fomc",
+                    "bitcoin reserve", "stablecoin bill",
+                ]
+
+                for n in news_list[:30]:
+                    title = n.get("title", "")
+                    title_lower = title.lower()
+                    title_short = title[:80]
+
+                    # 이미 알린 뉴스 건너뛰기
+                    if title_short in st["alerted_headlines"]:
+                        continue
+
+                    # 지정학 키워드 감지
+                    geo_hit = [kw for kw in GEO_KEYWORDS if kw in title_lower]
+                    if geo_hit:
+                        geo_headlines.append(title)
+                        st["alerted_headlines"].add(title_short)
+
+                    # 크립토 직접 영향 키워드 감지
+                    crypto_hit = [kw for kw in CRYPTO_IMPACT_KEYWORDS if kw in title_lower]
+                    if crypto_hit:
+                        high_impact_headlines.append(title)
+                        st["alerted_headlines"].add(title_short)
+
+                # 지정학 뉴스 알림
+                if geo_headlines and _can_alert("geopolitical", cooldown_min=30):
+                    geo_risk = rm.get_features().get("real_macro_geo_risk", 0)
+                    tg_notify(format_external_alert("geopolitical", {
+                        "events": geo_headlines[:5],
+                        "geo_risk": geo_risk,
+                    }))
+                    _mark_alerted("geopolitical")
+
+                # 크립토 영향 뉴스 알림
+                if high_impact_headlines:
+                    tg_notify(format_external_alert("breaking_news", {
+                        "headlines": high_impact_headlines[:5],
+                        "impact": "high",
+                    }))
+                    _mark_alerted("breaking_news")
+
+                # 알림 히스토리 정리 (100개 이상이면 오래된 것 제거)
+                if len(st["alerted_headlines"]) > 200:
+                    st["alerted_headlines"] = set(list(st["alerted_headlines"])[-100:])
+
+            # === 3. 종합 신호 급변 (방향 전환) ===
+            cs = self.external_manager.composite_signal
+            new_cs_score = cs.get("score", 0)
+            old_cs_score = st["last_composite_score"]
+
+            # 방향 전환 감지 (음→양 or 양→음, 0.15+ 변동)
+            if _can_alert("composite_shift", cooldown_min=60):
+                direction_changed = (old_cs_score < -0.05 and new_cs_score > 0.05) or \
+                                    (old_cs_score > 0.05 and new_cs_score < -0.05)
+                big_move = abs(new_cs_score - old_cs_score) >= 0.15
+
+                if direction_changed or big_move:
+                    tg_notify(format_external_alert("composite_shift", {
+                        "old_score": old_cs_score,
+                        "new_score": new_cs_score,
+                        "components": cs.get("components", {}),
+                    }))
+                    _mark_alerted("composite_shift")
+
+            # === 4. 공포탐욕 극단값 ===
+            fg = self.external_manager.fear_greed.current
+            fg_value = fg.get("value", 50)
+
+            if _can_alert("fear_greed_extreme", cooldown_min=120):
+                # 극단적 공포 (10 이하) or 극단적 탐욕 (90 이상)
+                if fg_value <= 10 and st["last_fg_value"] > 10:
+                    tg_notify(format_external_alert("fear_greed_extreme", {
+                        "value": fg_value, "label": "극단적 공포 (Extreme Fear)",
+                    }))
+                    _mark_alerted("fear_greed_extreme")
+                elif fg_value >= 90 and st["last_fg_value"] < 90:
+                    tg_notify(format_external_alert("fear_greed_extreme", {
+                        "value": fg_value, "label": "극단적 탐욕 (Extreme Greed)",
+                    }))
+                    _mark_alerted("fear_greed_extreme")
+
+            # === 5. 센티먼트 급변 ===
+            sent = self.external_manager.all_features.get("sentiment_avg", 0)
+            if abs(sent - st["last_sentiment"]) >= 0.20 and _can_alert("sentiment_shift", cooldown_min=60):
+                details = ""
+                if sent > st["last_sentiment"]:
+                    details = "뉴스/소셜 긍정 심리 급증. 매수 심리 강화 가능"
+                else:
+                    details = "뉴스/소셜 부정 심리 급증. 매도 압력 증가 가능"
+                tg_notify(format_external_alert("sentiment_shift", {
+                    "old_score": st["last_sentiment"],
+                    "new_score": sent,
+                    "details": details,
+                }))
+                _mark_alerted("sentiment_shift")
+
+            # 상태 업데이트
+            st["last_composite_score"] = new_cs_score
+            st["last_macro_score"] = rm_score
+            if fg_value > 0:
+                st["last_fg_value"] = fg_value
+            if oil > 0:
+                st["last_oil_price"] = oil
+            if dxy > 0:
+                st["last_dxy"] = dxy
+            if vix > 0:
+                st["last_vix"] = vix
+            st["last_sentiment"] = sent
+
+        except Exception as e:
+            logger.debug(f"[ExtAlert] 외부 알림 체크 실패: {e}")
 
     def _save_trade_with_context(self, trade: dict, context: dict = None):
         """save_trade 래퍼 — 퀀트 시그널/레짐/확신도 등 메타데이터 자동 포함"""
@@ -448,6 +691,9 @@ class AutoTrader:
                             logger.debug(f"[Quant-ML] {symbol} 사전 피처 수집 실패: {e}")
 
                         self.feature_engineer.set_external_features(ext_features)
+
+                    # 외부 요인 변동 → 텔레그램 알림 체크 (심볼 루프 끝난 후 1회)
+                    self._check_external_alerts()
 
                 # 멀티타임프레임 분석 (각 타임프레임 데이터 수집 & 분석)
                 for symbol in symbols:

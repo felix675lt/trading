@@ -154,6 +154,124 @@ def format_health_alert(data: dict) -> str:
     return msg
 
 
+def format_external_alert(alert_type: str, data: dict) -> str:
+    """외부 요인 변동 알림 (뉴스/매크로/지정학/센티먼트)"""
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    header = ""
+    body = ""
+
+    if alert_type == "macro_shift":
+        # 매크로 지표 급변
+        header = "🌍 <b>매크로 시장 변동 감지</b>"
+        changes = data.get("changes", [])
+        score = data.get("score", 0)
+        direction = "🟢 Bullish" if score > 0 else "🔴 Bearish"
+        body = f"📊 매크로 점수: <b>{score:+.2f}</b> ({direction})\n\n"
+        for c in changes:
+            body += f"  {c}\n"
+
+    elif alert_type == "breaking_news":
+        # 크립토 영향 뉴스
+        header = "📰 <b>크립토 영향 뉴스 감지</b>"
+        headlines = data.get("headlines", [])
+        impact = data.get("impact", "medium")
+        emoji = "🔴" if impact == "high" else "🟡"
+        body = f"{emoji} 임팩트: <b>{impact.upper()}</b>\n\n"
+        for h in headlines[:5]:
+            body += f"  • {h[:120]}\n"
+
+    elif alert_type == "geopolitical":
+        # 지정학 이벤트
+        header = "⚔️ <b>지정학 이벤트 감지</b>"
+        events = data.get("events", [])
+        geo_risk = data.get("geo_risk", 0)
+        body = f"🎯 지정학 리스크: <b>{geo_risk:.0%}</b>\n\n"
+        for e in events[:5]:
+            body += f"  • {e[:120]}\n"
+
+    elif alert_type == "sentiment_shift":
+        # 센티먼트 급변
+        header = "📊 <b>시장 센티먼트 급변</b>"
+        old_score = data.get("old_score", 0)
+        new_score = data.get("new_score", 0)
+        direction = "🟢 긍정 전환" if new_score > old_score else "🔴 부정 전환"
+        body = (
+            f"{direction}\n"
+            f"  이전: {old_score:+.2f} → 현재: <b>{new_score:+.2f}</b>\n"
+            f"  변화폭: {abs(new_score - old_score):.2f}\n"
+        )
+        if data.get("details"):
+            body += f"\n  📝 {data['details']}"
+
+    elif alert_type == "oil_move":
+        # 유가 급변
+        header = "🛢️ <b>유가 급변 감지</b>"
+        price = data.get("price", 0)
+        change = data.get("change", 0)
+        emoji = "📈" if change > 0 else "📉"
+        body = (
+            f"{emoji} WTI: <b>${price:.1f}</b> ({change:+.1%})\n"
+            f"  Brent: ${data.get('brent', 0):.1f}\n"
+        )
+        if data.get("implication"):
+            body += f"\n  💡 <i>{data['implication']}</i>"
+
+    elif alert_type == "dxy_move":
+        # 달러 인덱스 급변
+        header = "💵 <b>달러 인덱스(DXY) 급변</b>"
+        dxy = data.get("dxy", 0)
+        change = data.get("change", 0)
+        direction = "약세 📉" if change < 0 else "강세 📈"
+        crypto_impact = "🟢 크립토 호재" if change < 0 else "🔴 크립토 악재"
+        body = (
+            f"  DXY: <b>{dxy:.1f}</b> ({change:+.2%})\n"
+            f"  달러 {direction} → {crypto_impact}\n"
+        )
+
+    elif alert_type == "fear_greed_extreme":
+        # 공포탐욕 극단값
+        header = "😱 <b>공포탐욕 지수 극단값</b>"
+        value = data.get("value", 50)
+        label = data.get("label", "")
+        body = (
+            f"  지수: <b>{value}</b> ({label})\n"
+            f"  💡 <i>극단적 공포는 역발상 매수 시그널 가능</i>\n"
+        )
+
+    elif alert_type == "polymarket":
+        # 폴리마켓 급변
+        header = "🔮 <b>예측 시장(Polymarket) 변동</b>"
+        events = data.get("events", [])
+        score = data.get("score", 0)
+        body = f"📊 PM 점수: <b>{score:+.2f}</b>\n\n"
+        for e in events[:5]:
+            body += f"  • {e[:120]}\n"
+
+    elif alert_type == "composite_shift":
+        # 종합 신호 큰 변화
+        header = "🔄 <b>종합 외부 신호 전환</b>"
+        old = data.get("old_score", 0)
+        new = data.get("new_score", 0)
+        components = data.get("components", {})
+        emoji = "🟢" if new > old else "🔴"
+        body = f"{emoji} {old:+.2f} → <b>{new:+.2f}</b>\n\n"
+        if components:
+            body += "<b>구성요소:</b>\n"
+            for k, v in components.items():
+                body += f"  {k}: {v:+.3f}\n"
+
+    else:
+        header = "📢 <b>외부 요인 알림</b>"
+        body = json.dumps(data, ensure_ascii=False, default=str)[:500]
+
+    return (
+        f"{header}\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"{body}\n"
+        f"\n🕐 {now}"
+    )
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         send_message(" ".join(sys.argv[1:]))
