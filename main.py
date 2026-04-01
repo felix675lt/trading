@@ -129,6 +129,27 @@ class AutoTrader:
         self._live_pause_reason = ""
         self._live_pause_time = None
 
+    def _save_trade_with_context(self, trade: dict, context: dict = None):
+        """save_trade 래퍼 — 퀀트 시그널/레짐/확신도 등 메타데이터 자동 포함"""
+        meta = {}
+        if context:
+            meta.update(context)
+        # 현재 퀀트 상태 자동 수집
+        try:
+            ext_feats = self.feature_engineer.external_features
+            meta["quant_score"] = ext_feats.get("quant_score", 0)
+            meta["quant_risk_scale"] = ext_feats.get("quant_risk_scale", 1.0)
+            meta["quant_ob_imbalance"] = ext_feats.get("quant_ob_imbalance", 0)
+            meta["quant_vpin"] = ext_feats.get("quant_vpin", 0)
+            meta["quant_basis_pct"] = ext_feats.get("quant_basis_pct", 0)
+            meta["quant_crash_prob"] = ext_feats.get("quant_crash_prob", 0)
+            meta["quant_alpha_score"] = ext_feats.get("quant_alpha_score", 0)
+            meta["regime"] = self.adaptive.current_regime if hasattr(self, 'adaptive') else "?"
+        except Exception:
+            pass
+        trade["metadata"] = meta
+        self.storage.save_trade(trade)
+
     def _load_config(self, path: str) -> dict:
         with open(path) as f:
             config = yaml.safe_load(f)
@@ -212,7 +233,7 @@ class AutoTrader:
                 else:
                     self.strategy_manager.record_win()
                 self.risk_manager.record_pnl(pnl)
-                self.storage.save_trade({
+                self._save_trade_with_context({
                     "exchange": "binance", "symbol": symbol, "side": "close",
                     "price": result.get("exit_price", 0),
                     "amount": result.get("size", 0),
@@ -528,6 +549,23 @@ class AutoTrader:
                         logger.debug(f"[ListingDetector] 스캔 실패: {e}")
 
                 loop_count += 1
+
+                # === equity_curve 기록 (5분마다 = 10루프) ===
+                if loop_count % 10 == 0:
+                    try:
+                        risk_status = self.risk_manager.get_status()
+                        dd = risk_status.get("current_drawdown", 0)
+                        pos_info = {}
+                        if self.mode in ("paper", "dual"):
+                            pos_info["paper"] = {s: {"side": p.side, "pnl": getattr(p, 'unrealized_pnl', 0)}
+                                                  for s, p in self.paper_trader.positions.items()}
+                        for name, om in self.order_managers.items():
+                            pos_info[f"live_{name}"] = {s: {"side": p.side}
+                                                         for s, p in om.positions.items()}
+                        self.storage.save_equity(self.equity, dd, pos_info)
+                    except Exception as e:
+                        logger.debug(f"[DB] equity_curve 저장 실패: {e}")
+
                 if loop_count % 10 == 0:
                     ext_report = self.external_manager.get_report()
                     cs = ext_report.get("composite_signal", {})
@@ -960,7 +998,7 @@ class AutoTrader:
                 result = self.paper_trader.close_position(symbol, price, decision.reason)
                 if result:
                     self.risk_manager.record_pnl(result["pnl"])
-                    self.storage.save_trade({
+                    self._save_trade_with_context({
                         "exchange": exchange_name, "symbol": symbol, "side": "close",
                         "price": price, "amount": result["size"], "pnl": result["pnl"],
                         "fee": result["fee"], "strategy": "hybrid",
@@ -1026,7 +1064,7 @@ class AutoTrader:
                             self.strategy_manager.record_loss()
                         else:
                             self.strategy_manager.record_win()
-                        self.storage.save_trade({
+                        self._save_trade_with_context({
                             "exchange": exchange_name, "symbol": symbol, "side": "close",
                             "price": live_result.get("exit_price", 0),
                             "amount": live_result.get("size", 0),
@@ -1077,7 +1115,7 @@ class AutoTrader:
                              "signal": 0, "confidence": 0,
                              "external_score": 0, "external_direction": "neutral"},
                         )
-                        self.storage.save_trade({
+                        self._save_trade_with_context({
                             "exchange": exchange_name, "symbol": symbol, "side": "close",
                             "price": price, "amount": result["size"], "pnl": stale_pnl,
                             "fee": result["fee"], "strategy": "auto_close",
@@ -1180,6 +1218,8 @@ class AutoTrader:
 
             # === 퀀트 시그널 계산 ===
             quant_risk_scale = 1.0
+            quant_score = 0.0
+            quant_regime = {}
             try:
                 ob_data = await self.collector.fetch_orderbook(exchange_name, symbol, limit=20)
                 ticker = await self.collector.fetch_ticker(exchange_name, symbol)
@@ -1302,6 +1342,25 @@ class AutoTrader:
                 self.equity = self.paper_trader.equity
                 self.total_pnl = self.equity - self.initial_capital
 
+            # 시그널 DB 기록 (hold 포함 모든 결정)
+            try:
+                _ml_score = ml_signal.get("signal", 0) if isinstance(ml_signal, dict) else float(ml_signal)
+                self.storage.save_signal(
+                    symbol=symbol, model="ensemble",
+                    signal=float(_ml_score), confidence=float(decision.confidence),
+                    metadata={
+                        "action": decision.action,
+                        "regime": adaptive_params["regime"],
+                        "quant_score": round(quant_score, 4),
+                        "quant_risk_scale": round(quant_risk_scale, 4),
+                        "quant_regime": quant_regime.get("regime", "?"),
+                        "sources": getattr(decision, 'confirming_sources', []),
+                        "reason": decision.reason[:200],
+                    },
+                )
+            except Exception as e:
+                logger.debug(f"[DB] signal 저장 실패: {e}")
+
             if decision.action not in ("long", "short", "close"):
                 return None
 
@@ -1331,6 +1390,9 @@ class AutoTrader:
                 "trade_type": trade_type,
                 "tp_pct": tp_profile.get("tp_pct", self.config["risk"]["take_profit_pct"]),
                 "sl_pct": tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"]),
+                "quant_score": quant_score,
+                "quant_risk_scale": quant_risk_scale,
+                "quant_regime": quant_regime.get("regime", "?"),
             }
 
         except Exception as e:
@@ -1385,7 +1447,7 @@ class AutoTrader:
                      "signal": c.get("ml_signal", 0), "confidence": c.get("confidence", 0),
                      "external_score": 0, "external_direction": "neutral"},
                 )
-                self.storage.save_trade({
+                self._save_trade_with_context({
                     "exchange": "paper", "symbol": symbol, "side": "close",
                     "price": c["price"], "amount": result.get("size", 0),
                     "pnl": paper_pnl, "fee": 0, "strategy": "paper_concentration",
@@ -1497,7 +1559,7 @@ class AutoTrader:
                     self.strategy_manager.record_loss()
                 else:
                     self.strategy_manager.record_win()
-                self.storage.save_trade({
+                self._save_trade_with_context({
                     "exchange": exchange_name, "symbol": symbol, "side": "close",
                     "price": live_result.get("exit_price", 0),
                     "amount": live_result.get("size", 0),
@@ -1539,7 +1601,7 @@ class AutoTrader:
             side = trade.get("side", "")
 
             # DB 저장
-            self.storage.save_trade({
+            self._save_trade_with_context({
                 "exchange": "paper", "symbol": symbol, "side": "close",
                 "price": trade.get("exit_price", 0),
                 "amount": trade.get("size", 0),
@@ -2177,7 +2239,7 @@ class AutoTrader:
                         else:
                             self.strategy_manager.record_win()
                         self.risk_manager.record_pnl(pnl)
-                        self.storage.save_trade({
+                        self._save_trade_with_context({
                             "exchange": "binance", "symbol": symbol, "side": "close",
                             "price": result.get("exit_price", 0),
                             "amount": result.get("size", 0),

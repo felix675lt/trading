@@ -198,5 +198,16 @@ class Storage:
         row = cursor.fetchone()
         return row[0] if row else None
 
+    def save_signal(self, symbol: str, model: str, signal: float,
+                    confidence: float, metadata: dict = None):
+        """매매 시그널 기록"""
+        self.conn.execute(
+            "INSERT INTO signals (timestamp, symbol, model, signal, confidence, metadata) "
+            "VALUES (?,?,?,?,?,?)",
+            (str(datetime.utcnow()), symbol, model, signal, confidence,
+             json.dumps(metadata or {})),
+        )
+        self.conn.commit()
+
     def close(self):
         self.conn.close()
