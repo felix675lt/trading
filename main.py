@@ -746,6 +746,15 @@ class AutoTrader:
                 quant_regime = qs.get("regime", {})
                 quant_score = qs.get("combined_score", 0)
 
+                logger.info(
+                    f"[Quant] {symbol} | score={quant_score:+.3f} | "
+                    f"regime={quant_regime.get('regime','?')} | "
+                    f"risk_scale={quant_risk_scale:.2f} | "
+                    f"OB={qs.get('orderbook',{}).get('imbalance',0):.3f} | "
+                    f"VPIN={qs.get('vpin',{}).get('vpin',0):.3f} | "
+                    f"basis={qs.get('basis',{}).get('basis_pct',0):.4f}"
+                )
+
                 # 퀀트 레짐이 ranging이면 추가 확신도 감소
                 if quant_regime.get("regime") == "ranging":
                     decision.confidence *= 0.6
@@ -770,7 +779,7 @@ class AutoTrader:
                         decision.reason += f" +퀀트합류({quant_score:+.2f})"
 
             except Exception as e:
-                logger.debug(f"[Quant] {symbol} 시그널 수집 실패: {e}")
+                logger.warning(f"[Quant] {symbol} 시그널 수집 실패: {e}")
                 quant_risk_scale = 1.0
 
             # 7.1. 포지션 상관관계 체크
@@ -1133,6 +1142,15 @@ class AutoTrader:
                 quant_regime = qs.get("regime", {})
                 quant_score = qs.get("combined_score", 0)
 
+                logger.info(
+                    f"[Quant] {symbol} | score={quant_score:+.3f} | "
+                    f"regime={quant_regime.get('regime','?')} | "
+                    f"risk_scale={quant_risk_scale:.2f} | "
+                    f"OB={qs.get('orderbook',{}).get('imbalance',0):.3f} | "
+                    f"VPIN={qs.get('vpin',{}).get('vpin',0):.3f} | "
+                    f"basis={qs.get('basis',{}).get('basis_pct',0):.4f}"
+                )
+
                 # 퀀트 레짐 횡보 → 진입 차단
                 if quant_regime.get("regime") == "ranging" and decision.action in ("long", "short"):
                     decision.confidence *= 0.6
@@ -1151,7 +1169,7 @@ class AutoTrader:
                         decision.confidence = min(decision.confidence * 1.15, 1.0)
                         decision.reason += f" +퀀트합류({quant_score:+.2f})"
             except Exception as e:
-                logger.debug(f"[Quant] {symbol} 시그널 실패: {e}")
+                logger.warning(f"[Quant] {symbol} 시그널 실패: {e}")
 
             # 동적 레버리지
             ext_agrees = (
