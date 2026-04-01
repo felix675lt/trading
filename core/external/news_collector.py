@@ -28,13 +28,30 @@ class NewsCollector:
     - CoinGecko 트렌딩 (키 불필요)
     """
 
-    # RSS 피드 목록 (CryptoPanic은 더 이상 무료 RSS 미제공)
+    # RSS 피드 목록 — 크립토 + 지정학 + 매크로 속보 종합
     RSS_FEEDS = [
+        # 크립토 전문
         ("coindesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
         ("cointelegraph", "https://cointelegraph.com/rss"),
+
+        # 지정학 속보 (중동/전쟁/제재/유가)
+        ("aljazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+        ("bbc_world", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+        ("bbc_mideast", "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml"),
+        ("investing_world", "https://www.investing.com/rss/news_287.rss"),
+        ("investing_commodities", "https://www.investing.com/rss/news_11.rss"),
+
+        # 매크로 경제 (금리/인플레/연준/달러)
+        ("bbc_business", "https://feeds.bbci.co.uk/news/business/rss.xml"),
+        ("investing_economy", "https://www.investing.com/rss/news_14.rss"),
+        ("investing_indicators", "https://www.investing.com/rss/news_95.rss"),
+        ("cnbc_economy", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
+        ("cnbc_world", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"),
+
+        # Google News (보충)
         ("google_crypto", "https://news.google.com/rss/search?q=cryptocurrency+bitcoin&hl=en-US&gl=US&ceid=US:en"),
-        ("google_geopolitics", "https://news.google.com/rss/search?q=oil+price+war+geopolitics+sanctions&hl=en-US&gl=US&ceid=US:en"),
-        ("google_macro", "https://news.google.com/rss/search?q=fed+rate+inflation+dxy+dollar&hl=en-US&gl=US&ceid=US:en"),
+        ("google_geopolitics", "https://news.google.com/rss/search?q=iran+hormuz+oil+war+sanctions+ceasefire&hl=en-US&gl=US&ceid=US:en"),
+        ("google_macro", "https://news.google.com/rss/search?q=fed+rate+cut+inflation+cpi+fomc&hl=en-US&gl=US&ceid=US:en"),
     ]
 
     COINGECKO_TRENDING = "https://api.coingecko.com/api/v3/search/trending"
@@ -43,7 +60,7 @@ class NewsCollector:
         self.news: list[dict] = []
         self.trending: list[dict] = []
         self.last_fetch: datetime | None = None
-        self.fetch_interval = timedelta(minutes=15)
+        self.fetch_interval = timedelta(minutes=3)  # 3분마다 뉴스 갱신 (속보 빠른 감지)
 
     async def fetch(self) -> dict:
         """뉴스 및 트렌딩 수집"""
@@ -72,7 +89,7 @@ class NewsCollector:
                 seen_titles.add(title_key)
                 unique_news.append(n)
 
-        self.news = unique_news[:50]  # 최대 50개
+        self.news = unique_news[:100]  # 최대 100개 (소스 다양화)
         self.last_fetch = now
 
         logger.info(f"[News] 총 {len(self.news)}개 뉴스 수집 (소스: {len([r for r in results[:-1] if isinstance(r, list) and r])}개)")
