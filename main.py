@@ -1749,6 +1749,7 @@ class AutoTrader:
                 c["notional"] = live_size * c["dynamic_lev"]
             except Exception as e:
                 logger.warning(f"[LIVE] 잔고 조회 실패: {e}")
+                return  # 잔고 확인 안 되면 LIVE 진입 차단
 
             result = await om.open_position(
                 symbol, c["action"], c["size"], c["dynamic_lev"],
@@ -2230,12 +2231,28 @@ class AutoTrader:
 
             # ──── 잔고 체크 ────
             balance_info = ""
+            if not self.exchange_clients:
+                balance_info = "Paper 전용 (거래소 미연결)"
             for name, client in self.exchange_clients.items():
                 try:
                     bal = await client.get_balance()
-                    balance_info = f"${bal.get('total', 0):,.2f} (가용: ${bal.get('free', 0):,.2f})"
-                except Exception:
-                    balance_info = "조회 실패"
+                    total = bal.get("total", 0) or 0
+                    free = bal.get("free", 0) or 0
+                    if total > 0:
+                        balance_info = f"${total:,.2f} (가용: ${free:,.2f})"
+                    else:
+                        balance_info = f"$0.00 (가용: $0.00)"
+                except Exception as e:
+                    err_msg = str(e)
+                    if "Invalid Api-Key" in err_msg or "invalid" in err_msg.lower():
+                        balance_info = f"❌ {name} API 키 무효 — 키 재발급 필요"
+                        issues.append(f"{name} API 키 인증 실패")
+                    elif "permission" in err_msg.lower():
+                        balance_info = f"❌ {name} API 권한 부족 — 선물 권한 확인"
+                        issues.append(f"{name} API 권한 부족")
+                    else:
+                        balance_info = f"❌ {name} 잔고조회 실패: {err_msg[:60]}"
+                    logger.warning(f"[진단] {name} 잔고 조회 실패: {e}")
 
             # === 리포트 생성 ===
             status = "✅ 정상" if not issues else f"⚠️ {len(issues)}건 문제"
