@@ -25,6 +25,8 @@ class PaperPosition:
 class PaperTrader:
     """실거래 없이 시뮬레이션하는 페이퍼 트레이딩 엔진"""
 
+    SL_COOLDOWN_SECONDS = 300  # SL 청산 후 5분간 같은 심볼 재진입 차단
+
     def __init__(self, initial_capital: float = 10000.0, commission: float = 0.0004,
                  trailing_config: dict | None = None,
                  trade_profiles: dict | None = None):
@@ -35,6 +37,7 @@ class PaperTrader:
         self.positions: dict[str, PaperPosition] = {}
         self.trade_history: list[dict] = []
         self.equity_history: list[dict] = []
+        self._sl_cooldown: dict[str, datetime] = {}  # symbol → SL 청산 시각
 
         # 트레일링 스탑 기본값 (fallback)
         tc = trailing_config or {}
@@ -68,6 +71,16 @@ class PaperTrader:
         if symbol in self.positions:
             logger.warning(f"[Paper] {symbol} 이미 포지션 보유")
             return None
+
+        # SL 쿨다운 체크
+        sl_time = self._sl_cooldown.get(symbol)
+        if sl_time:
+            elapsed = (datetime.utcnow() - sl_time).total_seconds()
+            if elapsed < self.SL_COOLDOWN_SECONDS:
+                logger.info(f"[Paper-쿨다운] {symbol} SL 후 재진입 차단 ({elapsed:.0f}s/{self.SL_COOLDOWN_SECONDS}s)")
+                return None
+            else:
+                del self._sl_cooldown[symbol]
 
         amount = (size_usdt * leverage) / price
         fee = size_usdt * self.commission
@@ -136,6 +149,11 @@ class PaperTrader:
         }
         self.trade_history.append(trade)
         del self.positions[symbol]
+
+        # SL 청산이면 쿨다운 등록
+        if "SL" in reason.upper() or "sl" in reason:
+            self._sl_cooldown[symbol] = datetime.utcnow()
+            logger.info(f"[Paper-쿨다운] {symbol} SL 청산 → {self.SL_COOLDOWN_SECONDS}초 재진입 차단")
 
         logger.info(f"[Paper] 포지션 청산: {symbol} | PnL: {net_pnl:.2f} | 사유: {reason}")
         return trade

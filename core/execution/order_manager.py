@@ -43,6 +43,8 @@ class Position:
 class OrderManager:
     """주문 실행 및 포지션 라이프사이클 관리 — 내부 SL/TP 모니터링"""
 
+    SL_COOLDOWN_SECONDS = 300  # SL 청산 후 5분간 같은 심볼 재진입 차단
+
     def __init__(self, exchange: ExchangeClient, risk_config: dict,
                  trailing_config: dict | None = None,
                  trade_profiles: dict | None = None):
@@ -53,6 +55,7 @@ class OrderManager:
         self._failed_attempts: dict[str, int] = {}
         self._on_sl_callback = None
         self._on_tp_callback = None
+        self._sl_cooldown: dict[str, datetime] = {}  # symbol → SL 청산 시각
 
         # 트레일링 스탑 기본값
         tc = trailing_config or {}
@@ -149,6 +152,21 @@ class OrderManager:
             logger.warning(f"{symbol} 이미 포지션 보유 중")
             return None
 
+        # SL 쿨다운: 최근 SL 청산 후 5분간 재진입 차단
+        sl_time = self._sl_cooldown.get(symbol)
+        if sl_time:
+            elapsed = (datetime.utcnow() - sl_time).total_seconds()
+            if elapsed < self.SL_COOLDOWN_SECONDS:
+                remaining = self.SL_COOLDOWN_SECONDS - elapsed
+                logger.info(
+                    f"[쿨다운] {symbol} SL 후 재진입 차단 | "
+                    f"{elapsed:.0f}초 경과 / {self.SL_COOLDOWN_SECONDS}초 필요 "
+                    f"(남은: {remaining:.0f}초)"
+                )
+                return None
+            else:
+                del self._sl_cooldown[symbol]
+
         # 연속 실패 쿨다운
         fails = self._failed_attempts.get(symbol, 0)
         if fails >= 3 and fails < 13:
@@ -230,7 +248,13 @@ class OrderManager:
             return None
 
     async def close_position(self, symbol: str, reason: str = "") -> dict:
-        """포지션 청산 — 시장가 청산"""
+        """포지션 전량 청산 — 거래소 실제 잔여 수량 확인 후 시장가 청산
+
+        버그 방지:
+        - 거래소에서 실제 포지션 사이즈를 조회하여 전량 청산
+        - 내부 추적 사이즈와 거래소 실제 사이즈 불일치 시 거래소 기준
+        - SL 청산 시 쿨다운 등록 (5분간 같은 심볼 재진입 차단)
+        """
         if symbol not in self.positions:
             return {}
 
@@ -242,11 +266,26 @@ class OrderManager:
             except Exception:
                 pass
 
-            # 시장가 청산
+            # 거래소 실제 포지션 사이즈 확인 — 전량 청산 보장
+            actual_size = pos.size
+            try:
+                exchange_pos = await self.exchange.get_position(symbol)
+                ex_size = exchange_pos.get("size", 0) if exchange_pos else 0
+                if ex_size > 0:
+                    if abs(ex_size - pos.size) / max(pos.size, 1) > 0.01:
+                        logger.warning(
+                            f"[청산] {symbol} 사이즈 불일치: 내부={pos.size:.6f} 거래소={ex_size:.6f} "
+                            f"→ 거래소 기준으로 전량 청산"
+                        )
+                    actual_size = ex_size
+            except Exception:
+                pass  # 조회 실패 시 내부 추적값 사용
+
+            # 시장가 전량 청산
             order = await self.exchange.close_position(
                 symbol,
                 fallback_side=pos.side,
-                fallback_size=pos.size,
+                fallback_size=actual_size,
             )
 
             if not order:
@@ -258,11 +297,17 @@ class OrderManager:
             pnl = 0.0
             if fill_price > 0:
                 if pos.side == "long":
-                    pnl = (fill_price - pos.entry_price) / pos.entry_price * pos.size * pos.entry_price
+                    pnl = (fill_price - pos.entry_price) / pos.entry_price * actual_size * pos.entry_price
                 else:
-                    pnl = (pos.entry_price - fill_price) / pos.entry_price * pos.size * pos.entry_price
+                    pnl = (pos.entry_price - fill_price) / pos.entry_price * actual_size * pos.entry_price
 
+            # 내부 포지션 삭제
             del self.positions[symbol]
+
+            # SL 청산이면 쿨다운 등록 (5분간 재진입 차단)
+            if "SL" in reason.upper() or "sl" in reason:
+                self._sl_cooldown[symbol] = datetime.utcnow()
+                logger.info(f"[쿨다운] {symbol} SL 청산 → {self.SL_COOLDOWN_SECONDS}초 재진입 차단 시작")
 
             logger.info(f"포지션 청산: {symbol} | PnL: {pnl:.2f} USDT | 사유: {reason}")
 
@@ -271,7 +316,7 @@ class OrderManager:
                 "side": pos.side,
                 "entry_price": pos.entry_price,
                 "exit_price": fill_price,
-                "size": pos.size,
+                "size": actual_size,
                 "pnl": pnl,
                 "reason": reason,
             }
