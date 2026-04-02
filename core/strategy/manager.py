@@ -276,36 +276,27 @@ class StrategyManager:
                 confidence *= 1.10
                 reason += " +트렌드일치"
 
-        # 2.7. 고임팩트 이벤트 오버라이드
+        # 2.7. 고임팩트 이벤트 오버라이드 [해제됨] — 로그만 남김
         if has_high_impact and abs(ext_score) > 0.4:
             if ext_direction == "bearish" and final_action == "long":
-                final_action = "hold"
-                reason = f"고임팩트-롱차단 (ext={ext_score:.2f})"
+                logger.info(f"[리스크해제] 고임팩트 롱차단 무시 (ext={ext_score:.2f})")
             elif ext_direction == "bullish" and final_action == "short":
-                final_action = "hold"
-                reason = f"고임팩트-숏차단 (ext={ext_score:.2f})"
+                logger.info(f"[리스크해제] 고임팩트 숏차단 무시 (ext={ext_score:.2f})")
 
-        # 2.8. 레짐 방향 바이어스 (펀딩비 + 공포탐욕 + 가격추세 종합)
+        # 2.8. 레짐 방향 바이어스 [해제됨] — 로그만 남김
         if final_action in ["long", "short"]:
             direction_block = self._regime_direction_bias(
                 final_action, funding_rate, fear_greed_index, mom_direction, mom_rsi,
             )
             if direction_block:
-                old_action = final_action
-                final_action = "hold"
-                confidence = 0.0
-                reason = direction_block
-                confirming = []
+                logger.info(f"[리스크해제] 레짐차단 무시: {direction_block}")
+                # 차단하지 않고 통과
 
-        # 2.9. 피드백 블랙리스트 필터
+        # 2.9. 피드백 블랙리스트 필터 [해제됨] — 로그만 남김
         if final_action in ["long", "short"] and feedback_blacklist:
             combo_key = "+".join(sorted(confirming))
             if combo_key in feedback_blacklist:
-                old_action = final_action
-                final_action = "hold"
-                confidence = 0.0
-                reason = f"피드백 블랙리스트 차단 ({combo_key} → {old_action})"
-                confirming = []
+                logger.info(f"[리스크해제] 블랙리스트 무시: {combo_key} → {final_action}")
 
         # 3. 최소 확신도 필터 (강화)
         if confidence < self.min_confidence and final_action not in ("close", "hold"):

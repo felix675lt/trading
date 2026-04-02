@@ -52,6 +52,11 @@ class NewsCollector:
         ("google_crypto", "https://news.google.com/rss/search?q=cryptocurrency+bitcoin&hl=en-US&gl=US&ceid=US:en"),
         ("google_geopolitics", "https://news.google.com/rss/search?q=iran+hormuz+oil+war+sanctions+ceasefire&hl=en-US&gl=US&ceid=US:en"),
         ("google_macro", "https://news.google.com/rss/search?q=fed+rate+cut+inflation+cpi+fomc&hl=en-US&gl=US&ceid=US:en"),
+
+        # 한국 거래소 상장 뉴스 (업비트/빗썸)
+        ("google_upbit_listing", "https://news.google.com/rss/search?q=%EC%97%85%EB%B9%84%ED%8A%B8+%EC%83%81%EC%9E%A5&hl=ko&gl=KR&ceid=KR:ko"),
+        ("google_bithumb_listing", "https://news.google.com/rss/search?q=%EB%B9%97%EC%8D%B8+%EC%83%81%EC%9E%A5&hl=ko&gl=KR&ceid=KR:ko"),
+        ("google_kr_listing_en", "https://news.google.com/rss/search?q=upbit+listing+OR+bithumb+listing+crypto&hl=en-US&gl=US&ceid=US:en"),
     ]
 
     COINGECKO_TRENDING = "https://api.coingecko.com/api/v3/search/trending"

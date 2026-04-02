@@ -48,37 +48,32 @@ class RiskManager:
         self.peak_equity = equity
 
     def check_can_trade(self, equity: float, num_positions: int) -> tuple[bool, str]:
-        """거래 가능 여부 확인"""
+        """거래 가능 여부 확인 (리스크 관리 해제 모드)"""
         self._check_daily_reset()
 
-        # 쿨다운 체크
+        # [해제됨] 쿨다운 체크 — 로그만 남김
         if self._cooldown_until and datetime.utcnow() < self._cooldown_until:
             remaining = (self._cooldown_until - datetime.utcnow()).seconds // 60
-            return False, f"쿨다운 중: {remaining}분 남음 (연패 {self.consecutive_losses}회 후)"
+            logger.info(f"[리스크해제] 쿨다운 무시: {remaining}분 남았으나 통과 (연패 {self.consecutive_losses}회)")
 
-        # 드로다운 체크
+        # [해제됨] 드로다운 체크 — 로그만 남김
         self.peak_equity = max(self.peak_equity, equity)
         drawdown = (self.peak_equity - equity) / self.peak_equity
         if drawdown > self.max_drawdown_pct:
-            self.is_trading_halted = True
-            self.halt_reason = f"최대 드로다운 초과: {drawdown:.2%} > {self.max_drawdown_pct:.2%}"
-            logger.warning(f"거래 중지: {self.halt_reason}")
-            return False, self.halt_reason
+            logger.info(f"[리스크해제] 드로다운 무시: {drawdown:.2%} > {self.max_drawdown_pct:.2%}")
 
-        # 일일 손실 체크
+        # [해제됨] 일일 손실 체크 — 로그만 남김
         daily_loss = -self.daily_pnl / self.initial_equity if self.initial_equity > 0 else 0
         if daily_loss > self.max_daily_loss_pct:
-            self.is_trading_halted = True
-            self.halt_reason = f"일일 최대 손실 초과: {daily_loss:.2%}"
-            logger.warning(f"거래 중지: {self.halt_reason}")
-            return False, self.halt_reason
+            logger.info(f"[리스크해제] 일일 손실 무시: {daily_loss:.2%}")
 
-        # 최대 포지션 수 체크
+        # 최대 포지션 수 체크 (이것만 유지 — 과다 포지션 방지)
         if num_positions >= self.max_open_positions:
             return False, f"최대 포지션 수 도달: {num_positions}/{self.max_open_positions}"
 
-        if self.is_trading_halted:
-            return False, self.halt_reason
+        # 거래 중지 상태 해제
+        self.is_trading_halted = False
+        self.halt_reason = ""
 
         return True, "OK"
 

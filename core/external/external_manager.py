@@ -217,8 +217,9 @@ class ExternalDataManager:
         real_macro = real_macro or {}
 
         # 각 카테고리 점수 (-1 ~ 1)
-        fg_score = fg.get("fg_normalized", 0)
-        fg_contrarian = -fg_score * 0.5
+        # [제거됨] 공포탐욕 지수 — 후행 지표, 예측력 없음, 노이즈만 추가
+        fg_score = 0.0
+        fg_contrarian = 0.0
 
         sentiment_score = sentiment.get("sentiment_avg", 0)
         macro_score = macro.get("macro_composite_score", 0)
@@ -247,19 +248,17 @@ class ExternalDataManager:
         real_macro_score = real_macro.get("real_macro_composite_score", 0)
         geo_risk = real_macro.get("real_macro_geo_risk", 0)
 
-        # 가중 평균 (v5 - 실제 매크로 추가)
+        # 가중 평균 (v6 - 공포탐욕 제거, 비중 재분배)
         composite = (
-            deriv_score * 0.16 +             # 파생상품
-            twitter_score * 0.14 +           # 크립토 트위터
-            real_macro_score * 0.12 +        # 실제 매크로 (신규)
-            poly_score * 0.07 +              # Polymarket 예측 시장
-            seasonal_score * 0.08 +          # 계절 사이클
-            fg_contrarian * 0.06 +           # 역발상 공포탐욕
-            fg_score * 0.04 +                # 순방향 공포탐욕
-            sentiment_score * 0.09 +         # NLP 센티먼트
-            macro_score * 0.06 +             # 매크로 (CoinGecko)
-            onchain_score * 0.08 +           # 온체인
-            social_score * 0.06 +            # Reddit 소셜
+            deriv_score * 0.18 +             # 파생상품 (16→18)
+            twitter_score * 0.15 +           # 크립토 트위터 (14→15)
+            real_macro_score * 0.14 +        # 실제 매크로 (12→14)
+            poly_score * 0.08 +              # Polymarket 예측 시장 (7→8)
+            seasonal_score * 0.08 +          # 계절 사이클 (유지)
+            sentiment_score * 0.10 +         # NLP 센티먼트 (9→10)
+            macro_score * 0.07 +             # 매크로 CoinGecko (6→7)
+            onchain_score * 0.10 +           # 온체인 (8→10)
+            social_score * 0.06 +            # Reddit 소셜 (유지)
             0.0 * 0.04                       # 뉴스 (이벤트 임팩트로 반영)
         )
 

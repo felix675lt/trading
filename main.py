@@ -749,6 +749,9 @@ class AutoTrader:
                         for om in self.order_managers.values():
                             await om.update_positions()
 
+                    # 스나이핑 포지션 펀비 기반 익절 체크
+                    await self._check_snipe_funding_exit()
+
                     # LIVE: 포지션 여유 있을 때만 신규 진입
                     if live_positions < max_live and candidates:
                         # 확신도 × (1 - priority/10) 로 최종 순위 결정
@@ -762,38 +765,30 @@ class AutoTrader:
                     for symbol in symbols:
                         await self._process_symbol(exchange_name, symbol, primary_tf)
 
-                # === 상장 시그널 스캔 (15분마다) ===
-                if self.listing_detector.exchange and loop_count % 30 == 0:
+                # === 상장 시그널 스캔 (5분마다 = 10루프) ===
+                if self.listing_detector.exchange and loop_count % 10 == 0:
                     try:
                         listing_signals = await self.listing_detector.scan_signals()
                         if listing_signals:
-                            tradeable = self.listing_detector.get_tradeable_signals(min_score=0.65)
-                            for sig in tradeable[:2]:  # 상위 2개만 거래 시도
-                                sym = sig["symbol"]
-                                if sym not in symbols:
-                                    # 동적으로 심볼 추가하여 처리
-                                    logger.info(
-                                        f"[ListingDetector] 🎯 {sig['coin']} ({sig['tier']}) "
-                                        f"score={sig['confidence']:.2f} → {sig['action']} "
-                                        f"사유: {', '.join(sig['reasons'])}"
+                            # 알림: 0.50 이상 전부 텔레그램
+                            for sig in listing_signals:
+                                if sig["score"] >= 0.50:
+                                    source_tag = "📰 상장뉴스" if sig.get("source") == "news" else "🔍 선매집"
+                                    tg_notify(
+                                        f"🎯 <b>{source_tag} 감지</b>\n"
+                                        f"━━━━━━━━━━━━━\n"
+                                        f"코인: <b>{sig['coin']}</b> ({sig.get('tier', '?')})\n"
+                                        f"점수: {sig['score']:.2f}\n"
+                                        f"24h: {sig.get('pct_24h', 0):+.1f}% | 볼륨: ${sig.get('volume_m', 0):.0f}M"
+                                        f"{' | 볼륨배율: ' + str(sig.get('vol_ratio', 0)) + 'x' if sig.get('vol_ratio', 0) > 1 else ''}\n"
+                                        f"사유: {', '.join(sig.get('reasons', []))}"
                                     )
-                                    add_live_log({
-                                        "time": datetime.utcnow().strftime("%H:%M:%S"),
-                                        "type": "listing_signal",
-                                        "message": f"🎯 상장시그널: {sig['coin']} ({sig['tier']}) "
-                                                   f"score={sig['confidence']:.2f} {', '.join(sig['reasons'])}",
-                                    })
-                                    # 시그널이 강하면 텔레그램 알림
-                                    if sig["confidence"] >= 0.75:
-                                        tg_notify(
-                                            f"🎯 <b>상장 시그널 감지</b>\n"
-                                            f"━━━━━━━━━━━━━\n"
-                                            f"코인: <b>{sig['coin']}</b> ({sig['tier']})\n"
-                                            f"점수: {sig['confidence']:.2f}\n"
-                                            f"방향: {sig['action']}\n"
-                                            f"사유: {', '.join(sig['reasons'])}"
-                                        )
-                            # 대시보드에 리포트 반영
+
+                            # 거래: 0.65 이상 → 10% 시드 + 고배율 스나이핑
+                            tradeable = self.listing_detector.get_tradeable_signals()
+                            for sig in tradeable[:2]:
+                                await self._execute_listing_snipe(exchange_name, sig)
+
                             self.last_external["listing"] = self.listing_detector.get_report()
                     except Exception as e:
                         logger.debug(f"[ListingDetector] 스캔 실패: {e}")
@@ -919,7 +914,7 @@ class AutoTrader:
         # 5. 전략 결정 (ML + RL + 외부 요인 + MTF + 모멘텀 + 레짐 바이어스 통합)
         ext_features_all = self.external_manager.get_all_features()
         funding_rate = ext_features_all.get("deriv_funding_rate", 0)
-        fear_greed = ext_features_all.get("fg_value", 50)
+        fear_greed = 50.0  # [제거됨] 공포탐욕 지수 비활성화
 
         current_position = 0.0
         if self.mode in ("paper", "dual"):
@@ -945,25 +940,18 @@ class AutoTrader:
                 (decision.action == "short" and mtf_dir == "bearish")
             )
 
-            # 강한 MTF 반대 (합의 75%+) → 진입 차단
+            # [해제됨] 강한 MTF 반대 — 로그만 남김
             if action_opposes_mtf and mtf_agreement >= 0.75:
                 logger.info(
-                    f"[MTF] {symbol} {decision.action} 차단 — "
+                    f"[리스크해제] MTF 강반대 무시 — "
                     f"MTF {mtf_dir} 합의 {mtf_agreement:.0%} (conf={decision.confidence:.2f})"
                 )
-                decision.action = "hold"
-                decision.confidence = 0.0
-                decision.size = 0.0
-                decision.reason = f"MTF 강반대 차단 ({mtf_dir} {mtf_agreement:.0%})"
+                decision.reason += f" !MTF반대무시({mtf_dir} {mtf_agreement:.0%})"
 
-            # 약한 MTF 반대 (50~75%) → 확신도 40% 감소
+            # [해제됨] 약한 MTF 반대 — 확신도 감소 없이 로그만
             elif action_opposes_mtf and mtf_agreement >= 0.5:
-                decision.confidence *= 0.6
-                decision.reason += f" ! MTF반대({mtf_dir} {mtf_agreement:.0%})"
-                if decision.confidence < self.strategy_manager.min_confidence:
-                    decision.action = "hold"
-                    decision.size = 0.0
-                    decision.reason += " → 확신도부족"
+                logger.info(f"[리스크해제] MTF 약반대 무시 ({mtf_dir} {mtf_agreement:.0%})")
+                decision.reason += f" !MTF약반대무시({mtf_dir} {mtf_agreement:.0%})"
 
             # MTF 합류 확인 시 확신도 부스트
             elif action_agrees_mtf and mtf_agreement > 0.7:
@@ -1034,8 +1022,7 @@ class AutoTrader:
             self.last_signals["anomalies"] = [a["message"] for a in alerts]
             high_alerts = [a for a in alerts if a["severity"] == "high"]
             if high_alerts and decision.action in ["long", "short"]:
-                logger.warning(f"[Anomaly] 이상 감지로 진입 보류: {high_alerts[0]['message']}")
-                return
+                logger.info(f"[리스크해제] 이상 감지 무시: {high_alerts[0]['message']}")
 
         # 6. 리스크 체크
         num_positions = len(self.paper_trader.positions) if self.mode in ("paper", "dual") else 0
@@ -1045,7 +1032,7 @@ class AutoTrader:
             logger.info(f"{symbol} 거래 차단: {risk_msg}")
             return
 
-        # 6.5. 피드백 필터 (과거 거래 결과 기반)
+        # 6.5. 피드백 필터 [해제됨] — 로그만 남김
         if decision.action in ["long", "short"]:
             from datetime import datetime as dt
             fb_ok, fb_reason = self.feedback.should_trade_now(
@@ -1055,8 +1042,7 @@ class AutoTrader:
                 signal_strength=ml_signal.get("signal", 0),
             )
             if not fb_ok:
-                logger.info(f"[Feedback] {symbol} 거래 차단: {fb_reason}")
-                return
+                logger.info(f"[리스크해제] 피드백 차단 무시: {fb_reason}")
 
         # 7. 주문 실행
         if decision.action in ["long", "short"]:
@@ -1431,7 +1417,7 @@ class AutoTrader:
             # 펀딩비 + 공포탐욕 지수 (레짐 바이어스용)
             ext_features = self.external_manager.get_all_features()
             funding_rate = ext_features.get("deriv_funding_rate", 0)
-            fear_greed = ext_features.get("fg_value", 50)
+            fear_greed = 50.0  # [제거됨] 공포탐욕 지수 비활성화
 
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
             decision = self.strategy_manager.decide(
@@ -1714,14 +1700,155 @@ class AutoTrader:
                 logger.info(f"[PAPER] 청산 {symbol} | PnL: ${paper_pnl:.2f} → 학습기록 완료")
                 tg_notify(format_trade_close("PAPER", symbol, paper_pnl, c["reason"], result.get("duration_minutes", 0)), silent=True)
 
+    async def _execute_listing_snipe(self, exchange_name: str, sig: dict):
+        """상장 스나이핑 — 시드 10% + 고배율(10x) + 안전 필터 + 펀비 익절
+
+        선매집 또는 상장 뉴스 감지 시 바이낸스 선물에서 즉시 롱 진입.
+        안전 필터: 유통비율 30% 미만 or 언락 뉴스 → 진입 금지.
+        펀비 익절: 펀비 -0.5% 이하(숏 극단) + 수익권 → 즉시 익절.
+        """
+        if self.mode not in ("live", "dual"):
+            return
+
+        om = self.order_managers.get(exchange_name)
+        if not om:
+            return
+
+        symbol = sig["symbol"]
+        coin = sig["coin"]
+
+        # 이미 포지션 보유 중이면 스킵
+        if symbol in om.positions:
+            return
+        if symbol in self.paper_trader.positions:
+            return
+
+        # === 안전 체크: 유통비율 + 언락 뉴스 ===
+        safe, reason = self.listing_detector.check_token_safety(coin)
+        if not safe:
+            logger.info(f"[스나이핑] ⚠️ {coin} 진입 차단: {reason}")
+            tg_notify(
+                f"⚠️ <b>스나이핑 차단</b>\n"
+                f"코인: {coin} | 사유: {reason}"
+            )
+            return
+
+        try:
+            balance = await om.exchange.get_balance()
+            live_free = balance.get("free", 0)
+
+            snipe_size = live_free * 0.10
+            snipe_leverage = 10
+
+            if snipe_size < 2:
+                logger.info(f"[스나이핑] {coin} 잔고 부족 (free=${live_free:.2f})")
+                return
+
+            result = await om.open_position(
+                symbol=symbol,
+                side="long",
+                size_usdt=snipe_size,
+                leverage=snipe_leverage,
+                sl_pct=0.05,
+                tp_pct=0.20,
+                trade_type="scalp",
+            )
+
+            if result:
+                notional = snipe_size * snipe_leverage
+                source_tag = "📰상장뉴스" if sig.get("source") == "news" else "🔍선매집"
+                logger.info(
+                    f"[스나이핑🎯] LONG {symbol} | "
+                    f"${snipe_size:.2f} × {snipe_leverage}x = ${notional:.2f} | "
+                    f"SL:5% TP:20% | {source_tag} score={sig['confidence']:.2f}"
+                )
+                tg_notify(
+                    f"🎯 <b>상장 스나이핑 진입!</b>\n"
+                    f"━━━━━━━━━━━━━\n"
+                    f"코인: <b>{coin}</b> ({sig.get('tier', '?')})\n"
+                    f"방향: LONG × {snipe_leverage}x\n"
+                    f"마진: ${snipe_size:.2f} (시드 10%)\n"
+                    f"노셔널: ${notional:.2f}\n"
+                    f"SL: 5% | TP: 20% (트레일링)\n"
+                    f"점수: {sig['confidence']:.2f} | {source_tag}\n"
+                    f"사유: {', '.join(sig.get('reasons', []))}"
+                )
+            else:
+                logger.warning(f"[스나이핑] {coin} 진입 실패")
+
+        except Exception as e:
+            logger.error(f"[스나이핑] {coin} 실행 오류: {e}")
+
+    async def _check_snipe_funding_exit(self):
+        """스나이핑 포지션 펀비 기반 익절 — 매 루프마다 호출
+
+        펀비가 극단적 음수(-0.5% 이하) = 숏 최대치 = 세력 던지기 직전
+        이 시점에 수익권이면 바로 익절하고 나옴.
+        """
+        for name, om in self.order_managers.items():
+            for symbol, pos in list(om.positions.items()):
+                try:
+                    # 현재 펀딩비 조회
+                    import json, urllib.request
+                    binance_sym = symbol.replace("/", "").replace(":USDT", "")
+                    url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={binance_sym}"
+                    data = json.loads(urllib.request.urlopen(url, timeout=5).read())
+                    funding_rate = float(data.get("lastFundingRate", 0))
+
+                    # 현재가
+                    price = await om.exchange.get_ticker_price(symbol)
+
+                    # 수익률 계산
+                    if pos.side == "long":
+                        profit_pct = (price - pos.entry_price) / pos.entry_price
+                    else:
+                        profit_pct = (pos.entry_price - price) / pos.entry_price
+
+                    # === 펀비 익절 조건 ===
+                    # 펀비 -0.5% 이하 (숏 극단) + 수익 1% 이상 → 즉시 익절
+                    if funding_rate <= -0.005 and profit_pct >= 0.01:
+                        logger.info(
+                            f"[펀비익절] {symbol} 펀비={funding_rate*100:.2f}% 극단 숏 + "
+                            f"수익 {profit_pct:.1%} → 즉시 익절"
+                        )
+                        result = await om.close_position(symbol, f"펀비 익절 (FR={funding_rate*100:.2f}%)")
+                        if result:
+                            pnl = result.get("pnl", 0)
+                            tg_notify(
+                                f"💰 <b>펀비 익절 완료</b>\n"
+                                f"━━━━━━━━━━━━━\n"
+                                f"코인: {symbol}\n"
+                                f"수익: ${pnl:.2f} ({profit_pct:.1%})\n"
+                                f"펀딩비: {funding_rate*100:.2f}% (숏 극단)\n"
+                                f"📝 숏 최대치 → 덤프 전 탈출"
+                            )
+
+                    # 펀비 -1% 이하 = 초극단 → 수익 0%만 넘어도 바로 탈출
+                    elif funding_rate <= -0.01 and profit_pct > 0:
+                        logger.info(
+                            f"[긴급탈출] {symbol} 펀비={funding_rate*100:.2f}% 초극단 + "
+                            f"수익 {profit_pct:.1%} → 긴급 탈출"
+                        )
+                        result = await om.close_position(symbol, f"긴급 탈출 (FR={funding_rate*100:.2f}%)")
+                        if result:
+                            pnl = result.get("pnl", 0)
+                            tg_notify(
+                                f"🚨 <b>긴급 탈출 완료</b>\n"
+                                f"코인: {symbol} | PnL: ${pnl:.2f}\n"
+                                f"펀딩비: {funding_rate*100:.2f}% — 초극단 숏"
+                            )
+
+                except Exception as e:
+                    logger.debug(f"[펀비체크] {symbol} 실패: {e}")
+
     async def _execute_live(self, exchange_name: str, c: dict):
         """LIVE 포지션 실행 — 가장 강한 시그널에만"""
         if self.mode not in ("live", "dual"):
             return
-        # 자가진단에 의한 LIVE 일시정지 상태면 신규 진입 차단
+        # [해제됨] LIVE 일시정지 — 로그만 남김
         if getattr(self, '_live_paused', False):
-            logger.info(f"[LIVE] 일시정지 상태 — 신규 진입 차단 (사유: {getattr(self, '_live_pause_reason', '?')})")
-            return
+            logger.info(f"[리스크해제] LIVE 일시정지 무시 (사유: {getattr(self, '_live_pause_reason', '?')})")
+            self._live_paused = False  # 강제 해제
         symbol = c["symbol"]
         om = self.order_managers.get(exchange_name)
         if not om:
