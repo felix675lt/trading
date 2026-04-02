@@ -962,6 +962,230 @@ class ListingDetector:
         self._backer_cache_time[coin_id] = now
         return result
 
+    # ═══════════════════════════════════════════════════════════
+    #  VC 언락 펌프 스캐너 — 4주 전 롱 진입 자동 탐지
+    # ═══════════════════════════════════════════════════════════
+    #
+    # Keyrock 16,000건 분석: 90% 언락은 하락. BUT 10%는 S-Tier VC가 펌프.
+    # 전략: S/A-Tier 백커 + 28일 내 대규모 언락 → 미리 롱 매집
+    # 사례: STO(+2212%), APE(+16%), SUI(+110%), APT(숏스퀴즈)
+
+    UNLOCK_PUMP_SCAN_DAYS = 28     # 향후 28일 (4주) 내 언락 스캔
+    UNLOCK_PUMP_MIN_PCT = 1.0      # 최소 1% 이상 언락 예정
+    UNLOCK_PUMP_SCAN_INTERVAL = 3600 * 12  # 12시간마다 스캔
+
+    # DefiLlama 313개 중 바이낸스 선물에 있는 주요 코인 (심볼 → 슬러그)
+    DEFILLAMA_SCANLIST = {
+        "W": "wormhole", "TIA": "celestia", "ZRO": "zro",
+        "ENA": "ethena", "HYPE": "hyperliquid", "APT": "aptos",
+        "ARB": "arbitrum", "STRK": "starknet", "SUI": "sui",
+        "SEI": "sei", "DYM": "dymension", "ALT": "altlayer",
+        "MANTA": "manta", "JUP": "jupiter", "PENDLE": "pendle",
+        "EIGEN": "eigenlayer", "ETHFI": "etherfi", "ONDO": "ondo",
+        "PYTH": "pyth", "OP": "optimism", "DYDX": "dydx",
+        "DRIFT": "drift", "STO": "stakestone", "AEVO": "aevo",
+        "BLAST": "blast", "ZK": "zk", "PORTAL": "portal",
+        "PIXEL": "pixels", "KAITO": "kaito", "PUMP": "pumpfun",
+        "IMX": "immutable", "AXS": "axs", "GMT": "gmt",
+        "LINK": "chainlink", "UNI": "uniswap", "AAVE": "aave",
+        "SNX": "synthetix", "CRV": "curve-finance", "GRT": "thegraph",
+        "ENS": "ens", "MOCA": "moca", "IO": "ionet",
+        "MOVE": "move", "SONIC": "sonic", "INIT": "initia",
+        "BERA": "berachain", "TRUMP": "trump", "MELANIA": "melania",
+        "USUAL": "usual", "REZ": "renzo", "SAGA": "saga",
+    }
+
+    def scan_vc_unlock_pumps(self) -> list[dict]:
+        """313개 프로토콜 중 바이낸스 선물 코인 대상으로
+        '4주 내 대규모 언락 + S/A-Tier 백커' 조합 자동 탐지
+
+        Returns: [{"coin", "slug", "unlock_pct", "unlock_date", "backer_tier", "backers", "score", ...}]
+        """
+        now = time.time()
+
+        # 캐시 확인
+        if hasattr(self, '_vc_pump_cache_time') and (now - self._vc_pump_cache_time) < self.UNLOCK_PUMP_SCAN_INTERVAL:
+            return getattr(self, '_vc_pump_cache', [])
+
+        logger.info("[ListingDetector] 🔍 VC 언락 펌프 스캐너 시작 (4주 윈도우)...")
+        candidates = []
+
+        for coin_sym, slug in self.DEFILLAMA_SCANLIST.items():
+            try:
+                # 1. 언락 스케줄 확인 (28일 윈도우)
+                unlock = self._check_unlock_schedule_custom(slug, self.UNLOCK_PUMP_SCAN_DAYS)
+                if not unlock or unlock.get("unlock_pct", 0) < self.UNLOCK_PUMP_MIN_PCT:
+                    continue
+
+                # 2. 백커 확인 — S/A Tier만
+                backer = self._check_backers(slug)
+                if backer.get("tier") not in ("S", "A"):
+                    continue
+
+                # 3. 점수 계산
+                unlock_pct = unlock["unlock_pct"]
+                score = 0.0
+
+                # 언락 규모 점수 (1~5%: 0.2~0.5, 5%+: 0.5~0.8)
+                if unlock_pct >= 5.0:
+                    score += min(0.8, 0.5 + (unlock_pct - 5) * 0.03)
+                elif unlock_pct >= 2.0:
+                    score += 0.3 + (unlock_pct - 2) * 0.067
+                else:
+                    score += 0.2
+
+                # 백커 등급 보너스
+                if backer["tier"] == "S":
+                    score += 0.3
+                elif backer["tier"] == "A":
+                    score += 0.2
+
+                # 첫 언락까지 남은 시간 (가까울수록 높은 점수)
+                first_event = min(unlock["events"], key=lambda e: e["timestamp"]) if unlock["events"] else None
+                if first_event:
+                    days_until = (first_event["timestamp"] - now) / 86400
+                    if days_until <= 7:
+                        score += 0.15  # 1주 이내 = 펌프 최고조
+                    elif days_until <= 14:
+                        score += 0.10
+                    elif days_until <= 21:
+                        score += 0.05
+
+                candidates.append({
+                    "coin": coin_sym,
+                    "slug": slug,
+                    "unlock_pct": round(unlock_pct, 2),
+                    "unlock_events": unlock["events"][:5],
+                    "first_unlock_date": first_event["date"] if first_event else "N/A",
+                    "days_until_unlock": round((first_event["timestamp"] - now) / 86400, 1) if first_event else 99,
+                    "backer_tier": backer["tier"],
+                    "backers": backer["names"][:4],
+                    "score": round(min(score, 1.0), 3),
+                    "action": "long",
+                    "source": "vc_unlock_pump",
+                    "strategy": (
+                        f"🏦 {backer['tier']}-Tier VC ({', '.join(backer['names'][:2])}) + "
+                        f"언락 {unlock_pct:.1f}% in {round((first_event['timestamp'] - now) / 86400)}일"
+                        if first_event else ""
+                    ),
+                })
+                logger.info(
+                    f"[ListingDetector] 🎯 VC펌프 후보: {coin_sym} | "
+                    f"언락 {unlock_pct:.1f}% | {backer['tier']}-Tier: {', '.join(backer['names'][:2])} | "
+                    f"score={score:.2f}"
+                )
+
+            except Exception as e:
+                logger.debug(f"[ListingDetector] {coin_sym}/{slug} 스캔 실패: {e}")
+                continue
+
+        # 점수순 정렬
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        self._vc_pump_cache = candidates
+        self._vc_pump_cache_time = now
+
+        if candidates:
+            top_str = ", ".join(f"{c['coin']}({c['score']:.2f})" for c in candidates[:5])
+            logger.info(f"[ListingDetector] 🏦 VC 언락 펌프 후보 {len(candidates)}건 | Top: {top_str}")
+        else:
+            logger.info("[ListingDetector] VC 언락 펌프 후보 없음")
+
+        return candidates
+
+    def _check_unlock_schedule_custom(self, coin_id: str, days: int) -> dict | None:
+        """커스텀 윈도우 기간으로 언락 스케줄 확인"""
+        now = time.time()
+
+        # 기존 캐시에서 raw 데이터 재활용
+        cache_key = f"{coin_id}_raw"
+        ts_content = None
+
+        if cache_key in self._unlock_cache:
+            ts_content = self._unlock_cache[cache_key]
+        else:
+            try:
+                url = f"{self.DEFILLAMA_EMISSIONS_BASE}/{coin_id}.ts"
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                resp = urllib.request.urlopen(req, timeout=10)
+                ts_content = resp.read().decode("utf-8")
+                self._unlock_cache[cache_key] = ts_content
+            except Exception:
+                return None
+
+        if not ts_content:
+            return None
+
+        # 커스텀 윈도우로 파싱
+        return self._parse_emissions_ts_custom(ts_content, coin_id, days)
+
+    def _parse_emissions_ts_custom(self, ts_content: str, coin_id: str, days: int) -> dict:
+        """커스텀 윈도우 기간으로 TypeScript 파싱"""
+        now = time.time()
+        window_start = now
+        window_end = now + days * 86400
+
+        total_supply = self._extract_number(ts_content, r'totalSupply\s*=\s*([\d_]+)')
+        start_ts = self._extract_number(ts_content, r'(?:const\s+)?start\s*=\s*(\d{10})')
+
+        if not total_supply or total_supply == 0:
+            total_supply = 1_000_000_000
+
+        YEAR = 31_536_000
+        MONTH = 2_628_000
+
+        events = []
+        total_unlock = 0.0
+        flat = _re.sub(r'\s+', ' ', ts_content)
+
+        # manualCliff
+        cliff_pattern = r'manualCliff\s*\(\s*([^,]+?)\s*,\s*(.+?)\s*\)(?:\s*[,\]\)])'
+        for match in _re.finditer(cliff_pattern, flat):
+            ts_expr = match.group(1).strip().rstrip(",").strip()
+            amount_expr = match.group(2).strip().rstrip(",").strip()
+            ts_val = self._eval_ts_expr(ts_expr, start_ts, YEAR, MONTH)
+            amount_val = self._eval_amount_expr(amount_expr, ts_content, total_supply)
+            if ts_val and amount_val and window_start <= ts_val <= window_end:
+                pct = (amount_val / total_supply) * 100
+                total_unlock += amount_val
+                events.append({
+                    "type": "cliff", "timestamp": ts_val,
+                    "date": datetime.utcfromtimestamp(ts_val).strftime("%Y-%m-%d"),
+                    "amount": amount_val, "pct": round(pct, 2),
+                })
+
+        # manualStep
+        step_pattern = r'manualStep\s*\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*(.+?)\s*,?\s*\)(?:\s*[,\]\)])'
+        for match in _re.finditer(step_pattern, flat):
+            start_expr = match.group(1).strip().rstrip(",")
+            interval_expr = match.group(2).strip().rstrip(",")
+            steps_expr = match.group(3).strip().rstrip(",")
+            amount_expr = match.group(4).strip().rstrip(",")
+            step_start = self._eval_ts_expr(start_expr, start_ts, YEAR, MONTH)
+            interval = self._eval_ts_expr(interval_expr, start_ts, YEAR, MONTH)
+            n_steps = self._eval_simple(steps_expr)
+            per_step = self._eval_amount_expr(amount_expr, ts_content, total_supply)
+            if step_start and interval and n_steps and per_step:
+                for i in range(int(n_steps)):
+                    unlock_ts = step_start + interval * i
+                    if unlock_ts > window_end:
+                        break
+                    if window_start <= unlock_ts <= window_end:
+                        pct = (per_step / total_supply) * 100
+                        total_unlock += per_step
+                        events.append({
+                            "type": "step", "timestamp": unlock_ts,
+                            "date": datetime.utcfromtimestamp(unlock_ts).strftime("%Y-%m-%d"),
+                            "amount": per_step, "pct": round(pct, 2),
+                        })
+
+        total_pct = (total_unlock / total_supply) * 100 if total_supply > 0 else 0
+        return {
+            "has_danger": total_pct >= self.UNLOCK_PUMP_MIN_PCT,
+            "unlock_pct": round(total_pct, 2),
+            "events": sorted(events, key=lambda e: e["timestamp"]),
+        }
+
     def get_tradeable_signals(self, min_score: float = None) -> list[dict]:
         """거래 가능한 시그널 반환"""
         threshold = min_score or self.TRADE_THRESHOLD

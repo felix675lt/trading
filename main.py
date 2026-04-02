@@ -793,6 +793,31 @@ class AutoTrader:
                     except Exception as e:
                         logger.debug(f"[ListingDetector] 스캔 실패: {e}")
 
+                # === VC 언락 펌프 스캐너 (12시간마다) ===
+                if self.listing_detector.exchange and loop_count % 1440 == 5:
+                    # 1440 루프 × 30초 ≈ 12시간, +5 오프셋으로 상장 스캔과 분리
+                    try:
+                        vc_candidates = self.listing_detector.scan_vc_unlock_pumps()
+                        if vc_candidates:
+                            # 텔레그램 알림: VC 펌프 후보 리스트
+                            top5 = vc_candidates[:5]
+                            lines = [f"🏦 <b>VC 언락 펌프 후보 ({len(vc_candidates)}건)</b>", "━━━━━━━━━━━━━"]
+                            for c in top5:
+                                lines.append(
+                                    f"<b>{c['coin']}</b> | 점수: {c['score']:.2f}\n"
+                                    f"  언락: {c['unlock_pct']}% ({c['first_unlock_date']})\n"
+                                    f"  백커: {c['backer_tier']}-Tier {', '.join(c['backers'][:2])}"
+                                )
+                            tg_notify("\n".join(lines))
+
+                            # 자동 진입: 상위 2개, score 0.60 이상
+                            for c in top5[:2]:
+                                if c["score"] >= 0.60:
+                                    await self._execute_vc_pump_entry(exchange_name, c)
+
+                    except Exception as e:
+                        logger.debug(f"[VC언락펌프] 스캔 실패: {e}")
+
                 loop_count += 1
 
                 # === equity_curve 기록 (5분마다 = 10루프) ===
@@ -1778,6 +1803,95 @@ class AutoTrader:
 
         except Exception as e:
             logger.error(f"[스나이핑] {coin} 실행 오류: {e}")
+
+    async def _execute_vc_pump_entry(self, exchange_name: str, candidate: dict):
+        """VC 언락 펌프 전략 — 4주 전 롱 매집
+
+        조건: S/A-Tier 백커 + 28일 내 대규모 언락 예정
+        전략: 시드 10% × 5x 레버리지 (스나이핑보다 보수적), SL 8%, TP 30%
+        원리: VC가 언락 전 가격을 올려서 더 높은 가격에 매도하는 패턴 활용
+        데이터: Keyrock 16,000건 중 S-Tier VC + 대규모 언락 = 상위 10% 펌프
+        """
+        if self.mode not in ("live", "dual"):
+            return
+
+        om = self.order_managers.get(exchange_name)
+        if not om:
+            return
+
+        coin = candidate["coin"]
+        # 바이낸스 선물 심볼 조회
+        symbol = self.listing_detector._binance_futures.get(coin)
+        if not symbol:
+            logger.debug(f"[VC펌프] {coin} 바이낸스 선물 심볼 없음")
+            return
+
+        # 이미 포지션 보유 중이면 스킵
+        if symbol in om.positions:
+            return
+        if symbol in self.paper_trader.positions:
+            return
+
+        # 이미 너무 올랐으면 진입 금지 (늦은 진입 방지)
+        try:
+            ticker = await om.exchange.exchange.fetch_ticker(symbol)
+            pct_24h = ticker.get("percentage", 0) or 0
+            if abs(pct_24h) > 50:
+                logger.info(f"[VC펌프] {coin} 이미 24h {pct_24h:+.0f}% — 늦은 진입 스킵")
+                return
+        except Exception:
+            pass
+
+        try:
+            balance = await om.exchange.get_balance()
+            live_free = balance.get("free", 0)
+
+            # 시드 10% × 5x (스나이핑보다 보수적 — 4주 홀딩이므로)
+            pump_size = live_free * 0.10
+            pump_leverage = 5
+            pump_sl = 0.08       # SL 8% (넓은 스탑 — 4주 변동성 수용)
+            pump_tp = 0.30       # TP 30%
+
+            if pump_size < 2:
+                logger.info(f"[VC펌프] {coin} 잔고 부족 (free=${live_free:.2f})")
+                return
+
+            result = await om.open_position(
+                symbol=symbol,
+                side="long",
+                size_usdt=pump_size,
+                leverage=pump_leverage,
+                sl_pct=pump_sl,
+                tp_pct=pump_tp,
+                trade_type="swing",  # 스윙 트레이드 (장기 홀딩)
+            )
+
+            if result:
+                notional = pump_size * pump_leverage
+                logger.info(
+                    f"[VC펌프🏦] LONG {symbol} | "
+                    f"${pump_size:.2f} × {pump_leverage}x = ${notional:.2f} | "
+                    f"SL:{pump_sl:.0%} TP:{pump_tp:.0%} | "
+                    f"{candidate['backer_tier']}-Tier: {', '.join(candidate['backers'][:2])} | "
+                    f"언락: {candidate['unlock_pct']}% in {candidate['days_until_unlock']:.0f}일"
+                )
+                tg_notify(
+                    f"🏦 <b>VC 언락 펌프 진입!</b>\n"
+                    f"━━━━━━━━━━━━━\n"
+                    f"코인: <b>{coin}</b>\n"
+                    f"방향: LONG × {pump_leverage}x\n"
+                    f"마진: ${pump_size:.2f} (시드 10%)\n"
+                    f"노셔널: ${notional:.2f}\n"
+                    f"SL: {pump_sl:.0%} | TP: {pump_tp:.0%}\n"
+                    f"백커: {candidate['backer_tier']}-Tier | {', '.join(candidate['backers'][:3])}\n"
+                    f"언락: {candidate['unlock_pct']}% | {candidate['first_unlock_date']}\n"
+                    f"전략: {candidate.get('strategy', '')}"
+                )
+            else:
+                logger.warning(f"[VC펌프] {coin} 진입 실패")
+
+        except Exception as e:
+            logger.error(f"[VC펌프] {coin} 실행 오류: {e}")
 
     async def _check_snipe_funding_exit(self):
         """스나이핑 포지션 펀비 기반 익절 — 매 루프마다 호출
