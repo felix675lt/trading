@@ -257,6 +257,13 @@ class AutoTrader:
                 "oil price", "opec", "embargo", "strait", "hormuz",
                 "conflict", "airstrike", "escalat", "de-escalat",
                 "negotiate", "deal", "treaty", "withdraw",
+                "oman", "houthi", "yemen", "hezbollah", "gaza", "israel",
+                "taiwan", "china", "nato", "russia", "ukraine",
+                "oil surge", "oil crash", "crude", "brent",
+                "protocol", "shipping", "blockade", "naval",
+                # 한국어 키워드 (한국 뉴스 소스용)
+                "전쟁", "제재", "미사일", "휴전", "평화", "핵",
+                "호르무즈", "이란", "유가", "원유", "관세",
             ]
             CRYPTO_IMPACT_KEYWORDS = [
                 "etf approved", "etf approval", "etf rejected", "etf denied",
@@ -269,7 +276,7 @@ class AutoTrader:
                 "delisting", "listing", "blackrock",
             ]
 
-            for n in news_list[:50]:
+            for n in news_list:  # 전체 뉴스 스캔 ([:50] 제한 제거 — 지정학 뉴스가 뒤에 있을 수 있음)
                 title = n.get("title", "")
                 title_lower = title.lower()
                 title_key = title[:80]
