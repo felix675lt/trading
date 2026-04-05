@@ -517,6 +517,14 @@ class AutoTrader:
                     f"📝 피드백 학습에 기록됨"
                 )
 
+                # 선매집 거래 쿨다운 등록 (2시간 재진입 차단)
+                try:
+                    coin_name = symbol.split("/")[0]
+                    if hasattr(self, 'listing_detector'):
+                        self.listing_detector.register_trade_cooldown(coin_name)
+                except Exception:
+                    pass
+
                 # 손실 시 즉시 원인분석 리포트
                 if pnl < 0:
                     self._generate_loss_report(result, mode="LIVE")
@@ -1765,6 +1773,14 @@ class AutoTrader:
             )
             return
 
+        # === 추가 안전 체크: 시총 $30M 이상 ===
+        mcap_m = self.listing_detector._get_mcap(coin)
+        if mcap_m >= 0 and mcap_m < self.listing_detector.MIN_MCAP_M:
+            logger.info(
+                f"[스나이핑] ⚠️ {coin} 시총 차단: ${mcap_m:.0f}M < ${self.listing_detector.MIN_MCAP_M:.0f}M"
+            )
+            return
+
         try:
             balance = await om.exchange.get_balance()
             live_free = balance.get("free", 0)
@@ -2345,13 +2361,9 @@ class AutoTrader:
                 else:
                     fixes.append(item["msg"])
 
-            # ──── 3. 모든 LIVE 포지션에 SL/TP Algo 주문 존재 확인 ────
-            algo_fixes = await self._check_algo_orders()
-            for item in algo_fixes:
-                if item["type"] == "issue":
-                    issues.append(item["msg"])
-                else:
-                    fixes.append(item["msg"])
+            # ──── 3. Algo 주문 체크 비활성화 (내부 SL/TP 모니터링 방식 사용) ────
+            # 거래소에 SL/TP Algo 주문을 설정하지 않으므로 체크 불필요
+            # _check_algo_orders()가 잘못된 사이즈로 주문 생성하여 충돌 유발
 
             # ──── 4. 연속 손실 / 승률 감시 → 자동 일시정지 ────
             loss_result = self._check_consecutive_losses()
@@ -2441,13 +2453,7 @@ class AutoTrader:
                 else:
                     fixes.append(item["msg"])
 
-            # ──── Algo 주문 확인 ────
-            algo_fixes = await self._check_algo_orders()
-            for item in algo_fixes:
-                if item["type"] == "issue":
-                    issues.append(item["msg"])
-                else:
-                    fixes.append(item["msg"])
+            # ──── Algo 주문 확인 비활성화 (내부 SL/TP 모니터링 방식) ────
 
             # ──── 콜백 확인 ────
             cb_fixes = self._check_callbacks()

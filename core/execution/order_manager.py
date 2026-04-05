@@ -196,6 +196,25 @@ class OrderManager:
             )
             fill_price = float(order.get("average", price))
 
+            # 실제 체결 수량 확인 — 부분 체결 대응
+            filled = float(order.get("filled", 0))
+            if filled > 0:
+                if abs(filled - amount) / max(amount, 1) > 0.05:
+                    logger.warning(
+                        f"[부분체결] {symbol} 요청={amount:.2f} 체결={filled:.2f} "
+                        f"({filled/amount*100:.1f}%)"
+                    )
+                amount = filled
+            else:
+                # filled 정보 없으면 거래소에서 직접 확인
+                try:
+                    exchange_pos = await self.exchange.get_position(symbol)
+                    ex_size = exchange_pos.get("size", 0) if exchange_pos else 0
+                    if ex_size > 0:
+                        amount = ex_size
+                except Exception:
+                    pass  # 실패 시 원래 amount 사용
+
             # SL/TP 계산 (내부 모니터링용)
             profile = self._get_profile(trade_type)
             sl_floor = profile.get("sl_floor_pct", self.risk_config.get("sl_floor_pct", 0.005))
@@ -280,6 +299,26 @@ class OrderManager:
                     actual_size = ex_size
             except Exception:
                 pass  # 조회 실패 시 내부 추적값 사용
+
+            # 더스트 포지션 체크 — 최소 주문금액($5) 미달 시 거래소 청산 불가
+            ticker_price = None
+            try:
+                ticker_price = await self.exchange.get_ticker_price(symbol)
+            except Exception:
+                pass
+            notional = actual_size * (ticker_price or pos.entry_price)
+            if notional < 5.0:
+                logger.warning(
+                    f"[더스트] {symbol} notional=${notional:.2f} < $5 — 거래소 청산 불가, 내부 포지션 정리"
+                )
+                del self.positions[symbol]
+                if "SL" in reason.upper() or "sl" in reason:
+                    self._sl_cooldown[symbol] = datetime.utcnow()
+                return {
+                    "symbol": symbol, "side": pos.side,
+                    "entry_price": pos.entry_price, "exit_price": ticker_price or pos.entry_price,
+                    "size": actual_size, "pnl": 0.0, "reason": f"{reason} (더스트 정리)",
+                }
 
             # 시장가 전량 청산
             order = await self.exchange.close_position(
@@ -444,14 +483,19 @@ class OrderManager:
 
             result = await self.close_position(symbol, reason)
 
+            # 청산 실패 시 콜백 호출하지 않음 (가짜 알림 방지)
+            if not result:
+                logger.warning(f"[청산실패] {symbol} — 콜백 스킵, 다음 루프 재시도")
+                continue
+
             callback_data = {
                 "symbol": symbol,
                 "side": pos.side,
                 "entry_price": pos.entry_price,
                 "exit_price": result.get("exit_price", close_price),
-                "size": pos.size,
+                "size": result.get("size", pos.size),
                 "pnl": result.get("pnl", pnl),
-                "reason": reason,
+                "reason": result.get("reason", reason),
                 "close_type": "SL" if was_sl else "TP",
             }
 

@@ -62,6 +62,13 @@ class ListingDetector:
     MAX_24H_PUMP_PCT = 100.0     # 24h 이미 +100% 이상이면 진입 금지 (늦은 진입)
     MIN_CIRCULATING_RATIO = 0.30  # 유통비율 30% 미만 = 언락 덤프 위험
 
+    # ── 추가 필터 (노이즈 제거) ──
+    SIGNAL_COOLDOWN_HOURS = 6     # 같은 코인 시그널 재알림 쿨다운 (6시간)
+    TRADE_COOLDOWN_HOURS = 2      # 거래 후 같은 코인 재진입 쿨다운 (2시간)
+    MIN_MCAP_M = 30.0             # 최소 시총 $30M (마이크로캡 밈코인 차단)
+    MIN_FUTURES_AGE_DAYS = 7      # 바이낸스 선물 상장 후 최소 7일 경과
+    MEME_PENALTY = 0.5            # 밈코인 패턴 감지 시 스코어 50% 감산
+
     # ── 토큰 언락 스케줄 설정 ──
     UNLOCK_DANGER_DAYS = 14       # 향후 N일 이내 대규모 언락 감지
     UNLOCK_DANGER_PCT = 1.5       # 총 공급량의 N% 이상 언락 = 위험 (투자자+팀 월 1.4%도 위험)
@@ -135,6 +142,12 @@ class ListingDetector:
         # 백커 정보 캐시
         self._backer_cache: dict[str, dict] = {}
         self._backer_cache_time: dict[str, float] = {}
+
+        # ── 시그널 쿨다운 (노이즈 제거) ──
+        self._signal_cooldown: dict[str, float] = {}   # coin → 마지막 시그널 시각
+        self._trade_cooldown: dict[str, float] = {}    # coin → 마지막 거래 청산 시각
+        self._mcap_cache: dict[str, tuple[float, float]] = {}  # coin → (mcap_M, timestamp)
+        self._mcap_cache_ttl = 3600 * 4  # 시총 캐시 4시간
 
     def _load_delisted_file(self):
         try:
@@ -321,10 +334,59 @@ class ListingDetector:
 
         return signals
 
+    def _is_meme_pattern(self, coin: str) -> bool:
+        """밈코인 심볼 패턴 감지 — 비ASCII, 숫자혼합, 극단적 이름"""
+        # 비ASCII 문자 (한자, 이모지 등)
+        if any(ord(c) > 127 for c in coin):
+            return True
+        # 알파벳+숫자 혼합에 길이 6 이상 (BROCCOLIF3B 같은 패턴)
+        has_digit = any(c.isdigit() for c in coin)
+        has_alpha = any(c.isalpha() for c in coin)
+        if has_digit and has_alpha and len(coin) >= 6:
+            return True
+        # 음식/동물/밈 키워드
+        meme_keywords = {
+            "BROCCOLI", "PEPE", "DOGE", "SHIB", "FLOKI", "BONK",
+            "WOJAK", "CHAD", "MEME", "BULLA", "BULL", "BEAR",
+            "CAT", "DOG", "FROG", "APU", "BRETT", "NEIRO",
+            "TURBO", "BABYDOGE", "LADYS", "TROLL", "BASED",
+        }
+        coin_upper = coin.upper()
+        for kw in meme_keywords:
+            if kw in coin_upper:
+                return True
+        return False
+
+    def _get_mcap(self, coin: str) -> float:
+        """CoinGecko에서 시총 조회 (캐시 4시간)"""
+        now = time.time()
+        cached = self._mcap_cache.get(coin)
+        if cached and (now - cached[1]) < self._mcap_cache_ttl:
+            return cached[0]
+
+        mcap_m = 0.0
+        try:
+            url = f"https://api.coingecko.com/api/v3/coins/{coin.lower()}?localization=false&tickers=false&community_data=false&developer_data=false"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = urllib.request.urlopen(req, timeout=8)
+            data = json.loads(resp.read())
+            mcap = data.get("market_data", {}).get("market_cap", {}).get("usd", 0)
+            mcap_m = mcap / 1e6 if mcap else 0.0
+        except Exception:
+            # CoinGecko 실패 시 → 시총 미확인 (차단하지 않음)
+            mcap_m = -1.0  # -1 = 조회 실패, 필터 미적용
+
+        self._mcap_cache[coin] = (mcap_m, now)
+        return mcap_m
+
+    def register_trade_cooldown(self, coin: str):
+        """외부에서 호출: 거래 청산 후 재진입 쿨다운 등록"""
+        self._trade_cooldown[coin.upper()] = time.time()
+
     def _score_coin(
         self, coin: str, symbol: str, ticker: dict, tier: str, tier_weight: float
     ) -> Optional[dict]:
-        """선매집 패턴 점수 계산 — 24시간 평균 볼륨 대비"""
+        """선매집 패턴 점수 계산 — 24시간 평균 볼륨 대비 + 노이즈 필터"""
         price = ticker.get("last", 0) or 0
         pct_24h = ticker.get("percentage", 0) or 0
         volume_m = (ticker.get("quoteVolume", 0) or 0) / 1e6
@@ -342,10 +404,17 @@ class ListingDetector:
 
         # === 안전 필터: 이미 너무 올랐으면 진입 금지 ===
         if pct_24h > self.MAX_24H_PUMP_PCT:
-            logger.debug(
-                f"[ListingDetector] {coin} 진입금지: 24h +{pct_24h:.0f}% "
-                f"(한도 +{self.MAX_24H_PUMP_PCT:.0f}%) — 늦은 진입/펌프앤덤프 위험"
-            )
+            return None
+
+        # === 필터 1: 시그널 쿨다운 (같은 코인 6시간 재알림 차단) ===
+        now_ts = time.time()
+        last_signal = self._signal_cooldown.get(coin, 0)
+        if (now_ts - last_signal) < self.SIGNAL_COOLDOWN_HOURS * 3600:
+            return None
+
+        # === 필터 4: 거래 후 재진입 쿨다운 (2시간) ===
+        last_trade = self._trade_cooldown.get(coin, 0)
+        if (now_ts - last_trade) < self.TRADE_COOLDOWN_HOURS * 3600:
             return None
 
         score = 0.0
@@ -387,6 +456,10 @@ class ListingDetector:
         elif price_1h > 0.08:
             score += 0.10
             reasons.append(f"1h +{price_1h:.0%}")
+        # === 필터 3: 1시간 하락 중이면 감산 (꼭대기 잡기 방지) ===
+        elif price_1h < -0.03:
+            score -= 0.15
+            reasons.append(f"1h {price_1h:.0%} 하락중")
 
         # === 4. 변동성 (일중 범위) ===
         if range_pct > 40:
@@ -409,8 +482,16 @@ class ListingDetector:
             score *= 0.5
             reasons.append("⚠상폐이력")
 
+        # === 필터 7: 밈코인 패턴 감지 → 스코어 감산 ===
+        if self._is_meme_pattern(coin):
+            score *= self.MEME_PENALTY
+            reasons.append("⚠밈코인패턴")
+
         if score < 0.20:
             return None
+
+        # === 필터 1 후속: 유효 시그널이면 쿨다운 등록 ===
+        self._signal_cooldown[coin] = now_ts
 
         return {
             "coin": coin,
