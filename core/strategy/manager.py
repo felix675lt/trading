@@ -42,6 +42,10 @@ class StrategyManager:
         self.min_confidence = self.base_min_confidence
         self.signal_threshold = config.get("signal_threshold", 0.10)
         self.min_confirming = config.get("min_confirming_signals", 2)
+        # 방향 필터: long_only=True면 숏 진입 완전 차단
+        self.long_only = config.get("long_only", False)
+        if self.long_only:
+            logger.warning("[Strategy] LONG_ONLY 모드 활성화 — 숏 진입 완전 차단")
         self.recent_decisions: list[TradeDecision] = []
 
         # 자기진단 상태
@@ -301,6 +305,13 @@ class StrategyManager:
                 final_action = "hold"
                 reason = direction_block
                 confidence = 0.0
+
+        # 2.85. LONG_ONLY 필터 (사용자 지시) — 숏 진입 완전 차단
+        if self.long_only and final_action == "short":
+            logger.info(f"[LONG_ONLY] 숏 차단 → hold (원래 사유: {reason})")
+            final_action = "hold"
+            reason = f"LONG_ONLY 모드 — 숏 차단 (원신호: {reason})"
+            confidence = 0.0
 
         # 2.9. 피드백 블랙리스트 필터 [재활성화] — 반복 실패 패턴 진입 차단
         if final_action in ["long", "short"] and feedback_blacklist:

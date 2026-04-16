@@ -41,6 +41,11 @@ trading:
   max_concurrent_live: 1   # LIVE: 한 번에 1포지션만 (풀시드 올인)
   max_concurrent_paper: 4  # PAPER: 학습용으로 다중 가능
 
+  # === 방향 필터 (사용자 지시) ===
+  # 숏 진입 완전 차단, 롱 각만 본다 (2026-04-17)
+  # 이유: 숏 승률 24% (40승 125패), 롱 승률 93% (885승 65패)
+  long_only: true
+
 risk:
   max_position_pct: 0.95        # 풀시드 집중: $188 × 95% = $178.6 마진
   min_order_notional: 5         # 알트코인 최소 $5
