@@ -59,17 +59,36 @@ class DataCollector:
         """지정 기간 전체 OHLCV 데이터를 페이지네이션으로 수집"""
         exchange = self.exchanges[exchange_name]
         since = int((datetime.utcnow() - timedelta(days=days)).timestamp() * 1000)
+        target_ts = int(datetime.utcnow().timestamp() * 1000)
         all_data = []
+        batch_count = 0
 
         while True:
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+            try:
+                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+            except Exception as e:
+                logger.warning(f"[DataCollect] {symbol} 수집 중 에러 (재시도): {e}")
+                await asyncio.sleep(5)
+                continue
+
             if not ohlcv:
                 break
             all_data.extend(ohlcv)
             since = ohlcv[-1][0] + 1
+            batch_count += 1
+
+            # 대량 수집 시 진행률 로깅 (50배치=50,000캔들마다)
+            if batch_count % 50 == 0:
+                progress = min(100, (since - (target_ts - days * 86400000)) / (days * 86400000) * 100)
+                logger.info(
+                    f"[DataCollect] {symbol} {timeframe} 수집 중... "
+                    f"{len(all_data):,}개 캔들 ({progress:.0f}%)"
+                )
+
             if len(ohlcv) < 1000:
                 break
-            await asyncio.sleep(exchange.rateLimit / 1000)
+            # rate limit 준수 (대량 수집 시 여유있게)
+            await asyncio.sleep(max(exchange.rateLimit / 1000, 0.2))
 
         df = pd.DataFrame(all_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")

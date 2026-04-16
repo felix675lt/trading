@@ -1,5 +1,6 @@
 """LSTM 기반 시계열 예측 모델"""
 
+import gc
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,11 @@ class LSTMNetwork(nn.Module):
 class LSTMPredictor:
     """LSTM 시계열 패턴 → 방향 예측"""
 
+    # 메모리 보호: 최대 시퀀스 수 제한 (OOM 방지)
+    MAX_SEQUENCES = 80000
+    # 5분봉을 1시간봉으로 다운샘플링하는 배수
+    DOWNSAMPLE_RATIO = 12
+
     def __init__(self, seq_length: int = 60, model_dir: str = "models_saved"):
         self.seq_length = seq_length
         self.model_dir = Path(model_dir)
@@ -43,16 +49,44 @@ class LSTMPredictor:
         self.std: np.ndarray | None = None
 
     def _create_sequences(self, X: np.ndarray, y: np.ndarray):
-        """시퀀스 데이터 생성"""
-        Xs, ys = [], []
-        for i in range(len(X) - self.seq_length):
-            Xs.append(X[i:i + self.seq_length])
-            ys.append(y[i + self.seq_length])
-        return np.array(Xs), np.array(ys)
+        """시퀀스 데이터 생성 (메모리 최적화: 최대 시퀀스 수 제한)
+
+        1. 데이터가 많으면 1시간봉으로 다운샘플링 (5분봉 × 12)
+        2. 그래도 많으면 랜덤 서브샘플링 (최대 MAX_SEQUENCES)
+        """
+        total_n = len(X) - self.seq_length
+
+        # 1단계: 데이터가 너무 많으면 1시간봉으로 다운샘플링
+        if total_n > self.MAX_SEQUENCES * self.DOWNSAMPLE_RATIO:
+            X = X[::self.DOWNSAMPLE_RATIO]
+            y = y[::self.DOWNSAMPLE_RATIO]
+            total_n = len(X) - self.seq_length
+            logger.info(
+                f"LSTM: 1시간봉 다운샘플링 적용 (5분×{self.DOWNSAMPLE_RATIO}) → "
+                f"{len(X):,}개 캔들"
+            )
+
+        # 2단계: 그래도 많으면 랜덤 서브샘플링
+        if total_n > self.MAX_SEQUENCES:
+            rng = np.random.default_rng(seed=42)
+            indices = np.sort(rng.choice(total_n, self.MAX_SEQUENCES, replace=False))
+            logger.info(
+                f"LSTM: 시퀀스 서브샘플링 {total_n:,} → {self.MAX_SEQUENCES:,}개"
+            )
+        else:
+            indices = np.arange(total_n)
+
+        # 시퀀스 생성 (float32로 메모리 절약)
+        Xs = np.stack([X[i:i + self.seq_length] for i in indices]).astype(np.float32)
+        ys = y[indices + self.seq_length].astype(np.int64)
+
+        gc.collect()
+        return Xs, ys
 
     def train(self, df: pd.DataFrame, feature_cols: list[str], label_col: str = "label",
               epochs: int = 50, batch_size: int = 64, lr: float = 0.001):
         """모델 학습 (기존 모델이 있으면 fine-tuning, 없으면 최초 학습)"""
+        gc.collect()  # 학습 시작 전 메모리 정리
         self.feature_columns = feature_cols
         X = df[feature_cols].values.astype(np.float32)
         y = df[label_col].values.astype(np.int64)
@@ -63,6 +97,10 @@ class LSTMPredictor:
         X = (X - self.mean) / self.std
 
         X_seq, y_seq = self._create_sequences(X, y)
+        # 원본 X, y는 더 이상 필요 없음 — 메모리 해제
+        del X, y
+        gc.collect()
+
         split = int(len(X_seq) * 0.8)
 
         train_ds = TensorDataset(
@@ -71,6 +109,10 @@ class LSTMPredictor:
         )
         test_X = torch.FloatTensor(X_seq[split:]).to(self.device)
         test_y = torch.LongTensor(y_seq[split:]).to(self.device)
+
+        # numpy 배열 삭제 (텐서로 복사 완료)
+        del X_seq, y_seq
+        gc.collect()
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
@@ -141,6 +183,11 @@ class LSTMPredictor:
         train_type = "Fine-tune" if is_finetune else "최초학습"
         improvement = f" ({best_acc - prev_accuracy:+.4f})" if prev_accuracy > 0 else ""
         logger.info(f"LSTM {train_type} 완료 - 최고 정확도: {self.accuracy:.4f}{improvement}")
+
+        # 학습 완료 후 메모리 정리
+        del train_ds, test_X, test_y, train_loader
+        gc.collect()
+
         return self.accuracy
 
     def predict(self, df: pd.DataFrame) -> dict:

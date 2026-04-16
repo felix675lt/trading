@@ -488,10 +488,10 @@ class AutoTrader:
                     self.strategy_manager.record_win()
                 self.risk_manager.record_pnl(pnl)
                 self._save_trade_with_context({
-                    "exchange": "binance", "symbol": symbol, "side": "close",
+                    "exchange": "binance", "symbol": symbol, "side": result.get("side", "close"),
                     "price": result.get("exit_price", 0),
                     "amount": result.get("size", 0),
-                    "pnl": pnl, "fee": 0,
+                    "pnl": pnl, "fee": result.get("fee", 0),
                     "strategy": f"{close_type.lower()}_triggered",
                     "mode": "LIVE",
                 })
@@ -663,11 +663,13 @@ class AutoTrader:
                         ext_features = self.external_manager.get_all_features()
 
                         # 퀀트 시그널을 ML 피처로 사전 주입 (예측 전에 계산)
+                        # v2 (2026-04-16): 실제 OHLCV/returns/volatility/spot-futures 전달
+                        #   이전에는 returns=[], df=None, futures=spot 로 넘겨서
+                        #   basis/crash/alpha가 항상 0 → ML 피처로 무의미했음
                         try:
                             ob_data = await self.collector.fetch_orderbook(exchange_name, symbol, limit=20)
                             ticker = await self.collector.fetch_ticker(exchange_name, symbol)
-                            _spot = ticker.get("last", 0)
-                            _futures = _spot  # 루프단에서는 근사치
+                            _futures = ticker.get("last", 0)  # 선물 가격 (ccxt futures 모드)
                             _taker_vol = ticker.get("quoteVolume", 0) or 0
                             _bid_v = ob_data.get("bid_volume", 0)
                             _ask_v = ob_data.get("ask_volume", 0)
@@ -675,12 +677,38 @@ class AutoTrader:
                             _buy_v = _taker_vol * (_bid_v / _total_v)
                             _sell_v = _taker_vol * (_ask_v / _total_v)
 
+                            # 실제 spot 가격 조회 (basis_spread 계산용)
+                            _spot = _futures  # 기본값 (실패 시 basis=0)
+                            try:
+                                spot_symbol = symbol.replace(":USDT", "")  # 선물→현물 심볼
+                                spot_ticker = await self.collector.fetch_ticker(exchange_name, spot_symbol)
+                                _spot = spot_ticker.get("last", _futures)
+                            except Exception:
+                                pass
+
+                            # 짧은 OHLCV 1회 조회 (returns/df/volatility용)
+                            _df_pre = await self.collector.fetch_ohlcv(
+                                exchange_name, symbol, primary_tf, limit=60,
+                            )
+                            if len(_df_pre) >= 20:
+                                _closes = _df_pre["close"].values
+                                _rets = [(_closes[i] - _closes[i-1]) / _closes[i-1]
+                                         for i in range(1, len(_closes))]
+                                _cur_vol = float(np.std(_rets[-5:])) if len(_rets) >= 5 else 0.01
+                                _avg_vol = float(np.std(_rets[-30:])) if len(_rets) >= 30 else _cur_vol
+                                _df_for_alpha = _df_pre
+                            else:
+                                _rets = []
+                                _cur_vol = 0.01
+                                _avg_vol = 0.01
+                                _df_for_alpha = None
+
                             qs_pre = self.quant_signals.get_all_signals(
                                 orderbook=ob_data, spot_price=_spot,
                                 futures_price=_futures,
                                 trades_volume=_taker_vol, buy_volume=_buy_v,
-                                sell_volume=_sell_v, returns=[],
-                                current_vol=0.01, avg_vol=0.01, df=None,
+                                sell_volume=_sell_v, returns=_rets,
+                                current_vol=_cur_vol, avg_vol=_avg_vol, df=_df_for_alpha,
                             )
                             # 퀀트 피처를 ext_features에 병합 → ML이 학습 가능
                             ext_features["quant_score"] = qs_pre.get("combined_score", 0)
@@ -959,10 +987,15 @@ class AutoTrader:
         current_position = 0.0
         if self.mode in ("paper", "dual"):
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
+
+        # 피드백 블랙리스트 조회 (반복 실패 시그널 조합 차단)
+        fb_blacklist = self.feedback.get_entry_blacklist()
+
         decision = self.strategy_manager.decide(
             ml_signal, rl_action, rl_confidence, current_position,
             adaptive_params["regime"], external_signal=ext_signal,
             momentum=momentum_signal,
+            feedback_blacklist=fb_blacklist,
             funding_rate=funding_rate,
             fear_greed_index=fear_greed,
         )
@@ -980,18 +1013,21 @@ class AutoTrader:
                 (decision.action == "short" and mtf_dir == "bearish")
             )
 
-            # [해제됨] 강한 MTF 반대 — 로그만 남김
+            # [재활성화] 강한 MTF 반대 — 진입 차단 (상위 TF 반대 시 승률 급락)
             if action_opposes_mtf and mtf_agreement >= 0.75:
-                logger.info(
-                    f"[리스크해제] MTF 강반대 무시 — "
-                    f"MTF {mtf_dir} 합의 {mtf_agreement:.0%} (conf={decision.confidence:.2f})"
+                logger.warning(
+                    f"[MTF차단] {decision.action} → hold "
+                    f"(상위 TF {mtf_dir} 합의 {mtf_agreement:.0%})"
                 )
-                decision.reason += f" !MTF반대무시({mtf_dir} {mtf_agreement:.0%})"
+                decision.action = "hold"
+                decision.reason = f"MTF강반대 차단 ({mtf_dir} {mtf_agreement:.0%})"
+                decision.confidence = 0.0
+                decision.size = 0.0
 
-            # [해제됨] 약한 MTF 반대 — 확신도 감소 없이 로그만
+            # [재활성화 — 약한 반대] 확신도 감소 (차단하진 않음)
             elif action_opposes_mtf and mtf_agreement >= 0.5:
-                logger.info(f"[리스크해제] MTF 약반대 무시 ({mtf_dir} {mtf_agreement:.0%})")
-                decision.reason += f" !MTF약반대무시({mtf_dir} {mtf_agreement:.0%})"
+                decision.confidence *= 0.75
+                decision.reason += f" !MTF약반대({mtf_dir} {mtf_agreement:.0%})"
 
             # MTF 합류 확인 시 확신도 부스트
             elif action_agrees_mtf and mtf_agreement > 0.7:
@@ -1275,7 +1311,7 @@ class AutoTrader:
                 if result:
                     self.risk_manager.record_pnl(result["pnl"])
                     self._save_trade_with_context({
-                        "exchange": exchange_name, "symbol": symbol, "side": "close",
+                        "exchange": exchange_name, "symbol": symbol, "side": result.get("side", "close"),
                         "price": price, "amount": result["size"], "pnl": result["pnl"],
                         "fee": result["fee"], "strategy": "hybrid",
                         "mode": "PAPER",
@@ -1341,10 +1377,10 @@ class AutoTrader:
                         else:
                             self.strategy_manager.record_win()
                         self._save_trade_with_context({
-                            "exchange": exchange_name, "symbol": symbol, "side": "close",
+                            "exchange": exchange_name, "symbol": symbol, "side": live_result.get("side", "close"),
                             "price": live_result.get("exit_price", 0),
                             "amount": live_result.get("size", 0),
-                            "pnl": live_pnl, "fee": 0, "strategy": "live_signal_close",
+                            "pnl": live_pnl, "fee": live_result.get("fee", 0), "strategy": "live_signal_close",
                             "mode": "LIVE",
                         })
 
@@ -1392,7 +1428,7 @@ class AutoTrader:
                              "external_score": 0, "external_direction": "neutral"},
                         )
                         self._save_trade_with_context({
-                            "exchange": exchange_name, "symbol": symbol, "side": "close",
+                            "exchange": exchange_name, "symbol": symbol, "side": result.get("side", "close"),
                             "price": price, "amount": result["size"], "pnl": stale_pnl,
                             "fee": result["fee"], "strategy": "auto_close",
                             "mode": "PAPER",
@@ -1724,9 +1760,9 @@ class AutoTrader:
                      "external_score": 0, "external_direction": "neutral"},
                 )
                 self._save_trade_with_context({
-                    "exchange": "paper", "symbol": symbol, "side": "close",
+                    "exchange": "paper", "symbol": symbol, "side": result.get("side", "close"),
                     "price": c["price"], "amount": result.get("size", 0),
-                    "pnl": paper_pnl, "fee": 0, "strategy": "paper_concentration",
+                    "pnl": paper_pnl, "fee": result.get("fee", 0), "strategy": "paper_concentration",
                     "mode": "PAPER",
                 })
                 p_hash = self.strategy_optimizer_paper._config_to_hash(
@@ -1773,9 +1809,14 @@ class AutoTrader:
             )
             return
 
-        # === 추가 안전 체크: 시총 $30M 이상 ===
+        # === 추가 안전 체크: 시총 $30M 이상 (조회 실패 시에도 차단) ===
         mcap_m = self.listing_detector._get_mcap(coin)
-        if mcap_m >= 0 and mcap_m < self.listing_detector.MIN_MCAP_M:
+        if mcap_m < 0:
+            logger.info(
+                f"[스나이핑] ⚠️ {coin} 시총 조회 실패 → 정보 없는 코인 거래 차단"
+            )
+            return
+        if mcap_m < self.listing_detector.MIN_MCAP_M:
             logger.info(
                 f"[스나이핑] ⚠️ {coin} 시총 차단: ${mcap_m:.0f}M < ${self.listing_detector.MIN_MCAP_M:.0f}M"
             )
@@ -2075,10 +2116,10 @@ class AutoTrader:
                 else:
                     self.strategy_manager.record_win()
                 self._save_trade_with_context({
-                    "exchange": exchange_name, "symbol": symbol, "side": "close",
+                    "exchange": exchange_name, "symbol": symbol, "side": live_result.get("side", "close"),
                     "price": live_result.get("exit_price", 0),
                     "amount": live_result.get("size", 0),
-                    "pnl": live_pnl, "fee": 0, "strategy": "live_concentration",
+                    "pnl": live_pnl, "fee": live_result.get("fee", 0), "strategy": "live_concentration",
                     "mode": "LIVE",
                 })
 
@@ -2117,7 +2158,7 @@ class AutoTrader:
 
             # DB 저장
             self._save_trade_with_context({
-                "exchange": "paper", "symbol": symbol, "side": "close",
+                "exchange": "paper", "symbol": symbol, "side": side or "close",
                 "price": trade.get("exit_price", 0),
                 "amount": trade.get("size", 0),
                 "pnl": pnl, "fee": trade.get("fee", 0),
@@ -2761,10 +2802,10 @@ class AutoTrader:
                             self.strategy_manager.record_win()
                         self.risk_manager.record_pnl(pnl)
                         self._save_trade_with_context({
-                            "exchange": "binance", "symbol": symbol, "side": "close",
+                            "exchange": "binance", "symbol": symbol, "side": result.get("side", "close"),
                             "price": result.get("exit_price", 0),
                             "amount": result.get("size", 0),
-                            "pnl": pnl, "fee": 0,
+                            "pnl": pnl, "fee": result.get("fee", 0),
                             "strategy": f"{close_type.lower()}_triggered",
                             "mode": "LIVE",
                         })

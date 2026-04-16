@@ -102,6 +102,7 @@ class ExternalDataManager:
             sentiment_features = self.sentiment.analyze_batch(texts, symbol)
 
             # 각 모듈의 피처 수집
+            # 공포탐욕은 수집은 하되 ML 피처로는 사용 안 함 (후행 지표, 예측력 없음)
             fg_features = self.fear_greed.get_features()
             onchain_features = self.onchain.get_features()
             macro_features = self.macro.get_features()
@@ -129,9 +130,8 @@ class ExternalDataManager:
             # 계절 시그널 업데이트
             self.seasonal.get_seasonal_signal()
 
-            # 모든 피처 통합
+            # 모든 피처 통합 (공포탐욕 제외 — 후행 지표라 ML 학습에서 제거)
             self.all_features = {
-                **fg_features,
                 **onchain_features,
                 **macro_features,
                 **news_features,
@@ -165,7 +165,6 @@ class ExternalDataManager:
             rm_sig = self.real_macro.get_signal()
             logger.info(
                 f"[External] 종합신호: {self.composite_signal['score']:.2f} | "
-                f"공포탐욕: {fg_features.get('fg_value', 50):.0f} | "
                 f"센티먼트: {sentiment_features.get('sentiment_avg', 0):.2f} | "
                 f"트위터: {twitter_features.get('twitter_composite', 0):.2f} | "
                 f"펀딩비: {derivatives_features.get('deriv_funding_rate', 0):.1f}bp | "

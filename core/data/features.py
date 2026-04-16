@@ -124,8 +124,14 @@ class FeatureEngineer:
 
         return df
 
-    def _add_labels(self, df: pd.DataFrame, forward_periods: int = 5, threshold: float = 0.002) -> pd.DataFrame:
-        """미래 수익률 기반 레이블 생성 (ML 학습용)"""
+    def _add_labels(self, df: pd.DataFrame, forward_periods: int = 12, threshold: float = 0.005) -> pd.DataFrame:
+        """미래 수익률 기반 레이블 생성 (ML 학습용)
+
+        v2 (2026-04-16): 0.2%/5캔들 → 0.5%/12캔들로 상향
+        - 이유: 이전 타겟은 노이즈 수준이라 ML이 대부분 "횡보"로 수렴 (정확도 47~50%)
+        - 새 타겟: 5분봉 = 1시간 뒤 ±0.5% / 1시간봉 = 12시간 뒤 ±0.5%
+        - SL 1.0% 보다 작은 움직임이라 TP 도달에 유리
+        """
         future_return = df["close"].pct_change(forward_periods).shift(-forward_periods)
         df["label"] = 1  # 횡보
         df.loc[future_return > threshold, "label"] = 2   # 상승

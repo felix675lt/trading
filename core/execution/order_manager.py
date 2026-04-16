@@ -63,6 +63,9 @@ class OrderManager:
         self.trailing_distance_pct = tc.get("distance_pct", 0.008)
         self.trailing_step_pct = tc.get("step_pct", 0.004)
 
+        # 수수료 (왕복: 진입 + 청산)
+        self.commission_pct = risk_config.get("commission_pct", 0.0004)  # 편도 0.04%
+
     def _get_profile(self, trade_type: str) -> dict:
         return self.trade_profiles.get(trade_type, {})
 
@@ -335,10 +338,14 @@ class OrderManager:
 
             pnl = 0.0
             if fill_price > 0:
+                notional = actual_size * pos.entry_price
                 if pos.side == "long":
-                    pnl = (fill_price - pos.entry_price) / pos.entry_price * actual_size * pos.entry_price
+                    pnl = (fill_price - pos.entry_price) / pos.entry_price * notional
                 else:
-                    pnl = (pos.entry_price - fill_price) / pos.entry_price * actual_size * pos.entry_price
+                    pnl = (pos.entry_price - fill_price) / pos.entry_price * notional
+                # 왕복 수수료 차감 (진입 + 청산)
+                fee = notional * self.commission_pct * 2
+                pnl -= fee
 
             # 내부 포지션 삭제
             del self.positions[symbol]
@@ -348,13 +355,14 @@ class OrderManager:
                 self._sl_cooldown[symbol] = datetime.utcnow()
                 logger.info(f"[쿨다운] {symbol} SL 청산 → {self.SL_COOLDOWN_SECONDS}초 재진입 차단 시작")
 
-            logger.info(f"포지션 청산: {symbol} | PnL: {pnl:.2f} USDT | 사유: {reason}")
+            logger.info(f"포지션 청산: {symbol} | PnL: {pnl:.2f} USDT (수수료 {fee:.4f}) | 사유: {reason}")
 
             return {
                 "symbol": symbol,
                 "side": pos.side,
                 "entry_price": pos.entry_price,
                 "exit_price": fill_price,
+                "fee": fee,
                 "size": actual_size,
                 "pnl": pnl,
                 "reason": reason,
@@ -425,13 +433,13 @@ class OrderManager:
                     if profit_pct >= t_activate and not pos.trailing_activated:
                         pos.trailing_activated = True
                         new_sl = pos.lowest_price * (1 + t_distance)
-                        pos.stop_loss = min(pos.stop_loss, new_sl)
+                        pos.stop_loss = new_sl
                         logger.info(
                             f"[Trailing-LIVE] {symbol} 숏({pos.trade_type}) 트레일링 활성화 | "
                             f"수익 {profit_pct:.2%} | SL → {pos.stop_loss:.2f}"
                         )
 
-                    # 트레일링 활성 중: SL 끌어내림
+                    # 트레일링 활성 중: 가격 하락 시 SL도 따라 내림 (수익 보호)
                     if pos.trailing_activated:
                         new_sl = pos.lowest_price * (1 + t_distance)
                         if new_sl < pos.stop_loss - (pos.entry_price * t_step):

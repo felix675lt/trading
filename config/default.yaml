@@ -55,7 +55,7 @@ risk:
   # === ATR 기반 동적 SL/TP (핵심) ===
   atr_sl_multiplier: 2.0        # SL = ATR(14) × 2.0 (노이즈 회피)
   atr_tp_multiplier: 3.5        # TP = ATR(14) × 3.5 (RR 1.75:1)
-  sl_floor_pct: 0.005           # SL 최소 0.5% (슬리피지 보호)
+  sl_floor_pct: 0.010           # SL 최소 1.0% (노이즈 회피 확대)
   sl_cap_pct: 0.030             # SL 최대 3.0% (최대 손실 제한)
 
   dynamic_leverage:
@@ -102,20 +102,20 @@ trade_profiles:
     sources: ["ML", "ML_val", "MOM", "RSI_extreme", "RL", "EXT", "EXT_boost"]
     max_risk_pct: 0.04     # 1거래 최대 손실 = 자본의 4%
     sl_pct: 0.010          # 1.0% SL (→ 4%/1% = 최대 4x)
-    tp_pct: 0.020          # 2.0% TP (RR 2:1)
-    sl_floor_pct: 0.005
+    tp_pct: 0.015          # 1.5% TP (RR 1.5:1 — 먹을 수 있을 때 먹기)
+    sl_floor_pct: 0.010
     sl_cap_pct: 0.015
     atr_sl_multiplier: 1.5
     atr_tp_multiplier: 3.0
     trailing:
       activate_pct: 0.010  # 1% 수익 시 트레일링 활성화
-      distance_pct: 0.005  # 최고점에서 0.5% 하락 시 청산
+      distance_pct: 0.008  # 최고점에서 0.8% 하락 시 청산 (찔끔 방지)
       step_pct: 0.003
     max_hold_minutes: 60   # 최대 1시간 보유
 
 ml:
   retrain_interval_hours: 24
-  lookback_days: 90
+  lookback_days: 2400    # 크립토 선물 전체 역사 (~2019-11~)
   train_split: 0.8
   min_accuracy: 0.55
   features:

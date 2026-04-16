@@ -276,27 +276,43 @@ class StrategyManager:
                 confidence *= 1.10
                 reason += " +트렌드일치"
 
-        # 2.7. 고임팩트 이벤트 오버라이드 [해제됨] — 로그만 남김
+        # 2.7. 고임팩트 이벤트 오버라이드 [재활성화]
+        # 강한 외부 시그널 + 고임팩트 뉴스 반대 방향 진입 → 차단
         if has_high_impact and abs(ext_score) > 0.4:
             if ext_direction == "bearish" and final_action == "long":
-                logger.info(f"[리스크해제] 고임팩트 롱차단 무시 (ext={ext_score:.2f})")
+                logger.warning(f"[고임팩트차단] 롱 차단 (ext_score={ext_score:.2f}, 베어리시 이벤트)")
+                final_action = "hold"
+                reason = f"고임팩트 베어리시 이벤트 → 롱 차단 (ext={ext_score:.2f})"
+                confidence = 0.0
             elif ext_direction == "bullish" and final_action == "short":
-                logger.info(f"[리스크해제] 고임팩트 숏차단 무시 (ext={ext_score:.2f})")
+                logger.warning(f"[고임팩트차단] 숏 차단 (ext_score={ext_score:.2f}, 불리시 이벤트)")
+                final_action = "hold"
+                reason = f"고임팩트 불리시 이벤트 → 숏 차단 (ext={ext_score:.2f})"
+                confidence = 0.0
 
-        # 2.8. 레짐 방향 바이어스 [해제됨] — 로그만 남김
+        # 2.8. 레짐 방향 바이어스 [재활성화 v2] — funding_rate 극값만 사용
+        # 공포탐욕 지수는 제거됨 (후행 지표, 예측력 없음)
         if final_action in ["long", "short"]:
             direction_block = self._regime_direction_bias(
                 final_action, funding_rate, fear_greed_index, mom_direction, mom_rsi,
             )
             if direction_block:
-                logger.info(f"[리스크해제] 레짐차단 무시: {direction_block}")
-                # 차단하지 않고 통과
+                logger.warning(f"[레짐차단] 진입 차단: {direction_block}")
+                final_action = "hold"
+                reason = direction_block
+                confidence = 0.0
 
-        # 2.9. 피드백 블랙리스트 필터 [해제됨] — 로그만 남김
+        # 2.9. 피드백 블랙리스트 필터 [재활성화] — 반복 실패 패턴 진입 차단
         if final_action in ["long", "short"] and feedback_blacklist:
-            combo_key = "+".join(sorted(confirming))
+            combo_key = "+".join(sorted(set(s.split("_")[0] for s in confirming)))
             if combo_key in feedback_blacklist:
-                logger.info(f"[리스크해제] 블랙리스트 무시: {combo_key} → {final_action}")
+                logger.warning(
+                    f"[블랙리스트] 진입 차단: {combo_key} → {final_action} "
+                    f"(피드백 학습 기반 — 승률 <25%)"
+                )
+                final_action = "hold"
+                reason = f"블랙리스트 차단: {combo_key} (반복 실패 패턴)"
+                confidence = 0.0
 
         # 3. 최소 확신도 필터 (강화)
         if confidence < self.min_confidence and final_action not in ("close", "hold"):
@@ -384,33 +400,34 @@ class StrategyManager:
         self, action: str, funding_rate: float, fear_greed: float,
         mom_direction: str, mom_rsi: float,
     ) -> str | None:
-        """레짐 기반 방향 필터 — 시장 상태와 반대 방향 진입 차단
+        """레짐 기반 방향 필터 — funding_rate + 모멘텀/RSI 극값만 사용
+        (공포탐욕 지수는 제거됨 — 후행 지표라 예측력 없음)
 
         Returns: 차단 사유 문자열 (None이면 통과)
 
         로직:
-        - 극도의 공포(< 20) + 음펀비(< -0.3bp) + 반등 시그널 → 숏 차단 (롱 유리)
-        - 극도의 탐욕(> 80) + 양펀비(> 1.5bp) + 과매수 → 롱 차단 (숏 유리)
         - 강한 음펀비(< -1bp)에서 숏 → 무조건 차단 (숏스퀴즈 리스크)
         - 강한 양펀비(> 3bp)에서 롱 → 무조건 차단 (롱스퀴즈 리스크)
+        - 중간 음펀비(< -0.5bp) + 과매도(RSI<30) + 반등 모멘텀 → 숏 차단
+        - 중간 양펀비(> 1.5bp) + 과매수(RSI>70) + 하락 모멘텀 → 롱 차단
         """
-        # 1. 극단 펀딩비 → 무조건 차단
+        # 1. 극단 펀딩비 → 무조건 차단 (스퀴즈 리스크)
         if action == "short" and funding_rate < -1.0:
             return f"레짐차단: 강한음펀비({funding_rate:.1f}bp)→숏스퀴즈위험"
         if action == "long" and funding_rate > 3.0:
             return f"레짐차단: 강한양펀비({funding_rate:.1f}bp)→롱스퀴즈위험"
 
-        # 2. 극도의 공포 + 음펀비 + 반등 조합 → 숏 차단
-        if (action == "short" and fear_greed < 20 and funding_rate < -0.3
+        # 2. 중간 음펀비 + 과매도 반등 → 숏 차단 (롱 유리)
+        if (action == "short" and funding_rate < -0.5
                 and (mom_direction == "long" or mom_rsi < 30)):
-            return (f"레짐차단: 극공포({fear_greed:.0f})+음펀비({funding_rate:.1f}bp)"
-                    f"+반등시그널→숏차단")
+            return (f"레짐차단: 음펀비({funding_rate:.1f}bp)+반등시그널"
+                    f"(RSI:{mom_rsi:.0f})→숏차단")
 
-        # 3. 극도의 탐욕 + 양펀비 + 과매수 → 롱 차단
-        if (action == "long" and fear_greed > 80 and funding_rate > 1.5
+        # 3. 중간 양펀비 + 과매수 하락 → 롱 차단 (숏 유리)
+        if (action == "long" and funding_rate > 1.5
                 and (mom_direction == "short" or mom_rsi > 70)):
-            return (f"레짐차단: 극탐욕({fear_greed:.0f})+양펀비({funding_rate:.1f}bp)"
-                    f"+과매수→롱차단")
+            return (f"레짐차단: 양펀비({funding_rate:.1f}bp)+과매수시그널"
+                    f"(RSI:{mom_rsi:.0f})→롱차단")
 
         return None
 

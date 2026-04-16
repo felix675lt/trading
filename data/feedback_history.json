@@ -2,9 +2,124 @@
   "pattern_scores": {},
   "hourly_performance": {
     "15": {
+      "wins": 4,
+      "losses": 18,
+      "total_pnl": -39.64896615997092
+    },
+    "17": {
+      "wins": 8,
+      "losses": 13,
+      "total_pnl": -16.495008435163154
+    },
+    "21": {
+      "wins": 61,
+      "losses": 5,
+      "total_pnl": 114.8347125171255
+    },
+    "23": {
+      "wins": 85,
+      "losses": 14,
+      "total_pnl": 299.23098521401755
+    },
+    "1": {
+      "wins": 85,
+      "losses": 3,
+      "total_pnl": 202.8715139562779
+    },
+    "16": {
+      "wins": 3,
+      "losses": 6,
+      "total_pnl": -13.167685004794807
+    },
+    "20": {
+      "wins": 73,
+      "losses": 8,
+      "total_pnl": 76.14144105331947
+    },
+    "22": {
+      "wins": 81,
+      "losses": 8,
+      "total_pnl": 383.27722379879947
+    },
+    "0": {
+      "wins": 84,
+      "losses": 5,
+      "total_pnl": 421.00097773530297
+    },
+    "10": {
       "wins": 0,
       "losses": 5,
-      "total_pnl": -9.08
+      "total_pnl": -17.864724303658292
+    },
+    "11": {
+      "wins": 0,
+      "losses": 4,
+      "total_pnl": -9.010780185169388
+    },
+    "14": {
+      "wins": 6,
+      "losses": 43,
+      "total_pnl": -44.96953910409409
+    },
+    "2": {
+      "wins": 87,
+      "losses": 6,
+      "total_pnl": 350.46043922276647
+    },
+    "6": {
+      "wins": 70,
+      "losses": 2,
+      "total_pnl": 598.2969735500002
+    },
+    "7": {
+      "wins": 3,
+      "losses": 6,
+      "total_pnl": -9.563538678329213
+    },
+    "5": {
+      "wins": 90,
+      "losses": 9,
+      "total_pnl": 688.5631959314528
+    },
+    "8": {
+      "wins": 2,
+      "losses": 8,
+      "total_pnl": -11.501937640274864
+    },
+    "13": {
+      "wins": 8,
+      "losses": 2,
+      "total_pnl": 8.807769386963386
+    },
+    "19": {
+      "wins": 18,
+      "losses": 10,
+      "total_pnl": -4.593983047095035
+    },
+    "9": {
+      "wins": 0,
+      "losses": 5,
+      "total_pnl": -4.958956028772947
+    },
+    "12": {
+      "wins": 4,
+      "losses": 3,
+      "total_pnl": 4.157205026831987
+    },
+    "18": {
+      "wins": 5,
+      "losses": 3,
+      "total_pnl": 4.9675159495664545
+    },
+    "3": {
+      "wins": 83,
+      "losses": 1,
+      "total_pnl": 569.3945480831583
+    },
+    "4": {
+      "wins": 65,
+      "losses": 6,
+      "total_pnl": 520.8504156999999
     }
   },
   "regime_performance": {
@@ -12,6 +127,36 @@
       "wins": 0,
       "losses": 5,
       "total_pnl": -9.08
+    },
+    "strong_uptrend": {
+      "wins": 14,
+      "losses": 46,
+      "total_pnl": -58.8397570865605
+    },
+    "strong_downtrend": {
+      "wins": 315,
+      "losses": 28,
+      "total_pnl": 1362.4913915101504
+    },
+    "normal": {
+      "wins": 373,
+      "losses": 59,
+      "total_pnl": 1844.4881707154561
+    },
+    "ranging": {
+      "wins": 221,
+      "losses": 36,
+      "total_pnl": 978.3476059912514
+    },
+    "extreme_volatility": {
+      "wins": 0,
+      "losses": 7,
+      "total_pnl": -24.16573077047686
+    },
+    "high_volume_breakout": {
+      "wins": 2,
+      "losses": 12,
+      "total_pnl": -22.161881821560996
     }
   },
   "symbol_performance": {
@@ -21,9 +166,129 @@
       "total_pnl": -3.15
     },
     "SOL/USDT:USDT": {
+      "wins": 19,
+      "losses": 45,
+      "total_pnl": -83.1921515198625
+    },
+    "DOGE/USDT:USDT": {
+      "wins": 17,
+      "losses": 66,
+      "total_pnl": -58.842878906106456
+    },
+    "ETH/USDT:USDT": {
+      "wins": 15,
+      "losses": 33,
+      "total_pnl": -39.093833638491624
+    },
+    "ON/USDT:USDT": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -3.059267999999994
+    },
+    "STO/USDT:USDT": {
+      "wins": 0,
+      "losses": 7,
+      "total_pnl": -14.784907100000009
+    },
+    "SYN/USDT:USDT": {
       "wins": 0,
       "losses": 2,
-      "total_pnl": -5.93
+      "total_pnl": -3.0959160999999877
+    },
+    "AIOT/USDT:USDT": {
+      "wins": 6,
+      "losses": 5,
+      "total_pnl": 4.488796199999992
+    },
+    "HIPPO/USDT:USDT": {
+      "wins": 844,
+      "losses": 2,
+      "total_pnl": 4291.697754699997
+    },
+    "DAM/USDT:USDT": {
+      "wins": 1,
+      "losses": 2,
+      "total_pnl": -4.740297299999999
+    },
+    "SIREN/USDT:USDT": {
+      "wins": 0,
+      "losses": 3,
+      "total_pnl": -4.147759400000002
+    },
+    "JCT/USDT:USDT": {
+      "wins": 3,
+      "losses": 3,
+      "total_pnl": -0.9639070000000078
+    },
+    "RLS/USDT:USDT": {
+      "wins": 3,
+      "losses": 0,
+      "total_pnl": 7.151838000000002
+    },
+    "PIPPIN/USDT:USDT": {
+      "wins": 2,
+      "losses": 0,
+      "total_pnl": 2.9761570000000153
+    },
+    "PLAY/USDT:USDT": {
+      "wins": 1,
+      "losses": 3,
+      "total_pnl": -2.5101624000000067
+    },
+    "PTB/USDT:USDT": {
+      "wins": 3,
+      "losses": 5,
+      "total_pnl": -3.8181346000000076
+    },
+    "\u6211\u8e0f\u9a6c\u6765\u4e86/USDT:USDT": {
+      "wins": 4,
+      "losses": 4,
+      "total_pnl": -4.615510799999985
+    },
+    "KOMA/USDT:USDT": {
+      "wins": 1,
+      "losses": 0,
+      "total_pnl": 1.1516190000000064
+    },
+    "BROCCOLIF3B/USDT:USDT": {
+      "wins": 1,
+      "losses": 0,
+      "total_pnl": 0.3526728000000003
+    },
+    "APR/USDT:USDT": {
+      "wins": 2,
+      "losses": 0,
+      "total_pnl": 4.297281000000002
+    },
+    "SYS/USDT:USDT": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -1.207408999999992
+    },
+    "SQD/USDT:USDT": {
+      "wins": 1,
+      "losses": 0,
+      "total_pnl": 1.1609400000000016
+    },
+    "AGT/USDT:USDT": {
+      "wins": 1,
+      "losses": 2,
+      "total_pnl": -1.4251641999999975
+    },
+    "BANK/USDT:USDT": {
+      "wins": 0,
+      "losses": 2,
+      "total_pnl": -9.204069999999989
+    },
+    "SKYAI/USDT:USDT": {
+      "wins": 1,
+      "losses": 0,
+      "total_pnl": 1.1200244159999972
+    },
+    "ZAMA/USDT:USDT": {
+      "wins": 0,
+      "losses": 4,
+      "total_pnl": -5.465914613280004
     }
   },
   "direction_performance": {
@@ -33,24 +298,233 @@
       "total_pnl": -3.15
     },
     "short": {
-      "wins": 0,
-      "losses": 1,
-      "total_pnl": -2.99
+      "wins": 40,
+      "losses": 125,
+      "total_pnl": -146.22912924105538
     },
     "long": {
-      "wins": 0,
-      "losses": 1,
-      "total_pnl": -2.94
+      "wins": 885,
+      "losses": 65,
+      "total_pnl": 4220.458927779315
     }
   },
   "signal_accuracy": {
     "weak": {
-      "wins": 0,
-      "losses": 5
+      "wins": 925,
+      "losses": 193
     }
   },
   "external_accuracy": {},
-  "lessons": [],
-  "adjustments": {},
-  "total_analyzed": 5
+  "lessons": [
+    "\uc5f0\ud328 3\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 55%\ub85c \ucd95\uc18c",
+    "'ranging' \ub808\uc9d0 \uc2b9\ub960 90% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 30% \ud655\ub300",
+    "'high_volume_breakout' \ub808\uc9d0 \uc2b9\ub960 9% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "\uc5f0\ud328 3\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 55%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 4\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 40%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 5\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 6\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 8\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "'ranging' \ub808\uc9d0 \uc2b9\ub960 89% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 30% \ud655\ub300",
+    "'high_volume_breakout' \ub808\uc9d0 \uc2b9\ub960 8% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "'high_volume_breakout' \ub808\uc9d0 \uc2b9\ub960 15% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "\uc5f0\ud328 3\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 55%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 4\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 40%\ub85c \ucd95\uc18c",
+    "'high_volume_breakout' \ub808\uc9d0 \uc2b9\ub960 14% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "\uc5f0\ud328 3\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 55%\ub85c \ucd95\uc18c",
+    "'ranging' \ub808\uc9d0 \uc2b9\ub960 88% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 30% \ud655\ub300",
+    "\uc5f0\ud328 3\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 55%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 4\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 40%\ub85c \ucd95\uc18c",
+    "'strong_uptrend' \ub808\uc9d0 \uc2b9\ub960 30% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "'short' \ubc29\ud5a5 \uc2b9\ub960 27% \u2192 \uc774 \ubc29\ud5a5 \ud3ec\uc9c0\uc158 50% \ucd95\uc18c",
+    "'strong_uptrend' \ub808\uc9d0 \uc2b9\ub960 29% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "\uc5f0\ud328 3\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 55%\ub85c \ucd95\uc18c",
+    "'strong_uptrend' \ub808\uc9d0 \uc2b9\ub960 28% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "\uc5f0\ud328 4\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 40%\ub85c \ucd95\uc18c",
+    "'strong_uptrend' \ub808\uc9d0 \uc2b9\ub960 27% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "\uc5f0\ud328 3\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 55%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 4\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 40%\ub85c \ucd95\uc18c",
+    "'strong_uptrend' \ub808\uc9d0 \uc2b9\ub960 26% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "'strong_downtrend' \ub808\uc9d0 \uc2b9\ub960 92% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 30% \ud655\ub300",
+    "\uc5f0\ud328 5\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 6\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 7\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "\uc5f0\ud328 8\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "'normal' \ub808\uc9d0 \uc2b9\ub960 87% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 30% \ud655\ub300",
+    "'ranging' \ub808\uc9d0 \uc2b9\ub960 87% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 30% \ud655\ub300",
+    "\uc5f0\ud328 9\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "UTC 9\uc2dc \uc2b9\ub960 0% \u2192 \uc774 \uc2dc\uac04\ub300 \uac70\ub798 \ud68c\ud53c",
+    "'unknown' \ub808\uc9d0 \uc2b9\ub960 0% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "'strong_uptrend' \ub808\uc9d0 \uc2b9\ub960 25% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "\uc5f0\ud328 10\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "UTC 10\uc2dc \uc2b9\ub960 0% \u2192 \uc774 \uc2dc\uac04\ub300 \uac70\ub798 \ud68c\ud53c",
+    "'strong_uptrend' \ub808\uc9d0 \uc2b9\ub960 24% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "'ranging' \ub808\uc9d0 \uc2b9\ub960 86% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 30% \ud655\ub300",
+    "\uc5f0\ud328 11\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "'strong_uptrend' \ub808\uc9d0 \uc2b9\ub960 23% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "'extreme_volatility' \ub808\uc9d0 \uc2b9\ub960 0% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 70% \ucd95\uc18c",
+    "\uc5f0\ud328 12\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "'normal' \ub808\uc9d0 \uc2b9\ub960 86% \u2192 \uc774 \ub808\uc9d0\uc5d0\uc11c \ud3ec\uc9c0\uc158 30% \ud655\ub300",
+    "\uc5f0\ud328 13\ud68c \uac10\uc9c0 \u2192 \ud3ec\uc9c0\uc158 \ud06c\uae30 30%\ub85c \ucd95\uc18c",
+    "'short' \ubc29\ud5a5 \uc2b9\ub960 24% \u2192 \uc774 \ubc29\ud5a5 \ud3ec\uc9c0\uc158 50% \ucd95\uc18c"
+  ],
+  "adjustments": {
+    "losing_streak_scale": 0.3,
+    "avoid_hour_15": true,
+    "regime_scale_unknown": 0.3,
+    "regime_scale_extreme_volatility": 0.3,
+    "direction_scale_short": 0.5,
+    "min_signal_strength": 0.2,
+    "avoid_hour_14": true,
+    "regime_scale_normal": 1.3,
+    "direction_scale_long": 0.5,
+    "regime_scale_high_volume_breakout": 0.3,
+    "avoid_hour_7": true,
+    "regime_scale_strong_uptrend": 0.3,
+    "avoid_hour_8": true,
+    "regime_scale_ranging": 1.3,
+    "avoid_hour_0": true,
+    "regime_scale_strong_downtrend": 1.3,
+    "overlev_scale": 0.7,
+    "avoid_hour_9": true,
+    "avoid_hour_10": true
+  },
+  "total_analyzed": 1118,
+  "entry_path_performance": {},
+  "exit_reason_analysis": {
+    "SL \ub3c4\ub2ec": {
+      "count": 77,
+      "total_pnl": -152.14930031737052,
+      "avg_pnl": -1.97596493918663
+    },
+    "tp": {
+      "count": 2,
+      "total_pnl": 22.944442940665496,
+      "avg_pnl": 11.472221470332748
+    },
+    "\ud2b8\ub808\uc77c\ub9c1 SL \ub3c4\ub2ec": {
+      "count": 36,
+      "total_pnl": 74.95173716175435,
+      "avg_pnl": 2.0819926989376207
+    },
+    "sl": {
+      "count": 994,
+      "total_pnl": 4151.773010753207,
+      "avg_pnl": 4.17683401484226
+    }
+  },
+  "entry_blacklist": [],
+  "loss_patterns": {
+    "normal_short_us": {
+      "count": 9,
+      "total_loss": -21.53110450450232
+    },
+    "strong_uptrend_short_us": {
+      "count": 18,
+      "total_loss": -27.601829658215614
+    },
+    "extreme_volatility_short_us": {
+      "count": 3,
+      "total_loss": -14.587610548014213
+    },
+    "extreme_volatility_short_asia": {
+      "count": 4,
+      "total_loss": -9.57812022246265
+    },
+    "ranging_short_europe": {
+      "count": 10,
+      "total_loss": -19.555496311758034
+    },
+    "normal_short_europe": {
+      "count": 27,
+      "total_loss": -23.83085700293546
+    },
+    "high_volume_breakout_short_asia": {
+      "count": 2,
+      "total_loss": -10.847863505814798
+    },
+    "strong_uptrend_short_europe": {
+      "count": 14,
+      "total_loss": -53.4114736394557
+    },
+    "ranging_short_us": {
+      "count": 12,
+      "total_loss": -22.9969089449382
+    },
+    "normal_short_asia": {
+      "count": 2,
+      "total_loss": -7.131627139999974
+    },
+    "normal_long_us": {
+      "count": 8,
+      "total_loss": -13.387379391823202
+    },
+    "strong_downtrend_long_us": {
+      "count": 3,
+      "total_loss": -6.775032496847519
+    },
+    "strong_downtrend_long_asia": {
+      "count": 13,
+      "total_loss": -24.451386900000017
+    },
+    "ranging_short_asia": {
+      "count": 2,
+      "total_loss": -1.8891936168417525
+    },
+    "normal_long_europe": {
+      "count": 6,
+      "total_loss": -9.442307767745206
+    },
+    "ranging_long_europe": {
+      "count": 4,
+      "total_loss": -7.808905699999998
+    },
+    "strong_downtrend_short_europe": {
+      "count": 8,
+      "total_loss": -12.84031070691623
+    },
+    "high_volume_breakout_short_europe": {
+      "count": 7,
+      "total_loss": -3.0901500000000346
+    },
+    "strong_uptrend_short_asia": {
+      "count": 3,
+      "total_loss": -4.148543000699503
+    },
+    "strong_uptrend_long_asia": {
+      "count": 2,
+      "total_loss": -2.1249569999999935
+    },
+    "strong_uptrend_long_europe": {
+      "count": 5,
+      "total_loss": -8.712305378479996
+    },
+    "strong_uptrend_long_us": {
+      "count": 3,
+      "total_loss": -3.9248801000000073
+    },
+    "ranging_long_us": {
+      "count": 6,
+      "total_loss": -14.561291998405457
+    },
+    "normal_long_asia": {
+      "count": 7,
+      "total_loss": -12.175863226799992
+    },
+    "ranging_long_asia": {
+      "count": 2,
+      "total_loss": -9.082076320000002
+    },
+    "high_volume_breakout_short_us": {
+      "count": 2,
+      "total_loss": -11.045757719324106
+    },
+    "strong_downtrend_long_europe": {
+      "count": 1,
+      "total_loss": -1.0573150657847983
+    },
+    "high_volume_breakout_long_europe": {
+      "count": 1,
+      "total_loss": -1.0606960423955787
+    }
+  }
 }
