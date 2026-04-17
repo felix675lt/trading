@@ -626,9 +626,10 @@ class AutoTrader:
         timeframes = self.config["trading"]["timeframes"]  # 멀티타임프레임
         primary_tf = timeframes[0]  # 메인 타임프레임 (5m)
 
-        # 자기학습 트레이너
+        # 자기학습 트레이너 (tier_manager 주입 → Walk-Forward CV 자동 활성화)
         trainer = SelfLearningTrainer(
             self.collector, self.storage, self.ensemble, self.rl_agent, self.config,
+            tier_manager=self.tier_manager,
         )
 
         # 모델이 없으면 초기 학습
@@ -669,6 +670,26 @@ class AutoTrader:
                                 f"활성 기능: {list(self.tier_manager.get_tier(which).features.keys())}",
                                 silent=False,
                             )
+
+                # === 티어 기반 주문 라우팅 적용 (매 루프, idempotent) ===
+                # order_routing: market_only / limit_first / twap / smart
+                paper_routing = self.tier_manager.get_feature(
+                    "order_routing", mode="paper", default="market_only"
+                )
+                live_routing = self.tier_manager.get_feature(
+                    "order_routing", mode="live", default="market_only"
+                )
+                # PaperTrader
+                self.paper_trader.set_routing(
+                    limit_first=(paper_routing in ("limit_first", "twap", "smart"))
+                )
+                # OrderManager (LIVE)
+                for om_obj in self.order_managers.values():
+                    om_obj.set_routing(
+                        limit_first=(live_routing in ("limit_first", "twap", "smart")),
+                        wait_seconds=20,
+                        offset_pct=0.0001,
+                    )
 
                 # 재학습 체크 (일반 + stuck 감지)
                 diag = self.strategy_manager.get_diagnostics()
@@ -1280,9 +1301,23 @@ class AutoTrader:
 
             # 7.3. 피드백 기반 포지션 크기 조정 + 퀀트 리스크 스케일
             fb_scale = self.feedback.get_position_scale(adaptive_params["regime"], decision.action)
+            # === Kelly sizing (tier=mid+ 활성화, PAPER 가상시드 $5K → mid) ===
+            # 첫 번째 call-site는 paper/dual 공통 분석 단계 → PAPER 티어 기준으로 Kelly
+            kelly_enabled = self.tier_manager.feature_enabled("kelly_enabled", mode="paper")
+            kelly_fraction = self.tier_manager.get_feature("kelly_fraction", mode="paper", default=0.25) or 0.25
+            kelly_stats = (
+                self.feedback.get_kelly_stats(
+                    regime=adaptive_params["regime"],
+                    side=decision.action,
+                )
+                if kelly_enabled else None
+            )
             size = self.risk_manager.calculate_position_size(
                 self.equity, decision.confidence, volatility,
                 adaptive_params["position_scale"] * fb_scale * corr_mult * quant_risk_scale,
+                kelly_enabled=kelly_enabled,
+                kelly_fraction=float(kelly_fraction),
+                kelly_stats=kelly_stats,
             )
 
             # 7.4. 최소 주문 notional 보장 (Binance 최소 $100 + 여유분)
@@ -1681,9 +1716,22 @@ class AutoTrader:
 
             # 포지션 크기 (풀시드) + 퀀트 리스크 스케일
             fb_scale = self.feedback.get_position_scale(adaptive_params["regime"], decision.action)
+            # === Kelly sizing: 집중매매 분석 (PAPER 가상시드 티어 기준) ===
+            kelly_enabled = self.tier_manager.feature_enabled("kelly_enabled", mode="paper")
+            kelly_fraction = self.tier_manager.get_feature("kelly_fraction", mode="paper", default=0.25) or 0.25
+            kelly_stats = (
+                self.feedback.get_kelly_stats(
+                    regime=adaptive_params["regime"],
+                    side=decision.action,
+                )
+                if kelly_enabled else None
+            )
             size = self.risk_manager.calculate_position_size(
                 self.equity, decision.confidence, volatility,
                 adaptive_params["position_scale"] * fb_scale * quant_risk_scale,
+                kelly_enabled=kelly_enabled,
+                kelly_fraction=float(kelly_fraction),
+                kelly_stats=kelly_stats,
             )
 
             # 최소 notional 보장
@@ -1808,6 +1856,25 @@ class AutoTrader:
             return
         if c["action"] in ("long", "short"):
             if symbol not in self.paper_trader.positions:
+                # === CVaR tail risk 체크 (PAPER 가상시드 mid+ 티어에서 활성화) ===
+                if self.tier_manager.feature_enabled("cvar_risk", mode="paper"):
+                    passed, cvar_pct, reason = self.risk_manager.check_cvar_limit(
+                        proposed_notional=c["notional"],
+                        equity=max(self.paper_trader.equity, 1.0),
+                        threshold_pct=0.05,
+                    )
+                    if not passed:
+                        logger.warning(f"[CVaR-PAPER] {symbol} 진입 차단: {reason}")
+                        add_live_log({
+                            "time": datetime.utcnow().strftime("%H:%M:%S"),
+                            "type": "cvar_block",
+                            "mode": "PAPER",
+                            "symbol": symbol,
+                            "cvar_pct": round(cvar_pct, 4),
+                            "reason": reason,
+                        })
+                        return
+
                 tp_pct = c.get("tp_pct", self.config["risk"]["take_profit_pct"])
                 sl_pct = c.get("sl_pct", self.config["risk"]["stop_loss_pct"])
                 self.paper_trader.open_position(
@@ -2163,6 +2230,26 @@ class AutoTrader:
             except Exception as e:
                 logger.warning(f"[LIVE] 잔고 조회 실패: {e}")
                 return  # 잔고 확인 안 되면 LIVE 진입 차단
+
+            # === CVaR tail risk 체크 (tier=mid+ 활성화) ===
+            if self.tier_manager.feature_enabled("cvar_risk", mode="live"):
+                notional_check = c["size"] * c["dynamic_lev"]
+                passed, cvar_pct, reason = self.risk_manager.check_cvar_limit(
+                    proposed_notional=notional_check,
+                    equity=max(self.live_equity, 1.0),
+                    threshold_pct=0.05,
+                )
+                if not passed:
+                    logger.warning(f"[CVaR-LIVE] {symbol} 진입 차단: {reason}")
+                    add_live_log({
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "type": "cvar_block",
+                        "mode": "LIVE",
+                        "symbol": symbol,
+                        "cvar_pct": round(cvar_pct, 4),
+                        "reason": reason,
+                    })
+                    return
 
             result = await om.open_position(
                 symbol, c["action"], c["size"], c["dynamic_lev"],

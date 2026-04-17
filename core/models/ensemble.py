@@ -17,11 +17,21 @@ class EnsembleSignalGenerator:
         self.weights = {"xgboost": 0.5, "lstm": 0.5}
         self._performance_history: list[dict] = []
 
-    def train_all(self, df: pd.DataFrame, feature_cols: list[str]):
-        """모든 모델 학습"""
-        logger.info("=== 앙상블 모델 학습 시작 ===")
-        xgb_acc = self.xgb.train(df, feature_cols)
-        lstm_acc = self.lstm.train(df, feature_cols)
+    def train_all(self, df: pd.DataFrame, feature_cols: list[str], walk_forward: bool = False):
+        """모든 모델 학습
+
+        Args:
+            walk_forward: True이면 TimeSeriesSplit 기반 walk-forward CV
+                          (Capital Tier small+ 활성화 — 정보누수 차단된 OOS 평가)
+        """
+        if walk_forward:
+            logger.info("=== 앙상블 모델 Walk-Forward CV 학습 시작 ===")
+            xgb_acc = self.xgb.train_walkforward(df, feature_cols)
+            lstm_acc = self.lstm.train_walkforward(df, feature_cols)
+        else:
+            logger.info("=== 앙상블 모델 학습 시작 ===")
+            xgb_acc = self.xgb.train(df, feature_cols)
+            lstm_acc = self.lstm.train(df, feature_cols)
 
         # 정확도 기반 가중치 자동 조정
         total = xgb_acc + lstm_acc

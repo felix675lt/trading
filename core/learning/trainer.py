@@ -26,12 +26,14 @@ class SelfLearningTrainer:
         ensemble: EnsembleSignalGenerator,
         rl_agent: RLAgent,
         config: dict,
+        tier_manager=None,  # CapitalTierManager (optional, walk-forward CV gating용)
     ):
         self.collector = collector
         self.storage = storage
         self.ensemble = ensemble
         self.rl_agent = rl_agent
         self.config = config
+        self.tier_manager = tier_manager
         self.feature_engineer = FeatureEngineer(config.get("ml", {}).get("features"))
         self._train_time_file = Path("models_saved/.last_train_time")
         self.last_train_time = self._load_last_train_time()
@@ -93,7 +95,23 @@ class SelfLearningTrainer:
         prev_lstm_acc = self.ensemble.lstm.accuracy
 
         # 2. ML 앙상블 학습 (기존 모델 이어서 / 외부 피처 포함)
-        self.ensemble.train_all(df, all_feature_cols)
+        #    티어 기반 Walk-Forward CV: small+ 에서 활성화 (PAPER 가상 시드 포함)
+        use_walk_forward = False
+        if self.tier_manager is not None:
+            try:
+                use_walk_forward = (
+                    self.tier_manager.feature_enabled("walk_forward_cv", mode="paper")
+                    or self.tier_manager.feature_enabled("walk_forward_cv", mode="live")
+                )
+            except Exception as e:
+                logger.debug(f"[WalkForward] 티어 조회 실패: {e}")
+
+        if use_walk_forward:
+            logger.info(
+                f"[WalkForward] 활성화 — tier(paper={self.tier_manager.get_tier('paper').name}"
+                f", live={self.tier_manager.get_tier('live').name})"
+            )
+        self.ensemble.train_all(df, all_feature_cols, walk_forward=use_walk_forward)
 
         # 3. RL 에이전트 학습 (기존 모델 이어서 / 기본 피처만)
         ohlcv_cols = ["open", "high", "low", "close", "volume"]

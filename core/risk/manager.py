@@ -1,5 +1,12 @@
-"""리스크 매니저 - 포지션 크기, 드로다운, 일일 손실, 동적 레버리지, 상관관계 관리"""
+"""리스크 매니저 - 포지션 크기, 드로다운, 일일 손실, 동적 레버리지, 상관관계 관리
 
+v5 — Capital Tier 연동:
+- Kelly fractional sizing (tier=mid+ 활성화)
+- CVaR tail risk cap (tier=mid+ 활성화)
+- PnL 히스토리 덱 (CVaR/분석용)
+"""
+
+from collections import deque
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -42,6 +49,12 @@ class RiskManager:
         # 연패 추적 (쿨다운용)
         self.consecutive_losses = 0
         self._last_leverage: float = self.base_leverage
+
+        # PnL 히스토리 (CVaR/분석용) — 최근 200건
+        self._pnl_history: deque = deque(maxlen=200)
+        # 마지막 Kelly/CVaR 상태 (디버깅/리포트용)
+        self._last_kelly: dict = {"used": False, "fraction": 0.0, "size": 0.0}
+        self._last_cvar: dict = {"checked": False, "cvar_pct": 0.0, "threshold_pct": 0.0, "passed": True}
 
     def initialize(self, equity: float):
         self.initial_equity = equity
@@ -248,32 +261,144 @@ class RiskManager:
         confidence: float,
         volatility: float,
         adaptive_scale: float = 1.0,
+        kelly_enabled: bool = False,
+        kelly_fraction: float = 0.25,
+        kelly_stats: dict | None = None,
     ) -> float:
-        """켈리 기준 + 변동성 기반 포지션 크기 계산"""
+        """포지션 크기 계산 — confidence/volatility 기반, tier에 따라 Kelly 혼합
+
+        Args:
+            kelly_enabled: Capital Tier가 kelly_enabled=True인 경우 활성화
+            kelly_fraction: Fractional Kelly 비율 (0.25 = 1/4 Kelly, 안전)
+            kelly_stats: TradeFeedbackAnalyzer.get_kelly_stats() 반환값
+                         {win_rate, avg_win, avg_loss, sample_size, kelly_fraction_raw}
+
+        Kelly 전략:
+        - 샘플 ≥ 10이고 kelly_fraction_raw > 0일 때만 Kelly 적용
+        - Kelly 원시 비율에 fractional 계수 곱해서 안전성 확보
+        - Kelly와 기존 confidence 기반 크기를 min() 처리 — 더 보수적인 쪽 채택
+        - 샘플 부족 시 기존 confidence 기반 크기로 fallback
+        """
+        # === 기존 confidence + volatility 기반 사이즈 ===
         base_size = equity * self.max_position_pct
 
-        # 확신도 비례 조정
         confidence_factor = max(0.3, min(1.0, confidence))
         sized = base_size * confidence_factor
 
-        # 변동성 역비례 조정 (변동성 높으면 포지션 줄임)
         if volatility > 0:
             vol_factor = min(1.0, 0.02 / (volatility + 1e-8))
             sized *= vol_factor
 
-        # 적응형 스케일
         sized *= adaptive_scale
 
-        # 최소/최대 제한
         min_size = equity * 0.01
         max_size = equity * self.max_position_pct
         sized = max(min_size, min(max_size, sized))
 
+        # === Kelly 혼합 (tier=mid+ 활성화) ===
+        if kelly_enabled and kelly_stats:
+            kelly_raw = kelly_stats.get("kelly_fraction_raw", 0.0)
+            sample_size = kelly_stats.get("sample_size", 0)
+            if sample_size >= 10 and kelly_raw > 0:
+                # Fractional Kelly: f = f* × fraction (예: f* × 0.25)
+                fractional = max(0.0, min(1.0, kelly_raw * kelly_fraction))
+                kelly_size = equity * fractional
+                # 더 보수적인 쪽 채택 — 폭주 방지
+                final_size = min(sized, kelly_size)
+                # 최소 equity × 1% 보장
+                final_size = max(min_size, final_size)
+                self._last_kelly = {
+                    "used": True,
+                    "fraction": round(fractional, 4),
+                    "kelly_raw": round(kelly_raw, 4),
+                    "win_rate": kelly_stats.get("win_rate", 0),
+                    "payoff_ratio": kelly_stats.get("payoff_ratio", 0),
+                    "sample_size": sample_size,
+                    "size": round(final_size, 2),
+                    "confidence_based_size": round(sized, 2),
+                }
+                logger.info(
+                    f"[Kelly] WR={kelly_stats.get('win_rate'):.2f} "
+                    f"payoff={kelly_stats.get('payoff_ratio'):.2f} "
+                    f"f*={kelly_raw:.3f} → f={fractional:.3f} "
+                    f"size=${final_size:.2f} (conf=${sized:.2f}, 채택={min(sized, kelly_size)/equity:.1%})"
+                )
+                return final_size
+            else:
+                self._last_kelly = {
+                    "used": False,
+                    "reason": f"sample={sample_size}<10 or kelly_raw={kelly_raw:.3f}<=0",
+                    "size": round(sized, 2),
+                }
+        else:
+            self._last_kelly = {"used": False, "reason": "disabled", "size": round(sized, 2)}
+
         return sized
+
+    def check_cvar_limit(
+        self,
+        proposed_notional: float,
+        equity: float,
+        threshold_pct: float = 0.05,
+        alpha: float = 0.95,
+    ) -> tuple[bool, float, str]:
+        """CVaR (Expected Shortfall) tail risk 체크
+
+        최근 PnL 히스토리에서 worst 5% (α=0.95) 평균 손실이
+        제안된 notional의 % 대비 threshold 초과하면 차단.
+
+        Returns:
+            (passed, cvar_pct, reason)
+            - passed: False면 거래 거부
+            - cvar_pct: 관찰된 CVaR (절댓값) / equity 비율
+            - reason: 차단 사유 (passed=True일 때는 "OK")
+        """
+        if len(self._pnl_history) < 20:
+            # 데이터 부족 → 통과 (fallback)
+            self._last_cvar = {"checked": False, "reason": "sample<20", "passed": True}
+            return True, 0.0, "샘플 부족"
+
+        pnls = np.array(list(self._pnl_history))
+        losses = -pnls[pnls < 0]  # 손실만 추출 (양수로 변환)
+
+        if len(losses) < 5:
+            self._last_cvar = {"checked": False, "reason": "losses<5", "passed": True}
+            return True, 0.0, "손실 샘플 부족"
+
+        # VaR(α): 손실 분포의 α-quantile
+        # CVaR(α) = E[L | L ≥ VaR(α)] — worst (1-α)% 손실의 평균
+        var_threshold = np.quantile(losses, alpha)
+        tail_losses = losses[losses >= var_threshold]
+        cvar = float(np.mean(tail_losses)) if len(tail_losses) > 0 else float(np.max(losses))
+
+        # equity 대비 CVaR 비율
+        cvar_pct_of_equity = cvar / max(equity, 1.0)
+
+        # 제안 notional의 손실 잠재력 ~ notional × SL% ≈ CVaR 히스토릭 평균
+        # → equity 대비 cvar_pct가 threshold보다 크면 차단
+        self._last_cvar = {
+            "checked": True,
+            "cvar_usd": round(cvar, 2),
+            "cvar_pct": round(cvar_pct_of_equity, 4),
+            "threshold_pct": threshold_pct,
+            "sample_size": len(losses),
+            "passed": cvar_pct_of_equity <= threshold_pct,
+        }
+
+        if cvar_pct_of_equity > threshold_pct:
+            reason = (
+                f"CVaR(95%)=${cvar:.2f} ({cvar_pct_of_equity:.1%}/equity) > "
+                f"허용 {threshold_pct:.1%} — 과거 tail 손실 과다"
+            )
+            logger.warning(f"[CVaR] 거래 차단: {reason}")
+            return False, cvar_pct_of_equity, reason
+
+        return True, cvar_pct_of_equity, "OK"
 
     def record_trade_result(self, pnl: float):
         """거래 결과 기록 (PnL + 연패/연승 추적)"""
         self.daily_pnl += pnl
+        self._pnl_history.append(float(pnl))
 
         if pnl < 0:
             self.consecutive_losses += 1
@@ -323,6 +448,9 @@ class RiskManager:
             "consecutive_losses": self.consecutive_losses,
             "current_leverage": self._last_leverage,
             "cooldown_active": self._cooldown_until is not None and datetime.utcnow() < self._cooldown_until,
+            "pnl_history_size": len(self._pnl_history),
+            "last_kelly": self._last_kelly,
+            "last_cvar": self._last_cvar,
             "correlations": {
                 f"{s1}-{s2}": round(self._calculate_correlation(s1, s2), 2)
                 for i, s1 in enumerate(self._price_histories)

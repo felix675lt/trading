@@ -3,8 +3,14 @@
 거래소 Algo Order(SL/TP) 사용하지 않음.
 봇이 직접 가격을 감시하고 시장가로 청산 — PAPER와 동일한 방식.
 거래소에 SL 위치를 노출하지 않아 스탑 헌팅 회피.
+
+v5 — Limit-first order routing (tier=small+ 활성화):
+- 진입 시 best-bid/ask에 post-only limit 주문 → maker fee 0.02% 활용
+- limit_wait_seconds (기본 20초) 대기 → 미체결 시 취소하고 market fallback
+- taker fee 0.04% vs maker fee 0.02% → 편도 50% 수수료 절감
 """
 
+import asyncio
 import math
 from dataclasses import dataclass
 from datetime import datetime
@@ -66,6 +72,23 @@ class OrderManager:
         # 수수료 (왕복: 진입 + 청산)
         self.commission_pct = risk_config.get("commission_pct", 0.0004)  # 편도 0.04%
 
+        # Limit-first order routing (tier=small+ 활성화)
+        self.limit_first_enabled = False  # main.py에서 tier 기반으로 set
+        self.limit_wait_seconds = 20      # 지정가 대기 시간
+        self.limit_offset_pct = 0.0001    # best-bid/ask에서 소폭 offset (체결 확률 ↑)
+
+    def set_routing(self, limit_first: bool, wait_seconds: int = 20, offset_pct: float = 0.0001):
+        """Capital Tier에 따라 주문 라우팅 방식 설정 (main.py에서 호출)"""
+        self.limit_first_enabled = limit_first
+        self.limit_wait_seconds = wait_seconds
+        self.limit_offset_pct = offset_pct
+        if limit_first:
+            logger.info(
+                f"[Routing] Limit-first 활성화 (wait={wait_seconds}s, offset={offset_pct*100:.3f}%)"
+            )
+        else:
+            logger.info("[Routing] Market-only 모드")
+
     def _get_profile(self, trade_type: str) -> dict:
         return self.trade_profiles.get(trade_type, {})
 
@@ -83,6 +106,77 @@ class OrderManager:
 
     def set_tp_callback(self, callback):
         self._on_tp_callback = callback
+
+    async def _try_limit_first(
+        self,
+        symbol: str,
+        order_side: str,  # "buy" or "sell"
+        amount: float,
+    ) -> dict | None:
+        """Limit-first 진입 시도 — 실패 시 None 반환하여 호출부가 market fallback
+
+        전략:
+        1. best bid(buy)/ask(sell)에서 offset 만큼 유리한 가격에 limit 주문
+        2. limit_wait_seconds 동안 체결 대기 (1초마다 상태 확인)
+        3. 체결됨 → order 반환 / 미체결 → 취소하고 None 반환
+        """
+        try:
+            bid, ask, _ = await self.exchange.get_bid_ask(symbol)
+            # maker 체결 우선 — bid에 buy, ask에 sell (크로스 방지)
+            if order_side == "buy":
+                limit_price = bid * (1 - self.limit_offset_pct)
+            else:
+                limit_price = ask * (1 + self.limit_offset_pct)
+
+            logger.info(
+                f"[Limit-first] {order_side} {amount:.6f} {symbol} @ {limit_price:.4f} "
+                f"(bid={bid:.4f} ask={ask:.4f}, wait={self.limit_wait_seconds}s)"
+            )
+            order = await self.exchange.create_limit_order(
+                symbol, order_side, amount, limit_price
+            )
+            order_id = order.get("id")
+            if not order_id:
+                logger.warning(f"[Limit-first] {symbol} 주문 ID 없음 → market fallback")
+                return None
+
+            # 폴링 (1초 간격)
+            for elapsed in range(self.limit_wait_seconds):
+                await asyncio.sleep(1)
+                status = await self.exchange.fetch_order_status(order_id, symbol)
+                if not status:
+                    continue
+                st = (status.get("status") or "").lower()
+                filled = float(status.get("filled", 0) or 0)
+                if st in ("closed", "filled") or filled >= amount * 0.99:
+                    logger.info(
+                        f"[Limit-first] {symbol} 체결 성공 ({elapsed+1}s) "
+                        f"filled={filled:.6f}/{amount:.6f} @ {status.get('average', limit_price)}"
+                    )
+                    return status
+                if st in ("canceled", "cancelled", "expired"):
+                    logger.info(f"[Limit-first] {symbol} 주문 취소됨 ({st}) → market fallback")
+                    return None
+
+            # 시간 초과 → 취소
+            logger.info(
+                f"[Limit-first] {symbol} {self.limit_wait_seconds}s 미체결 → 취소 후 market fallback"
+            )
+            await self.exchange.cancel_order(order_id, symbol)
+            # 취소 후 부분 체결 있으면 반영
+            final = await self.exchange.fetch_order_status(order_id, symbol)
+            final_filled = float(final.get("filled", 0) or 0) if final else 0
+            if final_filled >= amount * 0.5:
+                # 절반 이상 체결됐으면 limit 결과 수용 (나머지는 포기)
+                logger.warning(
+                    f"[Limit-first] {symbol} 부분체결 {final_filled:.6f} ({final_filled/amount*100:.0f}%) 수용"
+                )
+                return final
+            return None
+
+        except Exception as e:
+            logger.warning(f"[Limit-first] {symbol} 실패: {e} → market fallback")
+            return None
 
     async def recover_positions(self, symbols: list[str]) -> list[Position]:
         """시스템 재시작 시 거래소의 기존 포지션 복구 (Algo Order 없이)"""
@@ -193,11 +287,18 @@ class OrderManager:
             if notional < min_notional:
                 amount = math.ceil(min_notional / price / step) * step
 
-            # 시장가 진입만 — Algo Order 없음
-            order = await self.exchange.create_market_order(
-                symbol, "buy" if side == "long" else "sell", amount
-            )
-            fill_price = float(order.get("average", price))
+            # === 주문 라우팅: limit-first 또는 market-only ===
+            order_side = "buy" if side == "long" else "sell"
+            order = None
+
+            if self.limit_first_enabled:
+                order = await self._try_limit_first(symbol, order_side, amount)
+
+            if order is None:
+                # limit-first 비활성화 or 미체결 → market fallback
+                order = await self.exchange.create_market_order(symbol, order_side, amount)
+
+            fill_price = float(order.get("average", price) or price)
 
             # 실제 체결 수량 확인 — 부분 체결 대응
             filled = float(order.get("filled", 0))

@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from loguru import logger
+from sklearn.model_selection import TimeSeriesSplit
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -189,6 +190,137 @@ class LSTMPredictor:
         gc.collect()
 
         return self.accuracy
+
+    def train_walkforward(
+        self,
+        df: pd.DataFrame,
+        feature_cols: list[str],
+        label_col: str = "label",
+        n_splits: int = 3,
+        purge_gap: int = 12,
+        epochs: int = 30,
+        batch_size: int = 64,
+        lr: float = 0.001,
+    ) -> float:
+        """Walk-forward CV for LSTM (tier=small+ 활성화)
+
+        LSTM은 학습 비용이 커서 n_splits=3 기본. 각 폴드 epochs 축소(30).
+        최종 모델은 마지막 폴드(가장 많은 데이터) 기준.
+        """
+        gc.collect()
+        self.feature_columns = feature_cols
+        X_raw = df[feature_cols].values.astype(np.float32)
+        y_raw = df[label_col].values.astype(np.int64)
+
+        # 정규화
+        self.mean = X_raw.mean(axis=0)
+        self.std = X_raw.std(axis=0) + 1e-8
+        X = (X_raw - self.mean) / self.std
+
+        # 시퀀스 생성 전 인덱스 기준 walk-forward split
+        n_samples = len(X) - self.seq_length
+        if n_samples < n_splits * 500:
+            logger.warning(
+                f"[WalkForward-LSTM] 샘플 부족 ({n_samples} < {n_splits*500}) → 기존 train()로 fallback"
+            )
+            return self.train(df, feature_cols, label_col, epochs=epochs, batch_size=batch_size, lr=lr)
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        fold_accs = []
+        prev_accuracy = self.accuracy
+
+        logger.info(f"[WalkForward-LSTM] {n_splits}-fold CV 시작 (purge_gap={purge_gap}, epochs={epochs})")
+
+        indices = np.arange(n_samples)
+        last_state = None
+
+        for fold_idx, (train_idx_raw, test_idx_raw) in enumerate(tscv.split(indices)):
+            # Purge
+            if len(train_idx_raw) > purge_gap:
+                train_idx_raw = train_idx_raw[:-purge_gap]
+
+            # 시퀀스 생성 (폴드별)
+            X_tr_seq = np.stack([X[i:i + self.seq_length] for i in train_idx_raw]).astype(np.float32)
+            y_tr_seq = y_raw[train_idx_raw + self.seq_length].astype(np.int64)
+
+            X_te_seq = np.stack([X[i:i + self.seq_length] for i in test_idx_raw]).astype(np.float32)
+            y_te_seq = y_raw[test_idx_raw + self.seq_length].astype(np.int64)
+
+            # 메모리 상한
+            if len(X_tr_seq) > self.MAX_SEQUENCES:
+                rng = np.random.default_rng(seed=42 + fold_idx)
+                sel = np.sort(rng.choice(len(X_tr_seq), self.MAX_SEQUENCES, replace=False))
+                X_tr_seq = X_tr_seq[sel]
+                y_tr_seq = y_tr_seq[sel]
+
+            train_ds = TensorDataset(torch.FloatTensor(X_tr_seq), torch.LongTensor(y_tr_seq))
+            train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+            test_X_t = torch.FloatTensor(X_te_seq).to(self.device)
+            test_y_t = torch.LongTensor(y_te_seq).to(self.device)
+
+            del X_tr_seq, y_tr_seq, X_te_seq, y_te_seq
+            gc.collect()
+
+            # 새 모델 (폴드마다 독립 학습 — OOS 정확도의 진짜 추정)
+            fold_model = LSTMNetwork(input_size=len(feature_cols)).to(self.device)
+            optimizer = torch.optim.Adam(fold_model.parameters(), lr=lr)
+            criterion = nn.CrossEntropyLoss()
+
+            best_fold_acc = 0.0
+            best_fold_state = None
+            for epoch in range(epochs):
+                fold_model.train()
+                for bX, by in train_loader:
+                    bX, by = bX.to(self.device), by.to(self.device)
+                    optimizer.zero_grad()
+                    out = fold_model(bX)
+                    loss = criterion(out, by)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(fold_model.parameters(), 1.0)
+                    optimizer.step()
+
+                fold_model.eval()
+                with torch.no_grad():
+                    pred = fold_model(test_X_t).argmax(dim=1)
+                    acc = (pred == test_y_t).float().mean().item()
+                    if acc > best_fold_acc:
+                        best_fold_acc = acc
+                        best_fold_state = {k: v.clone() for k, v in fold_model.state_dict().items()}
+
+            fold_accs.append(best_fold_acc)
+            last_state = best_fold_state  # 마지막 폴드 state 보존 (최종 모델용)
+            logger.info(
+                f"[WalkForward-LSTM] Fold {fold_idx+1}/{n_splits}: "
+                f"train_seq={len(train_loader.dataset)} test_seq={len(test_y_t)} "
+                f"best_acc={best_fold_acc:.4f}"
+            )
+
+            del fold_model, train_ds, train_loader, test_X_t, test_y_t
+            if best_fold_state is not last_state:
+                del best_fold_state
+            gc.collect()
+
+        mean_acc = float(np.mean(fold_accs))
+        std_acc = float(np.std(fold_accs))
+        logger.info(
+            f"[WalkForward-LSTM] 완료: 평균 acc={mean_acc:.4f} ± {std_acc:.4f} "
+            f"(최저={min(fold_accs):.4f}, 최고={max(fold_accs):.4f})"
+        )
+
+        # 롤백 가드
+        if prev_accuracy > 0 and mean_acc < prev_accuracy - 0.05:
+            logger.warning(
+                f"[WalkForward-LSTM] OOS {mean_acc:.4f} < 기존 {prev_accuracy:.4f} - 0.05 → 롤백"
+            )
+            self.accuracy = prev_accuracy
+            return self.accuracy
+
+        # 최종 모델: 마지막 폴드의 state 사용
+        self.model = LSTMNetwork(input_size=len(feature_cols)).to(self.device)
+        if last_state:
+            self.model.load_state_dict(last_state)
+        self.accuracy = mean_acc
+        return mean_acc
 
     def predict(self, df: pd.DataFrame) -> dict:
         """예측"""

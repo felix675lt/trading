@@ -210,3 +210,33 @@ class ExchangeClient:
     async def get_ticker_price(self, symbol: str) -> float:
         ticker = await self.exchange.fetch_ticker(symbol)
         return float(ticker["last"])
+
+    async def get_bid_ask(self, symbol: str) -> tuple[float, float, float]:
+        """Best bid/ask/last 조회 — 지정가 주문 가격 결정용"""
+        try:
+            ticker = await self.exchange.fetch_ticker(symbol)
+            bid = float(ticker.get("bid") or ticker["last"])
+            ask = float(ticker.get("ask") or ticker["last"])
+            last = float(ticker["last"])
+            return bid, ask, last
+        except Exception as e:
+            logger.warning(f"bid/ask 조회 실패 ({symbol}): {e}")
+            last = await self.get_ticker_price(symbol)
+            return last, last, last
+
+    async def fetch_order_status(self, order_id: str, symbol: str) -> dict:
+        """주문 상태 조회 (체결/미체결/취소)"""
+        try:
+            return await self.exchange.fetch_order(order_id, symbol)
+        except Exception as e:
+            logger.debug(f"주문 상태 조회 실패 ({order_id}): {e}")
+            return {}
+
+    async def cancel_order(self, order_id: str, symbol: str) -> bool:
+        """단일 주문 취소"""
+        try:
+            await self.exchange.cancel_order(order_id, symbol)
+            return True
+        except Exception as e:
+            logger.debug(f"주문 취소 실패 ({order_id}): {e}")
+            return False

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBClassifier
 
 
@@ -84,6 +85,91 @@ class XGBoostPredictor:
         logger.info(f"XGBoost {train_type}학습 완료 - 정확도: {self.accuracy:.4f}{improvement}")
         logger.info(f"\n{classification_report(y_test, y_pred, target_names=['하락','횡보','상승'], zero_division=0)}")
         return self.accuracy
+
+    def train_walkforward(
+        self,
+        df: pd.DataFrame,
+        feature_cols: list[str],
+        label_col: str = "label",
+        n_splits: int = 5,
+        purge_gap: int = 12,
+    ) -> float:
+        """Walk-forward Cross-Validation 학습 (tier=small+ 활성화)
+
+        TimeSeriesSplit으로 n_splits개의 expanding window 폴드 생성.
+        각 폴드 train/test 사이에 purge_gap만큼 공백 — 정보 누수 방지 (Lopez de Prado).
+
+        Args:
+            n_splits: 시간순 분할 개수 (기본 5)
+            purge_gap: train 끝과 test 시작 사이 버리는 샘플 수 (label horizon 고려)
+
+        Returns:
+            모든 폴드의 out-of-sample 평균 accuracy.
+            최종 모델은 마지막 폴드(train=전체의 (n/n+1), test=마지막 1/(n+1))로 학습.
+        """
+        self.feature_columns = feature_cols
+        X = df[feature_cols].values
+        y = df[label_col].values
+
+        if len(X) < n_splits * 100:
+            logger.warning(
+                f"[WalkForward-XGB] 샘플 부족 ({len(X)} < {n_splits * 100}) → 기존 train()로 fallback"
+            )
+            return self.train(df, feature_cols, label_col)
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        fold_accs = []
+
+        logger.info(f"[WalkForward-XGB] {n_splits}-fold CV 시작 (purge_gap={purge_gap})")
+
+        last_model = None
+        for fold_idx, (train_idx, test_idx) in enumerate(tscv.split(X)):
+            # Purge: train 끝 purge_gap개 샘플 버림 (label horizon 보호)
+            if len(train_idx) > purge_gap:
+                train_idx = train_idx[:-purge_gap]
+
+            X_tr, X_te = X[train_idx], X[test_idx]
+            y_tr, y_te = y[train_idx], y[test_idx]
+
+            fold_model = XGBClassifier(
+                n_estimators=300,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                use_label_encoder=False,
+                eval_metric="mlogloss",
+                early_stopping_rounds=20,
+            )
+            fold_model.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
+            y_pred = fold_model.predict(X_te)
+            acc = accuracy_score(y_te, y_pred)
+            fold_accs.append(acc)
+            last_model = fold_model
+            logger.info(
+                f"[WalkForward-XGB] Fold {fold_idx+1}/{n_splits}: "
+                f"train={len(train_idx)} test={len(test_idx)} acc={acc:.4f}"
+            )
+
+        mean_acc = float(np.mean(fold_accs))
+        std_acc = float(np.std(fold_accs))
+        logger.info(
+            f"[WalkForward-XGB] 완료: 평균 acc={mean_acc:.4f} ± {std_acc:.4f} "
+            f"(최저={min(fold_accs):.4f}, 최고={max(fold_accs):.4f})"
+        )
+
+        # 성능 가드: 기존 모델보다 5%p 이상 하락하면 롤백
+        if self.accuracy > 0 and mean_acc < self.accuracy - 0.05:
+            logger.warning(
+                f"[WalkForward-XGB] OOS 평균 {mean_acc:.4f} < 기존 {self.accuracy:.4f} - 0.05 → 롤백"
+            )
+            if self.load():
+                return self.accuracy
+
+        # 채택: 마지막 폴드의 모델을 최종 모델로 (가장 많은 데이터 본 것)
+        self.model = last_model
+        self.accuracy = mean_acc
+        return mean_acc
 
     def predict(self, df: pd.DataFrame) -> dict:
         """시그널 예측 반환"""

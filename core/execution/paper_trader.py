@@ -32,7 +32,8 @@ class PaperTrader:
                  trade_profiles: dict | None = None):
         self.initial_capital = initial_capital
         self.equity = initial_capital
-        self.commission = commission
+        self.commission = commission                       # taker fee (기본 0.04%)
+        self.maker_commission = commission * 0.5           # maker fee 추정 (0.02%)
         self.trade_profiles = trade_profiles or {}
         self.positions: dict[str, PaperPosition] = {}
         self.trade_history: list[dict] = []
@@ -47,6 +48,17 @@ class PaperTrader:
 
         # 자동 청산 콜백 (SL/TP/트레일링으로 청산 시 호출)
         self._on_auto_close_callback = None
+
+        # Limit-first routing (tier=small+ 활성화)
+        self.limit_first_enabled = False
+        # 지정가 체결률 통계 — maker fee 적용률 추적
+        self.limit_fill_stats = {"attempts": 0, "filled": 0, "fallback_market": 0}
+
+    def set_routing(self, limit_first: bool):
+        """Capital Tier 기반 라우팅 설정"""
+        self.limit_first_enabled = limit_first
+        if limit_first:
+            logger.info("[Paper-Routing] Limit-first 시뮬레이션 활성화 (maker fee 0.02% 적용)")
 
     def set_auto_close_callback(self, callback):
         """SL/TP/트레일링 자동 청산 시 호출할 콜백 등록
@@ -83,7 +95,22 @@ class PaperTrader:
                 del self._sl_cooldown[symbol]
 
         amount = (size_usdt * leverage) / price
-        fee = size_usdt * self.commission
+
+        # === Limit-first 시뮬레이션 (tier=small+ 활성화) ===
+        # 가정: 65% 확률로 maker 체결(limit fee), 35%는 market fallback(taker fee)
+        # 이 비율은 실제 limit 체결률 피드백으로 추후 보정 가능
+        is_maker = False
+        if self.limit_first_enabled:
+            import random
+            self.limit_fill_stats["attempts"] += 1
+            is_maker = random.random() < 0.65
+            if is_maker:
+                self.limit_fill_stats["filled"] += 1
+            else:
+                self.limit_fill_stats["fallback_market"] += 1
+
+        effective_commission = self.maker_commission if is_maker else self.commission
+        fee = size_usdt * effective_commission
         self.equity -= fee
 
         # trade_type 프로파일에서 기본값 가져오기

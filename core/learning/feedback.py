@@ -458,6 +458,82 @@ class TradeFeedbackAnalyzer:
         """전략 매니저에 전달할 자동 조정값 반환"""
         return self.feedback.get("adjustments", {})
 
+    def get_kelly_stats(
+        self,
+        regime: str | None = None,
+        side: str | None = None,
+        symbol: str | None = None,
+        min_samples: int = 10,
+    ) -> dict:
+        """Kelly 사이징에 필요한 통계 반환 (win_rate, avg_win, avg_loss, sample_size)
+
+        필터가 주어지면 recent_trades에서 조건에 맞는 거래만 집계.
+        샘플 수가 min_samples 미만이면 sample_size=N만 반환 — 호출부가 fallback 결정.
+
+        Returns:
+            {
+                "win_rate": 0.0~1.0,
+                "avg_win": 양수 (평균 수익, USDT),
+                "avg_loss": 양수 (평균 손실 절댓값, USDT),
+                "sample_size": N,
+                "payoff_ratio": avg_win / avg_loss,
+                "kelly_fraction_raw": f* = (p·b - q) / b,  # b = payoff_ratio
+            }
+        """
+        # recent_trades에서 조건 매칭
+        filtered = []
+        for t in self.recent_trades:
+            if regime and t.get("regime") != regime:
+                continue
+            if side and t.get("side") != side:
+                continue
+            if symbol and t.get("symbol") != symbol:
+                continue
+            pnl = t.get("pnl", 0)
+            if pnl == 0:
+                continue  # 0 pnl은 샘플에서 제외
+            filtered.append(pnl)
+
+        n = len(filtered)
+        if n < min_samples:
+            return {
+                "win_rate": 0.0,
+                "avg_win": 0.0,
+                "avg_loss": 0.0,
+                "sample_size": n,
+                "payoff_ratio": 0.0,
+                "kelly_fraction_raw": 0.0,
+            }
+
+        wins = [p for p in filtered if p > 0]
+        losses = [-p for p in filtered if p < 0]  # 양수로 변환
+        win_rate = len(wins) / n
+        avg_win = sum(wins) / len(wins) if wins else 0.0
+        avg_loss = sum(losses) / len(losses) if losses else 0.0
+
+        # Kelly: f* = (p*b - q) / b,  b = avg_win/avg_loss, p = win_rate, q = 1-p
+        if avg_loss > 0 and avg_win > 0:
+            payoff = avg_win / avg_loss
+            q = 1 - win_rate
+            kelly_raw = (win_rate * payoff - q) / payoff
+        else:
+            payoff = 0.0
+            kelly_raw = 0.0
+
+        return {
+            "win_rate": round(win_rate, 4),
+            "avg_win": round(avg_win, 6),
+            "avg_loss": round(avg_loss, 6),
+            "sample_size": n,
+            "payoff_ratio": round(payoff, 4),
+            "kelly_fraction_raw": round(max(0.0, kelly_raw), 4),  # 음수면 0 (Kelly 진입 거부)
+        }
+
+    def get_recent_pnls(self, limit: int = 100) -> list[float]:
+        """최근 N건의 PnL 반환 (CVaR 계산용)"""
+        pnls = [t.get("pnl", 0) for t in self.recent_trades[-limit:] if t.get("pnl", 0) != 0]
+        return pnls
+
     def should_trade_now(self, hour: int, regime: str, side: str, signal_strength: float) -> tuple[bool, str]:
         """피드백 기반 거래 필터"""
         adj = self.feedback.get("adjustments", {})
