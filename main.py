@@ -797,12 +797,17 @@ class AutoTrader:
 
                     # LIVE: 포지션 여유 있을 때만 신규 진입
                     if live_positions < max_live and candidates:
-                        # 확신도 × (1 - priority/10) 로 최종 순위 결정
-                        best = max(
-                            candidates,
-                            key=lambda c: c["confidence"] * (1 - c["priority"] / 10),
-                        )
-                        await self._execute_live(exchange_name, best)
+                        # [LIVE_LONG_ONLY] LIVE 후보에서 숏 제외 (PAPER는 위에서 둘 다 실행됨)
+                        live_candidates = candidates
+                        if getattr(self.strategy_manager, "live_long_only", False):
+                            live_candidates = [c for c in candidates if c.get("action") == "long"]
+                        if live_candidates:
+                            # 확신도 × (1 - priority/10) 로 최종 순위 결정
+                            best = max(
+                                live_candidates,
+                                key=lambda c: c["confidence"] * (1 - c["priority"] / 10),
+                            )
+                            await self._execute_live(exchange_name, best)
                 else:
                     # 기존 모드: 각 심볼 독립 매매
                     for symbol in symbols:
@@ -1264,7 +1269,17 @@ class AutoTrader:
                     tg_notify(format_trade_open("PAPER", symbol, decision.action, price, notional, dynamic_lev, decision.reason), silent=True)
 
             # === LIVE 실행 (live / dual 모드) ===
-            if self.mode in ("live", "dual"):
+            # [LIVE_LONG_ONLY] LIVE만 숏 차단 — PAPER는 위에서 이미 실행됐으므로 학습 데이터 수집 계속
+            live_block_short = (
+                getattr(self.strategy_manager, "live_long_only", False)
+                and decision.action == "short"
+            )
+            if live_block_short:
+                logger.info(
+                    f"[LIVE_LONG_ONLY] {symbol} LIVE 숏 차단 (PAPER는 실행됨) | "
+                    f"원신호: {decision.reason}"
+                )
+            if self.mode in ("live", "dual") and not live_block_short:
                 om = self.order_managers.get(exchange_name)
                 if om and symbol not in getattr(om, "positions", {}):
                     result = await om.open_position(
@@ -2022,6 +2037,16 @@ class AutoTrader:
     async def _execute_live(self, exchange_name: str, c: dict):
         """LIVE 포지션 실행 — 가장 강한 시그널에만"""
         if self.mode not in ("live", "dual"):
+            return
+        # [LIVE_LONG_ONLY] LIVE만 숏 차단 (PAPER는 이미 상위에서 실행됨)
+        if (
+            getattr(self.strategy_manager, "live_long_only", False)
+            and c.get("action") == "short"
+        ):
+            logger.info(
+                f"[LIVE_LONG_ONLY] {c.get('symbol')} LIVE 숏 차단 "
+                f"(PAPER 학습용 실행은 유지) | 원신호: {c.get('reason','?')}"
+            )
             return
         # [해제됨] LIVE 일시정지 — 로그만 남김
         if getattr(self, '_live_paused', False):

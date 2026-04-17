@@ -3,8 +3,8 @@
   "hourly_performance": {
     "15": {
       "wins": 4,
-      "losses": 18,
-      "total_pnl": -39.64896615997092
+      "losses": 19,
+      "total_pnl": -41.80329447997092
     },
     "17": {
       "wins": 8,
@@ -57,9 +57,9 @@
       "total_pnl": -9.010780185169388
     },
     "14": {
-      "wins": 6,
-      "losses": 43,
-      "total_pnl": -44.96953910409409
+      "wins": 7,
+      "losses": 44,
+      "total_pnl": -46.61154206997085
     },
     "2": {
       "wins": 87,
@@ -130,8 +130,8 @@
     },
     "strong_uptrend": {
       "wins": 14,
-      "losses": 46,
-      "total_pnl": -58.8397570865605
+      "losses": 47,
+      "total_pnl": -61.209031966560495
     },
     "strong_downtrend": {
       "wins": 315,
@@ -154,9 +154,9 @@
       "total_pnl": -24.16573077047686
     },
     "high_volume_breakout": {
-      "wins": 2,
-      "losses": 12,
-      "total_pnl": -22.161881821560996
+      "wins": 3,
+      "losses": 13,
+      "total_pnl": -23.588938227437772
     }
   },
   "symbol_performance": {
@@ -166,9 +166,9 @@
       "total_pnl": -3.15
     },
     "SOL/USDT:USDT": {
-      "wins": 19,
-      "losses": 45,
-      "total_pnl": -83.1921515198625
+      "wins": 20,
+      "losses": 47,
+      "total_pnl": -86.98848280573927
     },
     "DOGE/USDT:USDT": {
       "wins": 17,
@@ -298,9 +298,9 @@
       "total_pnl": -3.15
     },
     "short": {
-      "wins": 40,
-      "losses": 125,
-      "total_pnl": -146.22912924105538
+      "wins": 41,
+      "losses": 127,
+      "total_pnl": -150.0254605269321
     },
     "long": {
       "wins": 885,
@@ -310,8 +310,8 @@
   },
   "signal_accuracy": {
     "weak": {
-      "wins": 925,
-      "losses": 193
+      "wins": 926,
+      "losses": 195
     }
   },
   "external_accuracy": {},
@@ -388,7 +388,7 @@
     "avoid_hour_9": true,
     "avoid_hour_10": true
   },
-  "total_analyzed": 1118,
+  "total_analyzed": 1121,
   "entry_path_performance": {},
   "exit_reason_analysis": {
     "SL \ub3c4\ub2ec": {
@@ -402,14 +402,14 @@
       "avg_pnl": 11.472221470332748
     },
     "\ud2b8\ub808\uc77c\ub9c1 SL \ub3c4\ub2ec": {
-      "count": 36,
-      "total_pnl": 74.95173716175435,
-      "avg_pnl": 2.0819926989376207
+      "count": 37,
+      "total_pnl": 75.67900907587759,
+      "avg_pnl": 2.0453786236723674
     },
     "sl": {
-      "count": 994,
-      "total_pnl": 4151.773010753207,
-      "avg_pnl": 4.17683401484226
+      "count": 996,
+      "total_pnl": 4147.249407553207,
+      "avg_pnl": 4.163905027663862
     }
   },
   "entry_blacklist": [],
@@ -443,8 +443,8 @@
       "total_loss": -10.847863505814798
     },
     "strong_uptrend_short_europe": {
-      "count": 14,
-      "total_loss": -53.4114736394557
+      "count": 15,
+      "total_loss": -55.78074851945569
     },
     "ranging_short_us": {
       "count": 12,
@@ -483,8 +483,8 @@
       "total_loss": -12.84031070691623
     },
     "high_volume_breakout_short_europe": {
-      "count": 7,
-      "total_loss": -3.0901500000000346
+      "count": 8,
+      "total_loss": -5.244478320000038
     },
     "strong_uptrend_short_asia": {
       "count": 3,

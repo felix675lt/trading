@@ -41,10 +41,12 @@ trading:
   max_concurrent_live: 1   # LIVE: 한 번에 1포지션만 (풀시드 올인)
   max_concurrent_paper: 4  # PAPER: 학습용으로 다중 가능
 
-  # === 방향 필터 (사용자 지시) ===
-  # 숏 진입 완전 차단, 롱 각만 본다 (2026-04-17)
-  # 이유: 숏 승률 24% (40승 125패), 롱 승률 93% (885승 65패)
-  long_only: true
+  # === 방향 필터 (사용자 지시, 2026-04-17) ===
+  # PAPER: 롱숏 모두 허용 (학습 데이터 수집) — 현재 횡보장 판단
+  # LIVE : 롱만 진입 (숏 승률 24%, 롱 승률 93% — 실거래는 롱으로 고정)
+  # long_only: true 는 PAPER까지 숏 차단 (강력 모드, 비권장)
+  long_only: false
+  live_long_only: true
 
 risk:
   max_position_pct: 0.95        # 풀시드 집중: $188 × 95% = $178.6 마진

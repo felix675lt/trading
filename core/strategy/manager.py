@@ -42,10 +42,17 @@ class StrategyManager:
         self.min_confidence = self.base_min_confidence
         self.signal_threshold = config.get("signal_threshold", 0.10)
         self.min_confirming = config.get("min_confirming_signals", 2)
-        # 방향 필터: long_only=True면 숏 진입 완전 차단
+        # 방향 필터 (mode-aware):
+        # - live_long_only=True: LIVE 실행에서만 숏 차단 (PAPER는 학습 위해 양방향 허용)
+        # - long_only=True     : 모든 모드에서 숏 차단 (강력 차단 — backward compat)
+        # StrategyManager는 decide()에서 long_only만 반영한다.
+        # live_long_only는 main.py의 LIVE 주문 게이트에서 처리.
         self.long_only = config.get("long_only", False)
+        self.live_long_only = config.get("live_long_only", False)
         if self.long_only:
-            logger.warning("[Strategy] LONG_ONLY 모드 활성화 — 숏 진입 완전 차단")
+            logger.warning("[Strategy] LONG_ONLY (global) 모드 활성화 — 전 모드 숏 진입 차단")
+        elif self.live_long_only:
+            logger.warning("[Strategy] LIVE_LONG_ONLY 모드 활성화 — LIVE만 숏 차단, PAPER 양방향")
         self.recent_decisions: list[TradeDecision] = []
 
         # 자기진단 상태
@@ -307,6 +314,8 @@ class StrategyManager:
                 confidence = 0.0
 
         # 2.85. LONG_ONLY 필터 (사용자 지시) — 숏 진입 완전 차단
+        # 주: live_long_only는 여기서 차단하지 않는다 (PAPER는 양방향 학습 필요).
+        #     LIVE 전용 차단은 main.py의 주문 실행 게이트에서 수행.
         if self.long_only and final_action == "short":
             logger.info(f"[LONG_ONLY] 숏 차단 → hold (원래 사유: {reason})")
             final_action = "hold"
