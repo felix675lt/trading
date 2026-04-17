@@ -170,6 +170,136 @@ external:
     strong_bearish: -0.3    # 강한 매도 신호
     event_override: true    # 고임팩트 이벤트 시 기술적 분석 오버라이드
 
+# =============================================================================
+# Capital Tier System — 시드 구간별 기능 자동 활성화
+# =============================================================================
+# 실 LIVE 잔고가 커지면 상위 티어 기능이 자동으로 켜진다.
+# PAPER는 paper_virtual_seed (가상 시드)로 상위 티어 기능을 실시간으로
+# 선행 검증 — 실 자본 투입 전에 Kelly/HMM/메타라벨링을 paper에서 증명.
+#
+# 현재: LIVE=~$100 (micro 티어) / PAPER=$10K 가상 (mid 티어) → Kelly+BTC 검증
+# =============================================================================
+capital_tiers:
+  # PAPER가 가정하는 가상 시드 ($). 상위 티어 기능을 실시간 시장에서 검증.
+  # $5K → mid 티어 (Kelly + BTC + CVaR)를 먼저 paper로 증명 후 $15K→large로 상향 권장
+  paper_virtual_seed: 5000
+  paper_use_virtual: true     # false면 PAPER 실 equity로 티어 결정
+
+  tiers:
+    - name: micro
+      min: 0
+      max: 500
+      description: "소시드 집중매매 ($0~$500) — 1포지션 풀시드"
+      features:
+        symbols: ["ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"]
+        max_positions: 1
+        concentration_mode: true
+        sizing_method: confidence        # confidence | kelly_fractional | hrp
+        order_routing: market_only        # market_only | limit_first | twap | smart
+        kelly_enabled: false
+        kelly_fraction: 0.0
+        limit_order_pref: false
+        hmm_regime: false
+        meta_labeling: false
+        walk_forward_cv: false
+        cvar_risk: false
+        stat_arb_pairs: false
+        max_leverage: 5
+
+    - name: small
+      min: 500
+      max: 2000
+      description: "소형 시드 ($500~$2K) — 2포지션 + 제한주문 선호"
+      features:
+        symbols: ["ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"]
+        max_positions: 2
+        concentration_mode: false
+        sizing_method: confidence
+        order_routing: limit_first
+        kelly_enabled: false
+        kelly_fraction: 0.0
+        limit_order_pref: true
+        hmm_regime: false
+        meta_labeling: false
+        walk_forward_cv: true
+        cvar_risk: false
+        stat_arb_pairs: false
+        max_leverage: 5
+
+    - name: mid
+      min: 2000
+      max: 10000
+      description: "중형 시드 ($2K~$10K) — Kelly + BTC 재진입 + CVaR"
+      features:
+        symbols: ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"]
+        max_positions: 3
+        concentration_mode: false
+        sizing_method: kelly_fractional
+        order_routing: limit_first
+        kelly_enabled: true
+        kelly_fraction: 0.25
+        limit_order_pref: true
+        hmm_regime: false
+        meta_labeling: false
+        walk_forward_cv: true
+        cvar_risk: true
+        stat_arb_pairs: false
+        max_leverage: 4
+
+    - name: large
+      min: 10000
+      max: 50000
+      description: "대형 시드 ($10K~$50K) — HMM + 메타라벨링 + TWAP"
+      features:
+        symbols:
+          - "BTC/USDT:USDT"
+          - "ETH/USDT:USDT"
+          - "SOL/USDT:USDT"
+          - "DOGE/USDT:USDT"
+          - "BNB/USDT:USDT"
+          - "XRP/USDT:USDT"
+        max_positions: 5
+        concentration_mode: false
+        sizing_method: kelly_fractional
+        order_routing: twap
+        kelly_enabled: true
+        kelly_fraction: 0.30
+        limit_order_pref: true
+        hmm_regime: true
+        meta_labeling: true
+        walk_forward_cv: true
+        cvar_risk: true
+        stat_arb_pairs: false
+        max_leverage: 3
+
+    - name: pro
+      min: 50000
+      max: .inf
+      description: "프로 ($50K+) — 풀 포트폴리오 + 통계차익"
+      features:
+        symbols:
+          - "BTC/USDT:USDT"
+          - "ETH/USDT:USDT"
+          - "SOL/USDT:USDT"
+          - "DOGE/USDT:USDT"
+          - "BNB/USDT:USDT"
+          - "XRP/USDT:USDT"
+          - "AVAX/USDT:USDT"
+          - "ARB/USDT:USDT"
+        max_positions: 8
+        concentration_mode: false
+        sizing_method: hrp
+        order_routing: smart
+        kelly_enabled: true
+        kelly_fraction: 0.35
+        limit_order_pref: true
+        hmm_regime: true
+        meta_labeling: true
+        walk_forward_cv: true
+        cvar_risk: true
+        stat_arb_pairs: true
+        max_leverage: 3
+
 dashboard:
   host: "0.0.0.0"
   port: 8888

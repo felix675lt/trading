@@ -138,6 +138,18 @@ async def get_live_logs():
     return {"logs": list(_live_logs)}
 
 
+@app.get("/api/capital-tier")
+async def get_capital_tier():
+    """자본 티어 상태 — LIVE/PAPER 현재 티어와 다음 티어 진행률"""
+    trader = _state.get("trader")
+    if not trader or not hasattr(trader, "tier_manager"):
+        return {"error": "tier_manager unavailable"}
+    try:
+        return trader.tier_manager.status_report()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/strategy-optimization")
 async def get_strategy_optimization():
     """전략 최적화 상태 (Paper + Live 각각)"""

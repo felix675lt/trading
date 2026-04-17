@@ -31,6 +31,7 @@ from core.strategy.adaptive import AdaptiveOptimizer, StrategyOptimizer
 from core.strategy.manager import StrategyManager
 from core.external.listing_detector import ListingDetector
 from core.quant_signals import QuantSignals
+from core.capital_tiers import CapitalTierManager
 from dashboard.app import app as dashboard_app, set_state, add_live_log
 
 # Telegram 알림 (실패해도 트레이딩에 영향 없음)
@@ -95,9 +96,17 @@ class AutoTrader:
         # 외부 데이터 매니저 (뉴스/센티먼트/온체인/매크로/공포탐욕)
         self.external_manager = ExternalDataManager(self.config.get("external", {}))
 
+        # === Capital Tier System ===
+        # 시드 구간별 기능 자동 활성화. PAPER는 가상 시드로 상위 티어 선행 검증.
+        self.tier_manager = CapitalTierManager(self.config)
+
+        # PAPER 초기 자본 = 가상 시드 (상위 티어 기능 검증용)
+        # LIVE 잔고는 별도(order_manager가 실 거래소에서 조회)
+        paper_initial = self.tier_manager.paper_virtual_seed
+
         # Paper 트레이더 (paper / dual 모드에서 사용)
         self.paper_trader = PaperTrader(
-            initial_capital=self.config.get("backtest", {}).get("initial_capital", 10000),
+            initial_capital=paper_initial,
             commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
             trailing_config=self.config.get("trailing_stop", {}),
             trade_profiles=self.config.get("trade_profiles", {}),
@@ -121,9 +130,10 @@ class AutoTrader:
         # 상장 시그널 감지기
         self.listing_detector = ListingDetector()
 
-        # 상태
-        self.equity = self.config.get("backtest", {}).get("initial_capital", 10000)
-        self.initial_capital = self.equity
+        # 상태 — PAPER 가상 시드 기준 (dual/paper 모드에서 포트폴리오 지표 산출용)
+        self.equity = paper_initial
+        self.initial_capital = paper_initial
+        self.live_equity: float = 0.0  # 실 거래소 잔고 (LIVE 루프에서 업데이트)
         self.total_pnl = 0.0
         self.last_signals = {}
         self.last_external = {}
@@ -600,7 +610,19 @@ class AutoTrader:
         self.is_running = True
 
         exchange_name = list(self.config["exchanges"].keys())[0]
-        symbols = self.config["trading"]["symbols"]
+        # === 심볼 유니버스: 티어 기반 (PAPER+LIVE 합집합) ===
+        # 데이터 수집/분석은 union으로 수행. 실제 주문은 각 mode의 티어에서 허용된 심볼만.
+        # 티어 심볼이 있으면 티어, 없으면 config.trading.symbols fallback.
+        tier_symbols = self.tier_manager.union_symbols()
+        if tier_symbols:
+            symbols = tier_symbols
+            logger.info(
+                f"[CapitalTier] 심볼 유니버스 ({len(symbols)}): {symbols} | "
+                f"LIVE 티어={self.tier_manager.get_tier('live').name} "
+                f"PAPER 티어={self.tier_manager.get_tier('paper').name}"
+            )
+        else:
+            symbols = self.config["trading"]["symbols"]
         timeframes = self.config["trading"]["timeframes"]  # 멀티타임프레임
         primary_tf = timeframes[0]  # 메인 타임프레임 (5m)
 
@@ -619,6 +641,35 @@ class AutoTrader:
 
         while self.is_running:
             try:
+                # === 자본 티어 업데이트 (매 루프) ===
+                # LIVE 잔고 조회 (실 거래소) + PAPER equity → 티어 결정
+                live_eq = 0.0
+                try:
+                    om = self.order_managers.get(exchange_name)
+                    if om and self.mode in ("live", "dual"):
+                        bal = await om.exchange.get_balance()
+                        live_eq = float(bal.get("total", bal.get("free", 0)) or 0)
+                        self.live_equity = live_eq
+                except Exception as e:
+                    logger.debug(f"[CapitalTier] LIVE 잔고 조회 실패: {e}")
+
+                tier_changes = self.tier_manager.update(
+                    live_equity=live_eq,
+                    paper_equity=self.paper_trader.equity,
+                )
+                if tier_changes:
+                    # 티어 변경 시 텔레그램 알림
+                    for which, (old, new) in tier_changes.items():
+                        if old is not None:  # 최초 init 제외
+                            tg_notify(
+                                f"🎯 <b>자본 티어 변경 ({which.upper()})</b>\n"
+                                f"━━━━━━━━━━━━━\n"
+                                f"{old} → <b>{new}</b>\n"
+                                f"설명: {self.tier_manager.get_tier(which).description}\n"
+                                f"활성 기능: {list(self.tier_manager.get_tier(which).features.keys())}",
+                                silent=False,
+                            )
+
                 # 재학습 체크 (일반 + stuck 감지)
                 diag = self.strategy_manager.get_diagnostics()
                 needs_retrain = trainer.should_retrain()
@@ -755,9 +806,16 @@ class AutoTrader:
                     # 멀티타임프레임 합류 계산
                     mtf_result = self.external_manager.get_multi_tf_confluence()
 
-                # === 집중 매매 모드: 모든 심볼 분석 후 최강 시그널 1개만 LIVE 진입 ===
-                concentration = self.config["trading"].get("concentration_mode", False)
-                max_live = self.config["trading"].get("max_concurrent_live", 1)
+                # === 집중 매매 모드 결정 — LIVE 티어 기준 ===
+                # LIVE 티어가 concentration 모드이면 활성화 (micro 티어에서만 true 기본값)
+                concentration = self.tier_manager.get_feature(
+                    "concentration_mode", mode="live",
+                    default=self.config["trading"].get("concentration_mode", False),
+                )
+                max_live = self.tier_manager.get_feature(
+                    "max_positions", mode="live",
+                    default=self.config["trading"].get("max_concurrent_live", 1),
+                )
                 scalp_profiles = self.config["risk"].get("scalp_profiles", {})
 
                 if concentration:
@@ -1731,6 +1789,23 @@ class AutoTrader:
         symbol = c["symbol"]
         if self.mode not in ("paper", "dual"):
             return
+        # === 티어 심볼 필터 ===
+        if not self.tier_manager.allowed_symbol(symbol, mode="paper"):
+            logger.debug(
+                f"[Tier-PAPER] {symbol} 차단 — PAPER 티어({self.tier_manager.get_tier('paper').name}) 심볼 아님"
+            )
+            return
+        # === 티어 max_positions 제한 ===
+        paper_max = self.tier_manager.get_feature(
+            "max_positions", mode="paper",
+            default=self.config["trading"].get("max_concurrent_paper", 4),
+        )
+        if len(self.paper_trader.positions) >= paper_max:
+            logger.debug(
+                f"[Tier-PAPER] {symbol} 차단 — 최대 포지션({paper_max}) 도달 "
+                f"[현재: {list(self.paper_trader.positions.keys())}]"
+            )
+            return
         if c["action"] in ("long", "short"):
             if symbol not in self.paper_trader.positions:
                 tp_pct = c.get("tp_pct", self.config["risk"]["take_profit_pct"])
@@ -2038,6 +2113,14 @@ class AutoTrader:
         """LIVE 포지션 실행 — 가장 강한 시그널에만"""
         if self.mode not in ("live", "dual"):
             return
+        symbol = c.get("symbol", "?")
+        # === 티어 심볼 필터 (LIVE) ===
+        if not self.tier_manager.allowed_symbol(symbol, mode="live"):
+            logger.info(
+                f"[Tier-LIVE] {symbol} 차단 — LIVE 티어({self.tier_manager.get_tier('live').name}) "
+                f"심볼 아님 (허용: {self.tier_manager.get_symbols('live')})"
+            )
+            return
         # [LIVE_LONG_ONLY] LIVE만 숏 차단 (PAPER는 이미 상위에서 실행됨)
         if (
             getattr(self.strategy_manager, "live_long_only", False)
@@ -2052,7 +2135,7 @@ class AutoTrader:
         if getattr(self, '_live_paused', False):
             logger.info(f"[리스크해제] LIVE 일시정지 무시 (사유: {getattr(self, '_live_pause_reason', '?')})")
             self._live_paused = False  # 강제 해제
-        symbol = c["symbol"]
+        # symbol 은 함수 상단에서 이미 c.get("symbol") 로 설정됨
         om = self.order_managers.get(exchange_name)
         if not om:
             return
