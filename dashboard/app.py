@@ -98,6 +98,23 @@ async def get_signals():
     return {"signals": getattr(trader, "last_signals", {})}
 
 
+@app.get("/api/btc_reserve")
+async def get_btc_reserve():
+    """BTC Treasury 금고 현황 — LIVE/PAPER 각 누적, 평단, 미실현 PnL, 최근 적립"""
+    trader = _state.get("trader")
+    reserve = getattr(trader, "btc_reserve", None) if trader else None
+    if reserve is None:
+        return {"enabled": False, "status": None, "recent_entries": []}
+    return {
+        "enabled": bool(getattr(reserve, "enabled", False)),
+        "allocation_by_tier": getattr(reserve, "allocation_by_tier", {}),
+        "min_profit_usdt": getattr(reserve, "min_profit_usdt", 0.0),
+        "min_order_usdt": getattr(reserve, "min_order_usdt", 0.0),
+        "status": reserve.get_status(),
+        "recent_entries": reserve.get_recent_entries(n=20),
+    }
+
+
 @app.get("/api/risk")
 async def get_risk():
     trader = _state.get("trader")

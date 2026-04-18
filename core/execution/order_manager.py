@@ -153,6 +153,15 @@ class OrderManager:
     def set_tp_callback(self, callback):
         self._on_tp_callback = callback
 
+    def set_profit_callback(self, callback):
+        """포지션 청산 시 호출될 추가 콜백 (BTC Reserve 적립 등).
+
+        close_position이 성공적으로 체결된 후 PnL과 상관없이 호출된다.
+        콜백은 async이며 trade dict를 받는다: callback(trade: dict).
+        PnL>0 필터링은 콜백 내부에서 수행.
+        """
+        self._profit_callback = callback
+
     async def _try_limit_first(
         self,
         symbol: str,
@@ -546,7 +555,7 @@ class OrderManager:
 
             logger.info(f"포지션 청산: {symbol} | PnL: {pnl:.2f} USDT (수수료 {fee:.4f}) | 사유: {reason}")
 
-            return {
+            trade_result = {
                 "symbol": symbol,
                 "side": pos.side,
                 "entry_price": pos.entry_price,
@@ -556,6 +565,19 @@ class OrderManager:
                 "pnl": pnl,
                 "reason": reason,
             }
+
+            # === BTC Reserve 적립 콜백 (async) — 실패해도 청산 결과는 유지 ===
+            cb = getattr(self, "_profit_callback", None)
+            if cb is not None:
+                try:
+                    result = cb(trade_result)
+                    # coroutine이면 fire-and-forget (청산 반환을 블로킹하지 않음)
+                    if asyncio.iscoroutine(result):
+                        asyncio.create_task(result)
+                except Exception as e:
+                    logger.debug(f"[Live] profit_callback 실패 (무시): {e}")
+
+            return trade_result
         except Exception as e:
             logger.error(f"포지션 청산 실패 ({symbol}): {e} — 다음 루프에서 재시도")
             return {}

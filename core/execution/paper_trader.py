@@ -130,6 +130,15 @@ class PaperTrader:
         """
         self._on_auto_close_callback = callback
 
+    def set_profit_callback(self, callback):
+        """포지션 청산 시 항상 호출될 추가 콜백 (BTC Reserve 적립 등)
+
+        모든 close_position 경로(수동/SL/TP/liquidation)에서 PnL과 관계없이 호출됨.
+        콜백 내부에서 PnL>0 조건 등을 자체 판단해야 함.
+        callback(trade: dict)
+        """
+        self._profit_callback = callback
+
     # ---------------------------------------------------------------------
     # 슬리피지 모델
     # ---------------------------------------------------------------------
@@ -346,6 +355,15 @@ class PaperTrader:
             f"(req {price:.4f}, slip {slip_pct:+.3f}% [{slip_bps:.1f}bp]) | "
             f"PnL: {net_pnl:+.2f} | fee ${fee:.3f} | 사유: {reason}"
         )
+
+        # === BTC Reserve 적립 콜백 (수익 시 가상 BTC 누적) ===
+        cb = getattr(self, "_profit_callback", None)
+        if cb is not None:
+            try:
+                cb(trade)
+            except Exception as e:
+                logger.debug(f"[Paper] profit_callback 실패 (무시): {e}")
+
         return trade
 
     # ---------------------------------------------------------------------

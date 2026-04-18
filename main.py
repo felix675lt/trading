@@ -32,6 +32,7 @@ from core.strategy.manager import StrategyManager
 from core.external.listing_detector import ListingDetector
 from core.quant_signals import QuantSignals
 from core.capital_tiers import CapitalTierManager
+from core.treasury.btc_reserve import BTCReserve
 from core.learning.ic_tracker import ICTracker
 from core.learning.meta_labeler import MetaLabeler
 from core.strategy.regime_hmm import HMMRegimeClassifier
@@ -121,8 +122,21 @@ class AutoTrader:
         # PAPER 자동청산 콜백 (SL/TP/트레일링 → DB 저장 + 학습)
         self.paper_trader.set_auto_close_callback(self._on_paper_auto_close)
 
+        # === BTC Treasury Reserve (2026-04-18) ===
+        # 선물 실현수익의 일부를 현물 BTC로 자동 적립. 티어별 적립률 적용.
+        # collector는 initialize()에서 생성되므로 여기선 None으로 만들고 나중에 주입.
+        self.btc_reserve = BTCReserve(
+            config=self.config,
+            tier_manager=self.tier_manager,
+            collector=None,  # initialize()에서 주입
+        )
+        # PAPER 청산 → 가상 BTC 적립 (sync 콜백)
+        self.paper_trader.set_profit_callback(self.btc_reserve.on_paper_close)
+
         self.exchange_clients: dict[str, ExchangeClient] = {}
         self.order_managers: dict[str, OrderManager] = {}
+        # Binance spot 클라이언트 (BTC Reserve 실매수용) — initialize()에서 생성
+        self.spot_exchange_client = None
 
         # StrategyOptimizer — Paper/Live 각각 독립 추적
         self.strategy_optimizer_paper = StrategyOptimizer()
@@ -465,6 +479,14 @@ class AutoTrader:
         self.collector = DataCollector(self.config["exchanges"])
         await self.collector.initialize()
 
+        # BTC Reserve에 collector 주입 (가격 조회용)
+        self.btc_reserve.collector = self.collector
+        # Telegram 알림 주입
+        try:
+            self.btc_reserve.set_notifier(tg_notify)
+        except Exception:
+            pass
+
         # 실거래 모드 시 거래소 클라이언트 초기화 (live 또는 dual)
         if self.mode in ("live", "dual"):
             for name, cfg in self.config["exchanges"].items():
@@ -475,6 +497,24 @@ class AutoTrader:
                     trailing_config=self.config.get("trailing_stop", {}),
                     trade_profiles=self.config.get("trade_profiles", {}),
                 )
+                # LIVE 청산 → BTC 적립 콜백 주입 (async — 내부에서 create_task)
+                self.order_managers[name].set_profit_callback(self.btc_reserve.on_live_close)
+
+            # === Binance Spot 클라이언트 (BTC Reserve 실매수용) ===
+            # 선물(defaultType=future)과 분리된 spot 모드로 별도 ExchangeClient 생성.
+            # 같은 API 키 사용 — Binance는 단일 키로 spot/futures 모두 가능.
+            binance_cfg = self.config["exchanges"].get("binance")
+            if binance_cfg and self.config.get("treasury", {}).get("btc_reserve", {}).get("enabled", False):
+                spot_cfg = dict(binance_cfg)
+                spot_options = dict(binance_cfg.get("options", {}) or {})
+                spot_options["defaultType"] = "spot"
+                spot_cfg["options"] = spot_options
+                try:
+                    self.spot_exchange_client = ExchangeClient("binance", spot_cfg)
+                    self.btc_reserve.set_spot_exchange(self.spot_exchange_client)
+                    logger.info("[BTCReserve] Binance Spot 클라이언트 생성 완료 — LIVE 실매수 활성")
+                except Exception as e:
+                    logger.warning(f"[BTCReserve] Spot 클라이언트 생성 실패 → 가상 기록만: {e}")
 
             # Smart Router (tier=pro) — 다거래소 있으면 자동 주입
             if len(self.exchange_clients) >= 2:
@@ -753,6 +793,17 @@ class AutoTrader:
                         self.paper_trader.set_maker_fill_rate(sum(rates) / len(rates))
                 except Exception as e:
                     logger.debug(f"[Paper-Feedback] maker_fill_rate 동기화 실패: {e}")
+
+                # === BTC 현재가 hint → BTC Reserve (cost basis/미실현 PnL 계산용) ===
+                try:
+                    btc_ticker = await self.collector.fetch_ticker(
+                        exchange_name, "BTC/USDT:USDT",
+                    )
+                    btc_price = float(btc_ticker.get("last") or 0)
+                    if btc_price > 0:
+                        self.btc_reserve.set_btc_price_hint(btc_price)
+                except Exception as e:
+                    logger.debug(f"[BTCReserve] BTC 가격 hint 실패: {e}")
 
                 # 재학습 체크 (일반 + stuck 감지)
                 diag = self.strategy_manager.get_diagnostics()
@@ -1124,6 +1175,27 @@ class AutoTrader:
                             f"LIVE ${live_eq_now:,.2f}({live_tier_name}) + "
                             f"PAPER ${paper_eq_now:,.2f}({paper_tier_name}) = ${total_eq:,.2f} / ${target:,.0f}"
                         )
+
+                        # === BTC Treasury 누적 현황 (활성 시만) ===
+                        try:
+                            if getattr(self, "btc_reserve", None) and self.btc_reserve.enabled:
+                                rs = self.btc_reserve.get_status()
+                                live_btc = rs["live"]["total_btc"]
+                                paper_btc = rs["paper"]["total_btc"]
+                                if live_btc > 0 or paper_btc > 0:
+                                    live_val = rs["live"].get("current_value") or 0
+                                    paper_val = rs["paper"].get("current_value") or 0
+                                    live_pnl_pct = rs["live"].get("pnl_pct")
+                                    paper_pnl_pct = rs["paper"].get("pnl_pct")
+                                    logger.info(
+                                        f"[BTCReserve] 🏛️ 금고 "
+                                        f"LIVE {live_btc:.8f}BTC (${live_val:,.2f}"
+                                        f"{f' {live_pnl_pct:+.1f}%' if live_pnl_pct is not None else ''}) + "
+                                        f"PAPER {paper_btc:.8f}BTC (${paper_val:,.2f}"
+                                        f"{f' {paper_pnl_pct:+.1f}%' if paper_pnl_pct is not None else ''})"
+                                    )
+                        except Exception as e:
+                            logger.debug(f"[BTCReserve] 로그 출력 실패: {e}")
 
                 # 자동 전략 최적화 (각 모드별 독립)
                 for label, optimizer in [("PAPER", self.strategy_optimizer_paper),
@@ -3698,6 +3770,11 @@ class AutoTrader:
         await self.collector.close()
         for client in self.exchange_clients.values():
             await client.close()
+        if self.spot_exchange_client:
+            try:
+                await self.spot_exchange_client.close()
+            except Exception:
+                pass
         self.storage.close()
         logger.info("AutoTrader 종료 완료")
 

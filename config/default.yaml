@@ -74,6 +74,28 @@ trading:
   #   $50K~ : 보수 (Kelly 0.12) — 수확 모드
   target_equity: 100000
 
+# === BTC Treasury Reserve (2026-04-18) ===
+# 선물 실현수익의 일정 비율을 자동으로 현물 BTC로 전환하는 "디지털 금고".
+# 철학: 달러는 강력하지만 세계 재편 과정에서 BTC도 준비자산 자리를 가질 수 있음.
+# 적립된 BTC는 트레이딩에 사용하지 않음 (장기 보유 원칙).
+treasury:
+  btc_reserve:
+    enabled: true
+    paper_simulate: true            # paper 모드에서도 가상 적립 (시뮬레이션)
+    # 티어별 적립률 — 시드가 작을수록 복리우선(적게 떼고), 커질수록 수확 비중 ↑
+    allocation_by_tier:
+      micro: 0.10                   # $0~$500: 실현수익의 10%
+      small: 0.15                   # $500~$2K: 15%
+      mid:   0.20                   # $2K~$10K: 20%
+      large: 0.25                   # $10K~$50K: 25%
+      pro:   0.30                   # $50K+: 30%
+    fallback_allocation: 0.15       # 티어 식별 실패 시
+    # 수수료 드래그 방지 임계값
+    min_profit_usdt: 5.0            # 실현수익이 $5 미만이면 전환 스킵
+    min_order_usdt: 11.0            # Binance spot 최소 주문 $10 + 여유
+    spot_symbol: "BTC/USDT"         # Binance 현물 심볼
+    reserve_file: "data/btc_reserve.json"
+
 risk:
   max_position_pct: 0.95        # 풀시드 집중: $188 × 95% = $178.6 마진
   min_order_notional: 5         # 알트코인 최소 $5
