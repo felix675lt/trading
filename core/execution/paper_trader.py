@@ -1,6 +1,18 @@
-"""페이퍼 트레이딩 엔진 - 실시간 시뮬레이션"""
+"""페이퍼 트레이딩 엔진 — LIVE와 동일한 체결 모델로 시뮬레이션
 
-from dataclasses import dataclass, field
+현실화된 체결 모델 (2026-04-18 개정):
+1. 슬리피지 — 진입/청산 모두 방향 불리하게 기본 5bp + ATR 가변분
+2. 펀딩비 — 8h 경계 자동 감지 후 차감 (롱 편향시 체계적 비용)
+3. Maker 체결률 피드백 — Live 실측으로 업데이트 가능 (기본 0.45)
+4. SL 체결가 통일 — Live와 동일하게 "현재가 + 슬리피지" (SL 레벨 고정 X)
+5. 레이턴시 시뮬 — SL 감지 ~ 실제 체결 간 지연을 슬리피지에 반영
+6. Liquidation 체크 — 거래소 강제청산 근사 (maint margin 0.5% + 수수료)
+
+모든 수치는 LIVE 실측 데이터를 기반으로 재보정 가능.
+"""
+
+import random
+from dataclasses import dataclass
 from datetime import datetime
 
 from loguru import logger
@@ -20,12 +32,33 @@ class PaperPosition:
     lowest_price: float = 0.0    # 진입 후 최저가 (숏)
     trailing_activated: bool = False  # 트레일링 스탑 활성화 여부
     trade_type: str = "scalp"    # "scalp" or "swing"
+    entry_time: datetime = None   # 개시 시각 (펀딩/stale-age 공통)
+    last_funded_ts: int = 0      # 마지막으로 펀딩 차감한 8h 경계 (unix_h // 8)
+    funding_rate: float = 0.0    # 심볼별 funding rate (8h당, 롱=+이면 지불)
 
 
 class PaperTrader:
-    """실거래 없이 시뮬레이션하는 페이퍼 트레이딩 엔진"""
+    """LIVE와 동일한 체결 모델로 시뮬레이션하는 페이퍼 트레이딩 엔진"""
 
     SL_COOLDOWN_SECONDS = 300  # SL 청산 후 5분간 같은 심볼 재진입 차단
+
+    # === 현실성 파라미터 (LIVE 피드백으로 덮어쓰기 가능) ===
+    # 슬리피지: 거래소 mid-price 대비 체결가 편차
+    DEFAULT_SLIPPAGE_BPS = 5         # 기본 5bp (=0.05%) — Binance Futures 평균
+    SLIPPAGE_ATR_COEF = 0.15         # ATR 대비 추가 슬리피지 (변동성↑ → 슬리피지↑)
+    SL_SLIPPAGE_EXTRA_BPS = 8        # SL 히트 시 추가 슬리피지 (stop market 급체결)
+    MARKET_FALLBACK_EXTRA_BPS = 3    # limit→market fallback 시 추가
+
+    # Maker 체결률 — LIVE 실측 없을 때 fallback (보수적 45%)
+    DEFAULT_MAKER_FILL_RATE = 0.45
+
+    # 레이턴시 시뮬 (ms) → 슬리피지로 변환
+    LATENCY_MS = 500
+    LATENCY_SLIPPAGE_BPS = 2         # 500ms 대기 시 추가 2bp
+
+    # Liquidation 근사 (Binance Futures maintenance margin)
+    MAINT_MARGIN_RATE = 0.005
+    LIQ_FEE_BPS = 15                 # 강제청산 수수료 근사
 
     def __init__(self, initial_capital: float = 10000.0, commission: float = 0.0004,
                  trailing_config: dict | None = None,
@@ -53,18 +86,88 @@ class PaperTrader:
         self.limit_first_enabled = False
         # 지정가 체결률 통계 — maker fee 적용률 추적
         self.limit_fill_stats = {"attempts": 0, "filled": 0, "fallback_market": 0}
+        # LIVE 피드백으로 덮어쓰기 가능한 maker fill rate
+        self.maker_fill_rate = self.DEFAULT_MAKER_FILL_RATE
+
+        # 심볼별 funding rate 캐시 (외부에서 주입)
+        # { "BTC/USDT:USDT": 0.0001 }  — 8h당 rate (롱이 숏에게 지불하면 +)
+        self._funding_rates: dict[str, float] = {}
+
+        # 심볼별 ATR 캐시 (슬리피지 동적 계산용)
+        self._atr_cache: dict[str, float] = {}
+
+    # ---------------------------------------------------------------------
+    # 외부 주입 — LIVE 피드백으로 현실 반영
+    # ---------------------------------------------------------------------
+
+    def set_maker_fill_rate(self, rate: float):
+        """LIVE 실측 maker 체결률로 덮어쓰기 (0.0~1.0)"""
+        rate = max(0.0, min(1.0, float(rate)))
+        if abs(rate - self.maker_fill_rate) > 0.02:
+            logger.info(f"[Paper-Feedback] maker fill rate 업데이트: {self.maker_fill_rate:.2%} → {rate:.2%}")
+        self.maker_fill_rate = rate
+
+    def set_funding_rate(self, symbol: str, rate: float):
+        """심볼별 funding rate 주입 (8h당, 소수점 — 0.0001 = 0.01%)"""
+        self._funding_rates[symbol] = float(rate)
+
+    def set_atr(self, symbol: str, atr_pct: float):
+        """심볼별 ATR(%) 주입 — 슬리피지 동적 계산용"""
+        self._atr_cache[symbol] = max(0.0, float(atr_pct))
 
     def set_routing(self, limit_first: bool):
         """Capital Tier 기반 라우팅 설정"""
         self.limit_first_enabled = limit_first
         if limit_first:
-            logger.info("[Paper-Routing] Limit-first 시뮬레이션 활성화 (maker fee 0.02% 적용)")
+            logger.info(
+                f"[Paper-Routing] Limit-first 시뮬레이션 활성화 "
+                f"(maker fee {self.maker_commission*100:.3f}% × fill_rate {self.maker_fill_rate:.0%})"
+            )
 
     def set_auto_close_callback(self, callback):
         """SL/TP/트레일링 자동 청산 시 호출할 콜백 등록
         callback(trade: dict) — trade는 close_position 반환값과 동일
         """
         self._on_auto_close_callback = callback
+
+    # ---------------------------------------------------------------------
+    # 슬리피지 모델
+    # ---------------------------------------------------------------------
+
+    def _slippage_bps(self, symbol: str, is_sl: bool = False, is_market_fallback: bool = False) -> float:
+        """방향 불리한 슬리피지를 bps로 반환.
+
+        - 기본: 5bp
+        - ATR × 0.15 추가 (변동성 가변)
+        - SL 히트면 +8bp
+        - market fallback이면 +3bp
+        - 레이턴시 +2bp
+        """
+        bps = self.DEFAULT_SLIPPAGE_BPS
+        atr_pct = self._atr_cache.get(symbol, 0.0)
+        bps += atr_pct * 10000 * self.SLIPPAGE_ATR_COEF  # atr_pct 0.01 → +15bp
+        if is_sl:
+            bps += self.SL_SLIPPAGE_EXTRA_BPS
+        if is_market_fallback:
+            bps += self.MARKET_FALLBACK_EXTRA_BPS
+        bps += self.LATENCY_SLIPPAGE_BPS
+        return bps
+
+    def _apply_slippage(self, side: str, price: float, bps: float, is_entry: bool) -> float:
+        """슬리피지 적용 — 항상 방향 불리하게.
+
+        진입:
+          - long: 더 비싸게 매수 (+bps)
+          - short: 더 싸게 매도 (-bps)
+        청산(반대 방향):
+          - long 청산 = 매도: 더 싸게 (-bps)
+          - short 청산 = 매수: 더 비싸게 (+bps)
+        """
+        mult = bps / 10000.0
+        if is_entry:
+            return price * (1 + mult) if side == "long" else price * (1 - mult)
+        else:
+            return price * (1 - mult) if side == "long" else price * (1 + mult)
 
     def _get_trailing_params(self, trade_type: str) -> tuple[float, float, float]:
         """trade_type별 트레일링 파라미터"""
@@ -75,6 +178,10 @@ class PaperTrader:
             tc.get("distance_pct", self.trailing_distance_pct),
             tc.get("step_pct", self.trailing_step_pct),
         )
+
+    # ---------------------------------------------------------------------
+    # Open
+    # ---------------------------------------------------------------------
 
     def open_position(self, symbol: str, side: str, size_usdt: float,
                       price: float, leverage: int = 5, sl_pct: float = 0.02,
@@ -94,23 +201,38 @@ class PaperTrader:
             else:
                 del self._sl_cooldown[symbol]
 
-        amount = (size_usdt * leverage) / price
+        # ATR 캐시 업데이트 (슬리피지용)
+        if atr_pct and atr_pct > 0 and atr_pct == atr_pct:
+            self._atr_cache[symbol] = atr_pct
 
         # === Limit-first 시뮬레이션 (tier=small+ 활성화) ===
-        # 가정: 65% 확률로 maker 체결(limit fee), 35%는 market fallback(taker fee)
-        # 이 비율은 실제 limit 체결률 피드백으로 추후 보정 가능
+        # maker_fill_rate 확률로 maker 체결, 나머지는 market fallback
         is_maker = False
+        is_market_fallback = False
         if self.limit_first_enabled:
-            import random
             self.limit_fill_stats["attempts"] += 1
-            is_maker = random.random() < 0.65
+            is_maker = random.random() < self.maker_fill_rate
             if is_maker:
                 self.limit_fill_stats["filled"] += 1
             else:
                 self.limit_fill_stats["fallback_market"] += 1
+                is_market_fallback = True
 
+        # === 진입 슬리피지 적용 ===
+        # maker 체결이면 슬리피지 0 (limit price로 정확 체결 가정)
+        # market (taker)면 방향 불리하게 슬리피지
+        if is_maker:
+            fill_price = price
+        else:
+            slip_bps = self._slippage_bps(
+                symbol, is_sl=False,
+                is_market_fallback=is_market_fallback,
+            )
+            fill_price = self._apply_slippage(side, price, slip_bps, is_entry=True)
+
+        amount = (size_usdt * leverage) / fill_price
         effective_commission = self.maker_commission if is_maker else self.commission
-        fee = size_usdt * effective_commission
+        fee = size_usdt * leverage * effective_commission  # notional 기준 수수료
         self.equity -= fee
 
         # trade_type 프로파일에서 기본값 가져오기
@@ -128,51 +250,87 @@ class PaperTrader:
             final_sl = sl_pct if sl_pct != 0.02 else profile.get("sl_pct", sl_pct)
             final_tp = tp_pct if tp_pct != 0.04 else profile.get("tp_pct", tp_pct)
 
+        # SL/TP는 fill_price 기준으로 계산 (진입가 슬리피지 반영)
         if side == "long":
-            sl = price * (1 - final_sl)
-            tp = price * (1 + final_tp)
+            sl = fill_price * (1 - final_sl)
+            tp = fill_price * (1 + final_tp)
         else:
-            sl = price * (1 + final_sl)
-            tp = price * (1 - final_tp)
+            sl = fill_price * (1 + final_sl)
+            tp = fill_price * (1 - final_tp)
 
+        now = datetime.utcnow()
+        funding_rate = self._funding_rates.get(symbol, 0.0)
         pos = PaperPosition(
             symbol=symbol, side=side, size=amount,
-            entry_price=price, leverage=leverage,
+            entry_price=fill_price, leverage=leverage,
             stop_loss=sl, take_profit=tp,
-            highest_price=price, lowest_price=price,
+            highest_price=fill_price, lowest_price=fill_price,
             trade_type=trade_type,
+            entry_time=now,
+            last_funded_ts=int(now.timestamp()) // (8 * 3600),
+            funding_rate=funding_rate,
         )
         self.positions[symbol] = pos
+        fill_tag = "MAKER" if is_maker else ("MKT-FALLBACK" if is_market_fallback else "MARKET")
+        slip_pct = (fill_price - price) / price * 100 if side == "long" else (price - fill_price) / price * 100
         logger.info(
-            f"[Paper] 포지션 개시: {side} {amount:.6f} {symbol} @ {price:.2f} | "
-            f"타입: {trade_type} | SL: {final_sl*100:.1f}% TP: {final_tp*100:.1f}%"
+            f"[Paper] 포지션 개시: {side} {amount:.6f} {symbol} @ {fill_price:.4f} "
+            f"(req {price:.4f}, slip {slip_pct:+.3f}%, {fill_tag}) | "
+            f"타입: {trade_type} | SL: {final_sl*100:.1f}% TP: {final_tp*100:.1f}% | fee ${fee:.3f}"
         )
         return pos
+
+    # ---------------------------------------------------------------------
+    # Close — 슬리피지 적용 (SL 히트 시 추가 슬리피지)
+    # ---------------------------------------------------------------------
 
     def close_position(self, symbol: str, price: float, reason: str = "") -> dict:
         if symbol not in self.positions:
             return {}
 
         pos = self.positions[symbol]
-        if pos.side == "long":
-            pnl = (price - pos.entry_price) / pos.entry_price * pos.size * pos.entry_price * pos.leverage
-        else:
-            pnl = (pos.entry_price - price) / pos.entry_price * pos.size * pos.entry_price * pos.leverage
 
-        fee = pos.size * price * self.commission
+        # === 청산 슬리피지 적용 ===
+        # SL/liquidation 히트면 추가 슬리피지 (stop market 급체결)
+        is_sl_hit = ("SL" in reason.upper()) or ("liq" in reason.lower())
+        slip_bps = self._slippage_bps(symbol, is_sl=is_sl_hit, is_market_fallback=False)
+        fill_price = self._apply_slippage(pos.side, price, slip_bps, is_entry=False)
+
+        if pos.side == "long":
+            pnl = (fill_price - pos.entry_price) * pos.size * pos.leverage
+        else:
+            pnl = (pos.entry_price - fill_price) * pos.size * pos.leverage
+
+        # 수수료 — taker (청산은 대부분 market)
+        notional = pos.size * fill_price
+        fee = notional * self.commission
+
+        # Liquidation이면 강제청산 수수료 추가
+        if "liq" in reason.lower():
+            fee += notional * (self.LIQ_FEE_BPS / 10000.0)
+
         net_pnl = pnl - fee
         self.equity += net_pnl
+
+        duration_minutes = 0
+        if pos.entry_time:
+            duration_minutes = (datetime.utcnow() - pos.entry_time).total_seconds() / 60
 
         trade = {
             "timestamp": str(datetime.utcnow()),
             "symbol": symbol,
             "side": pos.side,
             "entry_price": pos.entry_price,
-            "exit_price": price,
+            "exit_price": fill_price,
+            "requested_price": price,
+            "slippage_bps": slip_bps,
             "size": pos.size,
+            "notional": notional,
             "pnl": net_pnl,
             "fee": fee,
             "reason": reason,
+            "duration_minutes": duration_minutes,
+            "leverage": pos.leverage,
         }
         self.trade_history.append(trade)
         del self.positions[symbol]
@@ -182,12 +340,23 @@ class PaperTrader:
             self._sl_cooldown[symbol] = datetime.utcnow()
             logger.info(f"[Paper-쿨다운] {symbol} SL 청산 → {self.SL_COOLDOWN_SECONDS}초 재진입 차단")
 
-        logger.info(f"[Paper] 포지션 청산: {symbol} | PnL: {net_pnl:.2f} | 사유: {reason}")
+        slip_pct = (price - fill_price) / price * 100 if pos.side == "long" else (fill_price - price) / price * 100
+        logger.info(
+            f"[Paper] 포지션 청산: {symbol} {pos.side} @ {fill_price:.4f} "
+            f"(req {price:.4f}, slip {slip_pct:+.3f}% [{slip_bps:.1f}bp]) | "
+            f"PnL: {net_pnl:+.2f} | fee ${fee:.3f} | 사유: {reason}"
+        )
         return trade
 
+    # ---------------------------------------------------------------------
+    # Update — 가격 업데이트 + 펀딩 + Liquidation + SL/TP
+    # ---------------------------------------------------------------------
+
     def update_prices(self, prices: dict[str, float]):
-        """현재가 업데이트 + 트레일링 스탑 + SL/TP 체크"""
+        """현재가 업데이트 + 펀딩비 차감 + 강제청산 + 트레일링 스탑 + SL/TP"""
         auto_closed = []  # (symbol, close_price, reason) — 루프 후 처리
+        now = datetime.utcnow()
+        now_8h = int(now.timestamp()) // (8 * 3600)
 
         for symbol, price in prices.items():
             if symbol not in self.positions:
@@ -195,6 +364,41 @@ class PaperTrader:
             pos = self.positions[symbol]
             t_activate, t_distance, t_step = self._get_trailing_params(pos.trade_type)
 
+            # === 1. 펀딩비 차감 — 8h 경계 넘었으면 ===
+            # Binance Futures: 00/08/16 UTC에 funding 지불/수취
+            if now_8h > pos.last_funded_ts and pos.funding_rate:
+                fr = self._funding_rates.get(symbol, pos.funding_rate)
+                notional = pos.size * price
+                # 롱은 +fr일 때 지불, 숏은 +fr일 때 수취 (기본 방향)
+                if pos.side == "long":
+                    funding_pnl = -notional * fr
+                else:
+                    funding_pnl = notional * fr
+                self.equity += funding_pnl
+                pos.last_funded_ts = now_8h
+                logger.info(
+                    f"[Paper-Funding] {symbol} {pos.side} notional ${notional:.2f} × rate {fr*100:.4f}% "
+                    f"= {funding_pnl:+.4f}"
+                )
+
+            # === 2. Liquidation 체크 (maintenance margin) ===
+            # unrealized PnL이 -(1/leverage - maint_margin) 넘어서면 강제청산
+            # 예: 5x 레버리지, maint 0.5% → -(0.20 - 0.005) = -19.5% 손실 시 liq
+            if pos.side == "long":
+                loss_pct = (pos.entry_price - price) / pos.entry_price
+            else:
+                loss_pct = (price - pos.entry_price) / pos.entry_price
+
+            liq_threshold = (1.0 / pos.leverage) - self.MAINT_MARGIN_RATE
+            if loss_pct > liq_threshold:
+                logger.warning(
+                    f"[Paper-LIQ] {symbol} {pos.side} 강제청산! "
+                    f"손실 {loss_pct*100:.2f}% > liq {liq_threshold*100:.2f}% (lev {pos.leverage}x)"
+                )
+                auto_closed.append((symbol, price, "liquidation"))
+                continue
+
+            # === 3. SL/TP/트레일링 ===
             if pos.side == "long":
                 pos.unrealized_pnl = (price - pos.entry_price) / pos.entry_price * pos.leverage
                 pos.highest_price = max(pos.highest_price, price)
@@ -214,10 +418,10 @@ class PaperTrader:
                         pos.stop_loss = new_sl
                         logger.info(f"[Trailing] {symbol}({pos.trade_type}) SL 상향 | {old_sl:.2f} → {pos.stop_loss:.2f}")
 
-                # SL/TP 체크
+                # SL/TP 체크 — Live와 동일하게 현재가로 청산 (SL 레벨 X)
                 if price <= pos.stop_loss:
                     reason = "트레일링 SL 도달" if pos.trailing_activated else "SL 도달"
-                    auto_closed.append((symbol, pos.stop_loss, reason))
+                    auto_closed.append((symbol, price, reason))
                 elif price >= pos.take_profit and not pos.trailing_activated:
                     pos.trailing_activated = True
                     pos.stop_loss = pos.entry_price * (1 + t_activate)
@@ -242,9 +446,10 @@ class PaperTrader:
                         pos.stop_loss = new_sl
                         logger.info(f"[Trailing] {symbol}({pos.trade_type}) 숏 SL 하향 | {old_sl:.2f} → {pos.stop_loss:.2f}")
 
+                # SL/TP 체크 — Live와 동일하게 현재가
                 if price >= pos.stop_loss:
                     reason = "트레일링 SL 도달" if pos.trailing_activated else "SL 도달"
-                    auto_closed.append((symbol, pos.stop_loss, reason))
+                    auto_closed.append((symbol, price, reason))
                 elif price <= pos.take_profit and not pos.trailing_activated:
                     pos.trailing_activated = True
                     pos.stop_loss = pos.entry_price * (1 - t_activate)

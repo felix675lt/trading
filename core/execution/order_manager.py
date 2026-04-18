@@ -90,6 +90,18 @@ class OrderManager:
         # Smart routing (tier=pro) — SmartRouter 인스턴스 주입
         self.smart_router = None
 
+        # 지정가 체결 통계 — Paper 피드백용 (maker fill rate 실측)
+        self.limit_fill_stats = {"attempts": 0, "filled": 0, "fallback_market": 0}
+
+    def get_maker_fill_rate(self) -> float | None:
+        """Limit-first 시도 대비 maker 체결 성공률 (부분체결 수용 포함).
+        샘플 수가 너무 적으면 None 반환 → 호출부가 기본값 유지.
+        """
+        attempts = self.limit_fill_stats.get("attempts", 0)
+        if attempts < 5:
+            return None
+        return self.limit_fill_stats.get("filled", 0) / attempts
+
     def set_routing(
         self,
         limit_first: bool = False,
@@ -154,6 +166,7 @@ class OrderManager:
         2. limit_wait_seconds 동안 체결 대기 (1초마다 상태 확인)
         3. 체결됨 → order 반환 / 미체결 → 취소하고 None 반환
         """
+        self.limit_fill_stats["attempts"] += 1
         try:
             bid, ask, _ = await self.exchange.get_bid_ask(symbol)
             # maker 체결 우선 — bid에 buy, ask에 sell (크로스 방지)
@@ -183,12 +196,14 @@ class OrderManager:
                 st = (status.get("status") or "").lower()
                 filled = float(status.get("filled", 0) or 0)
                 if st in ("closed", "filled") or filled >= amount * 0.99:
+                    self.limit_fill_stats["filled"] += 1
                     logger.info(
                         f"[Limit-first] {symbol} 체결 성공 ({elapsed+1}s) "
                         f"filled={filled:.6f}/{amount:.6f} @ {status.get('average', limit_price)}"
                     )
                     return status
                 if st in ("canceled", "cancelled", "expired"):
+                    self.limit_fill_stats["fallback_market"] += 1
                     logger.info(f"[Limit-first] {symbol} 주문 취소됨 ({st}) → market fallback")
                     return None
 
@@ -202,13 +217,16 @@ class OrderManager:
             final_filled = float(final.get("filled", 0) or 0) if final else 0
             if final_filled >= amount * 0.5:
                 # 절반 이상 체결됐으면 limit 결과 수용 (나머지는 포기)
+                self.limit_fill_stats["filled"] += 1
                 logger.warning(
                     f"[Limit-first] {symbol} 부분체결 {final_filled:.6f} ({final_filled/amount*100:.0f}%) 수용"
                 )
                 return final
+            self.limit_fill_stats["fallback_market"] += 1
             return None
 
         except Exception as e:
+            self.limit_fill_stats["fallback_market"] += 1
             logger.warning(f"[Limit-first] {symbol} 실패: {e} → market fallback")
             return None
 

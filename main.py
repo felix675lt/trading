@@ -741,6 +741,19 @@ class AutoTrader:
                         smart_router=getattr(self, "smart_router", None),
                     )
 
+                # === LIVE → Paper 피드백: 실측 maker 체결률을 Paper에 주입 ===
+                # 샘플 충분(≥5)하면 실측값으로 덮어쓰기, 부족하면 기본값 유지
+                try:
+                    rates = []
+                    for om_obj in self.order_managers.values():
+                        r = om_obj.get_maker_fill_rate()
+                        if r is not None:
+                            rates.append(r)
+                    if rates:
+                        self.paper_trader.set_maker_fill_rate(sum(rates) / len(rates))
+                except Exception as e:
+                    logger.debug(f"[Paper-Feedback] maker_fill_rate 동기화 실패: {e}")
+
                 # 재학습 체크 (일반 + stuck 감지)
                 diag = self.strategy_manager.get_diagnostics()
                 needs_retrain = trainer.should_retrain()
@@ -780,6 +793,18 @@ class AutoTrader:
                     for symbol in symbols:
                         await self.external_manager.update(symbol)
                         self.last_external = self.external_manager.get_report()
+
+                        # === Paper 피드백: 심볼별 funding rate 주입 (raw 8h rate) ===
+                        try:
+                            fr_raw = (
+                                self.last_external.get("derivatives", {})
+                                .get("funding_rate", {})
+                                .get("current_rate", 0.0)
+                            )
+                            if fr_raw is not None:
+                                self.paper_trader.set_funding_rate(symbol, float(fr_raw))
+                        except Exception as e:
+                            logger.debug(f"[Paper-Feedback] {symbol} funding rate 주입 실패: {e}")
 
                         # 외부 피처를 FeatureEngineer에 주입
                         ext_features = self.external_manager.get_all_features()
@@ -1334,6 +1359,16 @@ class AutoTrader:
         # 7. 주문 실행
         if decision.action in ["long", "short"]:
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
+
+            # ATR 값 추출 (동적 SL/TP + Paper 슬리피지용)
+            atr_pct = float(df["atr_pct"].iloc[-1]) if "atr_pct" in df.columns else 0.0
+            if atr_pct != atr_pct:  # NaN
+                atr_pct = 0.0
+            # Paper 슬리피지 모델에 ATR 주입 (포지션 유지 중 close 슬리피지도 최신 ATR 사용)
+            try:
+                self.paper_trader.set_atr(symbol, atr_pct)
+            except Exception:
+                pass
 
             # 7.0. 퀀트 시그널 계산 (오더북, VPIN, 베이시스, 크래시보호, 알파, 레짐)
             try:
