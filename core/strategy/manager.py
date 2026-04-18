@@ -49,10 +49,23 @@ class StrategyManager:
         # live_long_only는 main.py의 LIVE 주문 게이트에서 처리.
         self.long_only = config.get("long_only", False)
         self.live_long_only = config.get("live_long_only", False)
+
+        # === LIVE 공격 롱 모드 (2026-04-18) ===
+        # 매크로/지정학 하방 필터 완화 + 롱 확신도 부스트 + 낮은 임계값
+        self.live_aggressive_long = config.get("live_aggressive_long", False)
+        self.live_min_confidence = config.get("live_min_confidence", self.base_min_confidence)
+        self.live_long_conf_boost = config.get("live_long_conf_boost", 1.0)
+        self.live_disable_macro_block = config.get("live_disable_macro_block", False)
+
         if self.long_only:
             logger.warning("[Strategy] LONG_ONLY (global) 모드 활성화 — 전 모드 숏 진입 차단")
         elif self.live_long_only:
             logger.warning("[Strategy] LIVE_LONG_ONLY 모드 활성화 — LIVE만 숏 차단, PAPER 양방향")
+        if self.live_aggressive_long:
+            logger.warning(
+                f"[Strategy] LIVE 공격 롱 모드 ON — min_conf={self.live_min_confidence:.2f} "
+                f"boost=×{self.live_long_conf_boost:.2f} 매크로차단해제={self.live_disable_macro_block}"
+            )
         self.recent_decisions: list[TradeDecision] = []
 
         # 자기진단 상태
@@ -167,10 +180,17 @@ class StrategyManager:
         feedback_blacklist: list | None = None,
         funding_rate: float = 0.0,
         fear_greed_index: float = 50.0,
+        mode: str = "paper",
     ) -> TradeDecision:
-        """최종 트레이딩 결정 (v4 - 다중확인 시스템)"""
+        """최종 트레이딩 결정 (v4 - 다중확인 시스템)
+
+        mode: "paper" 또는 "live" — LIVE 공격 롱 모드 적용 여부 결정
+        """
         action_map = {0: "hold", 1: "long", 2: "short", 3: "close"}
         rl_direction = action_map.get(rl_action, "hold")
+
+        # LIVE 공격 롱 모드 활성 여부
+        live_aggro = (mode == "live") and self.live_aggressive_long
 
         ml_direction = ml_signal.get("direction", "neutral")
         ml_confidence = ml_signal.get("confidence", 0)
@@ -259,6 +279,16 @@ class StrategyManager:
             signal_str = "moderate"
             reason = f"ML+RL 강합의 ({ml_direction}, ML:{ml_confidence:.2f} RL:{rl_confidence:.2f})"
 
+        # 2.45. LIVE 공격 롱 부스트 — LIVE 모드에서 롱 확신도만 상향
+        if live_aggro and final_action == "long" and self.live_long_conf_boost > 1.0:
+            before = confidence
+            confidence *= self.live_long_conf_boost
+            reason += f" +LIVE공격롱(×{self.live_long_conf_boost:.2f})"
+            logger.info(
+                f"[LIVE-AGGRO] 롱 확신도 부스트: {before:.3f} → {confidence:.3f} "
+                f"(×{self.live_long_conf_boost:.2f})"
+            )
+
         # 2.5. 외부 신호 보정 (진입 시그널이 있을 때만)
         if final_action in ["long", "short"] and ext_direction != "neutral":
             ext_agrees = (
@@ -289,12 +319,20 @@ class StrategyManager:
 
         # 2.7. 고임팩트 이벤트 오버라이드 [재활성화]
         # 강한 외부 시그널 + 고임팩트 뉴스 반대 방향 진입 → 차단
+        # LIVE 공격 롱 모드 + macro_disable: 롱 차단만 해제 (숏 차단은 유지)
+        macro_disabled_long = live_aggro and self.live_disable_macro_block
         if has_high_impact and abs(ext_score) > 0.4:
             if ext_direction == "bearish" and final_action == "long":
-                logger.warning(f"[고임팩트차단] 롱 차단 (ext_score={ext_score:.2f}, 베어리시 이벤트)")
-                final_action = "hold"
-                reason = f"고임팩트 베어리시 이벤트 → 롱 차단 (ext={ext_score:.2f})"
-                confidence = 0.0
+                if macro_disabled_long:
+                    logger.info(
+                        f"[LIVE-AGGRO] 고임팩트 베어리시 이벤트 롱차단 무시 "
+                        f"(ext_score={ext_score:.2f}) — 매크로 필터 해제"
+                    )
+                else:
+                    logger.warning(f"[고임팩트차단] 롱 차단 (ext_score={ext_score:.2f}, 베어리시 이벤트)")
+                    final_action = "hold"
+                    reason = f"고임팩트 베어리시 이벤트 → 롱 차단 (ext={ext_score:.2f})"
+                    confidence = 0.0
             elif ext_direction == "bullish" and final_action == "short":
                 logger.warning(f"[고임팩트차단] 숏 차단 (ext_score={ext_score:.2f}, 불리시 이벤트)")
                 final_action = "hold"
@@ -303,15 +341,21 @@ class StrategyManager:
 
         # 2.8. 레짐 방향 바이어스 [재활성화 v2] — funding_rate 극값만 사용
         # 공포탐욕 지수는 제거됨 (후행 지표, 예측력 없음)
+        # LIVE 공격 롱 + macro_disable: 롱 차단만 무시 (숏 차단은 유지 — 펀비 스퀴즈 리스크 보호)
         if final_action in ["long", "short"]:
             direction_block = self._regime_direction_bias(
                 final_action, funding_rate, fear_greed_index, mom_direction, mom_rsi,
             )
             if direction_block:
-                logger.warning(f"[레짐차단] 진입 차단: {direction_block}")
-                final_action = "hold"
-                reason = direction_block
-                confidence = 0.0
+                if macro_disabled_long and final_action == "long":
+                    logger.info(
+                        f"[LIVE-AGGRO] 레짐 롱차단 무시: {direction_block}"
+                    )
+                else:
+                    logger.warning(f"[레짐차단] 진입 차단: {direction_block}")
+                    final_action = "hold"
+                    reason = direction_block
+                    confidence = 0.0
 
         # 2.85. LONG_ONLY 필터 (사용자 지시) — 숏 진입 완전 차단
         # 주: live_long_only는 여기서 차단하지 않는다 (PAPER는 양방향 학습 필요).
@@ -335,11 +379,15 @@ class StrategyManager:
                 confidence = 0.0
 
         # 3. 최소 확신도 필터 (강화)
-        if confidence < self.min_confidence and final_action not in ("close", "hold"):
+        # LIVE 공격 롱 모드에서 롱은 live_min_confidence 사용 (기본보다 낮음)
+        effective_min_conf = self.min_confidence
+        if live_aggro and final_action == "long":
+            effective_min_conf = min(self.min_confidence, self.live_min_confidence)
+        if confidence < effective_min_conf and final_action not in ("close", "hold"):
             max_long = max([v[1] for v in long_votes], default=0)
             max_short = max([v[1] for v in short_votes], default=0)
             reason = (
-                f"확신도 부족 ({confidence:.3f} < {self.min_confidence:.3f}) "
+                f"확신도 부족 ({confidence:.3f} < {effective_min_conf:.3f}) "
                 f"[L:{long_count}표(max={max_long:.2f}) S:{short_count}표(max={max_short:.2f}) "
                 f"ML:{ml_direction}/{ml_confidence:.2f} RL:{rl_direction}/{rl_confidence:.2f}]"
             )
@@ -348,7 +396,7 @@ class StrategyManager:
         # 4. 시장 레짐 필터
         if market_regime == "extreme_volatility" and final_action in ["long", "short"]:
             confidence *= 0.7
-            if confidence < self.min_confidence:
+            if confidence < effective_min_conf:
                 final_action = "hold"
                 reason = "극심한 변동성 - 진입 보류"
 

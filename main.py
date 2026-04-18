@@ -1108,6 +1108,23 @@ class AutoTrader:
                         f"MTF합류: {mtf.get('score', 0):.2f}({mtf.get('agreement', 0):.0%})"
                     )
 
+                    # === $100K 타겟 진행률 (2026-04-18) ===
+                    target = float(self.config.get("trading", {}).get("target_equity", 100000))
+                    live_eq_now = float(getattr(self, "live_equity", 0.0))
+                    paper_eq_now = float(self.paper_trader.equity)
+                    total_eq = live_eq_now + paper_eq_now
+                    if target > 0:
+                        pct = min(total_eq / target * 100, 100.0)
+                        filled = int(pct / 5)  # 20칸 스케일
+                        bar = "█" * filled + "░" * (20 - filled)
+                        live_tier_name = self.tier_manager.get_tier("live").name
+                        paper_tier_name = self.tier_manager.get_tier("paper").name
+                        logger.info(
+                            f"[Target] 🎯 $100K 진행 {pct:5.2f}% [{bar}] | "
+                            f"LIVE ${live_eq_now:,.2f}({live_tier_name}) + "
+                            f"PAPER ${paper_eq_now:,.2f}({paper_tier_name}) = ${total_eq:,.2f} / ${target:,.0f}"
+                        )
+
                 # 자동 전략 최적화 (각 모드별 독립)
                 for label, optimizer in [("PAPER", self.strategy_optimizer_paper),
                                          ("LIVE", self.strategy_optimizer_live)]:
@@ -1227,6 +1244,9 @@ class AutoTrader:
         # 피드백 블랙리스트 조회 (반복 실패 시그널 조합 차단)
         fb_blacklist = self.feedback.get_entry_blacklist()
 
+        # LIVE/dual에서는 "live" mode로 → LIVE 공격 롱 정책 적용
+        # 순수 paper에서는 "paper" mode로 → 기존 보수적 정책
+        decide_mode = "live" if self.mode in ("live", "dual") else "paper"
         decision = self.strategy_manager.decide(
             ml_signal, rl_action, rl_confidence, current_position,
             adaptive_params["regime"], external_signal=ext_signal,
@@ -1234,6 +1254,7 @@ class AutoTrader:
             feedback_blacklist=fb_blacklist,
             funding_rate=funding_rate,
             fear_greed_index=fear_greed,
+            mode=decide_mode,
         )
 
         # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
@@ -1789,6 +1810,8 @@ class AutoTrader:
             fear_greed = 50.0  # [제거됨] 공포탐욕 지수 비활성화
 
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
+            # concentration 모드에서 _analyze_symbol은 주로 LIVE 후보 선정 목적
+            decide_mode = "live" if self.mode in ("live", "dual") else "paper"
             decision = self.strategy_manager.decide(
                 ml_signal, rl_action, rl_confidence, current_position,
                 adaptive_params["regime"], external_signal=ext_signal,
@@ -1796,6 +1819,7 @@ class AutoTrader:
                 feedback_blacklist=fb_blacklist,
                 funding_rate=funding_rate,
                 fear_greed_index=fear_greed,
+                mode=decide_mode,
             )
 
             # MTF 필터 적용

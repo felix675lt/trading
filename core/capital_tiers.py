@@ -52,6 +52,18 @@ class CapitalTierManager:
         raw_tiers = cfg.get("tiers") or self._default_tiers()
         self.tiers: list[CapitalTier] = self._parse_tiers(raw_tiers)
 
+        # === Mode별 심볼 오버라이드 (2026-04-18) ===
+        # trading.paper_symbols_override / trading.live_symbols_override
+        # 설정되면 해당 mode 심볼을 완전히 교체 (티어 심볼 무시)
+        trading_cfg = config.get("trading", {}) or {}
+        self.symbol_overrides: dict[str, list[str]] = {}
+        po = trading_cfg.get("paper_symbols_override")
+        lo = trading_cfg.get("live_symbols_override")
+        if po:
+            self.symbol_overrides["paper"] = list(po)
+        if lo:
+            self.symbol_overrides["live"] = list(lo)
+
         # 상태
         self.live_equity: float = 0.0
         self.paper_equity: float = 0.0
@@ -62,6 +74,12 @@ class CapitalTierManager:
             f"[CapitalTier] 초기화 | 티어 {len(self.tiers)}개 | "
             f"PAPER 가상시드 ${self.paper_virtual_seed:,.0f} (use={self.paper_use_virtual})"
         )
+        if self.symbol_overrides:
+            logger.warning(
+                f"[CapitalTier] 심볼 오버라이드 활성: "
+                f"PAPER={self.symbol_overrides.get('paper', '티어기본')} | "
+                f"LIVE={self.symbol_overrides.get('live', '티어기본')}"
+            )
 
     # ---------------------------------------------------------------------
     # 티어 정의
@@ -274,7 +292,13 @@ class CapitalTierManager:
         return tier.features.get(feature, default)
 
     def get_symbols(self, mode: str = "live") -> list[str]:
-        """mode 티어가 허용하는 심볼 목록"""
+        """mode 티어가 허용하는 심볼 목록.
+
+        오버라이드가 설정되어 있으면 티어 심볼을 무시하고 오버라이드 사용.
+        (mode별로 집중 유니버스를 강제하고 싶을 때 — PAPER=BTC/ETH, LIVE=알트 등)
+        """
+        if mode in self.symbol_overrides:
+            return list(self.symbol_overrides[mode])
         return list(self.get_feature("symbols", mode, []))
 
     def allowed_symbol(self, symbol: str, mode: str = "live") -> bool:

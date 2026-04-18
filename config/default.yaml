@@ -17,13 +17,23 @@ exchanges:
 
 trading:
   symbols:
-    # BTC 제외: 시드 $10K 미만에서는 변동성 대비 수익 비효율
-    # BTC 일중범위 3.5% vs SOL 5.8% → 같은 돈으로 65% 더 벌 수 있음
-    # BTC는 시드 $10K 이상에서 재활성화
-    #- "BTC/USDT:USDT"
+    # fallback — tier/mode override가 있으면 그쪽 사용
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
     - "DOGE/USDT:USDT"
+
+  # === Mode별 심볼 오버라이드 (2026-04-18) ===
+  # PAPER: BTC/ETH 위주 (안정성 우선, LIVE와 동일 체결 조건으로 현실 검증)
+  paper_symbols_override:
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+  # LIVE: 알트 위주 (낮은 시드 → 변동성 기반 공격 롱)
+  #   티어 상승 시 tier.symbols에서 자동으로 더 많은 알트 추가됨
+  live_symbols_override:
+    - "ETH/USDT:USDT"
+    - "SOL/USDT:USDT"
+    - "DOGE/USDT:USDT"
+
   timeframes:
     - "5m"
     - "15m"
@@ -31,7 +41,7 @@ trading:
     - "4h"
   leverage: 3
   mode: "dual"  # backtest / paper / live / dual (Paper+Live 동시)
-  min_confidence: 0.40     # 최소 확신도 (적응형: 장기 hold 시 0.25까지 하향)
+  min_confidence: 0.40     # 최소 확신도 (PAPER 기준, 적응형: 장기 hold 시 0.25까지 하향)
   signal_threshold: 0.10   # ML 시그널 방향 결정 임계값
   min_confirming_signals: 2  # 최소 2개 시그널 합의 필요 (다중확인)
 
@@ -48,28 +58,44 @@ trading:
   long_only: false
   live_long_only: true
 
+  # === LIVE 공격 롱 모드 (2026-04-18, 사용자 지시) ===
+  # "국제정세/지정학 이슈에 시장이 반응 안 한다" 판단 → 매크로 하방 필터 완화
+  # LIVE는 알트 위주로 공격적 롱, 손절 최대한 안 치는 방향
+  live_aggressive_long: true
+  live_min_confidence: 0.30        # LIVE만 0.40 → 0.30 완화 (PAPER는 0.40 유지)
+  live_long_conf_boost: 1.25       # 롱 확신도 +25% 부스트 (LIVE 전용)
+  live_disable_macro_block: true   # LIVE 롱에 한해 고임팩트/지정학 차단 해제
+
+  # === $100K 타겟 ===
+  # 전체 시스템이 이 목표를 향해 공격성 자동 조절
+  #   < $1K : 극공격 (Kelly 0.35)
+  #   $1~10K: 공격 (Kelly 0.25)
+  #   $10~50K: 적극 (Kelly 0.20)
+  #   $50K~ : 보수 (Kelly 0.12) — 수확 모드
+  target_equity: 100000
+
 risk:
   max_position_pct: 0.95        # 풀시드 집중: $188 × 95% = $178.6 마진
   min_order_notional: 5         # 알트코인 최소 $5
-  max_daily_loss_pct: 0.05      # 일 최대 손실 5%
-  max_drawdown_pct: 0.15        # MDD 15%
+  max_daily_loss_pct: 0.06      # 일 최대 손실 6% (공격 모드 완화)
+  max_drawdown_pct: 0.20        # MDD 20% (공격 모드 완화)
   stop_loss_pct: 0.015          # 1.5% SL (fallback — ATR 없을 때만)
-  take_profit_pct: 0.025        # 2.5% TP (fallback — ATR 없을 때만)
+  take_profit_pct: 0.030        # 3.0% TP (fallback — ATR 없을 때만)
   max_open_positions: 1         # LIVE 1포지션 제한
-  cooldown_after_losses: 2
-  cooldown_minutes: 30
+  cooldown_after_losses: 3      # 2→3 (공격 모드 — 손절 후 쿨다운 완화)
+  cooldown_minutes: 20          # 30→20
 
-  # === ATR 기반 동적 SL/TP (핵심) ===
-  atr_sl_multiplier: 2.0        # SL = ATR(14) × 2.0 (노이즈 회피)
-  atr_tp_multiplier: 3.5        # TP = ATR(14) × 3.5 (RR 1.75:1)
-  sl_floor_pct: 0.010           # SL 최소 1.0% (노이즈 회피 확대)
-  sl_cap_pct: 0.030             # SL 최대 3.0% (최대 손실 제한)
+  # === ATR 기반 동적 SL/TP (공격 롱 모드 — 손절 최대한 안치도록 wider) ===
+  atr_sl_multiplier: 2.5        # 2.0 → 2.5 (SL 더 멀리 = 노이즈 내성 ↑)
+  atr_tp_multiplier: 4.0        # 3.5 → 4.0 (RR 1.6:1 유지)
+  sl_floor_pct: 0.015           # 1.0 → 1.5% (최소 SL 넓힘)
+  sl_cap_pct: 0.040             # 3.0 → 4.0% (최대 SL 확장)
 
   dynamic_leverage:
     enabled: true
-    base: 3                     # $188 × 3x = $564 notional
-    min: 2                      # 약한 시그널: 2x ($376)
-    max: 5                      # 강한 시그널: 5x ($940)
+    base: 2                     # 3 → 2 (레버리지 하향 — SL 히트 방어)
+    min: 2                      # 약한 시그널도 2x 유지
+    max: 3                      # 5 → 3 (공격 롱은 레버리지 대신 holding으로)
 
   # === 종목별 스캘핑 프로파일 (ATR fallback용) ===
   scalp_profiles:
@@ -101,24 +127,23 @@ trailing_stop:
   distance_pct: 0.008
   step_pct: 0.004
 
-# === 순수 스캘핑 전략 ===
-# 모든 시그널(ML, RL, 모멘텀, 외부)이 방향 투표 → 합의 시 진입
-# 외부 시그널 = 방향 필터 역할 (진입 근거 X, 방향 확인용)
+# === 공격 롱 + 시간 기반 가드 전략 (2026-04-18 재조정) ===
+# "손절 최대한 안치고 오래 hold" 방향 — SL 넓히고 max_hold를 시간 가드로 전환
 trade_profiles:
   scalp:
     sources: ["ML", "ML_val", "MOM", "RSI_extreme", "RL", "EXT", "EXT_boost"]
-    max_risk_pct: 0.04     # 1거래 최대 손실 = 자본의 4%
-    sl_pct: 0.010          # 1.0% SL (→ 4%/1% = 최대 4x)
-    tp_pct: 0.015          # 1.5% TP (RR 1.5:1 — 먹을 수 있을 때 먹기)
-    sl_floor_pct: 0.010
-    sl_cap_pct: 0.015
-    atr_sl_multiplier: 1.5
-    atr_tp_multiplier: 3.0
+    max_risk_pct: 0.06     # 4% → 6% (1거래 risk budget 완화)
+    sl_pct: 0.015          # 1.0 → 1.5% SL
+    tp_pct: 0.030          # 1.5 → 3.0% TP (RR 2.0:1)
+    sl_floor_pct: 0.015
+    sl_cap_pct: 0.025
+    atr_sl_multiplier: 2.0  # 1.5 → 2.0 (SL 멀리)
+    atr_tp_multiplier: 4.0  # 3.0 → 4.0
     trailing:
-      activate_pct: 0.010  # 1% 수익 시 트레일링 활성화
-      distance_pct: 0.008  # 최고점에서 0.8% 하락 시 청산 (찔끔 방지)
-      step_pct: 0.003
-    max_hold_minutes: 60   # 최대 1시간 보유
+      activate_pct: 0.015   # 1.5% 수익 시 트레일링 활성화 (기존 1%)
+      distance_pct: 0.012   # 0.8% → 1.2% (찔끔 방지 강화)
+      step_pct: 0.004
+    max_hold_minutes: 240   # 60 → 240 (4시간 — SL 대신 시간 가드로 방어)
 
 ml:
   retrain_interval_hours: 24
@@ -150,8 +175,8 @@ backtest:
 
 external:
   enabled: true
-  weight: 0.3              # 외부 요인이 최종 결정에 미치는 가중치 (0~1)
-  update_interval_min: 15   # 외부 데이터 업데이트 주기 (분)
+  weight: 0.2              # 외부 요인 가중치 완화 (0.3→0.2, 매크로 영향 축소)
+  update_interval_min: 15
   sources:
     fear_greed: true
     news: true
@@ -163,12 +188,12 @@ external:
     derivatives: true          # 펀딩비/OI/롱숏비율 (Binance)
     multi_timeframe: true      # 멀티타임프레임 합류 분석
   sentiment:
-    method: "vader"         # vader (경량) / keyword (초경량)
-    crypto_lexicon: true    # 크립토 특화 사전 사용
+    method: "vader"
+    crypto_lexicon: true
   signal_thresholds:
-    strong_bullish: 0.3     # 강한 매수 신호
-    strong_bearish: -0.3    # 강한 매도 신호
-    event_override: true    # 고임팩트 이벤트 시 기술적 분석 오버라이드
+    strong_bullish: 0.4     # 0.3 → 0.4 (더 강해야 신호로 인정)
+    strong_bearish: -0.4    # 0.3 → 0.4
+    event_override: false   # 고임팩트 오버라이드 해제 — 매크로가 진입 방해하지 않게
 
 # =============================================================================
 # Capital Tier System — 시드 구간별 기능 자동 활성화
@@ -189,49 +214,49 @@ capital_tiers:
     - name: micro
       min: 0
       max: 500
-      description: "소시드 집중매매 ($0~$500) — 1포지션 풀시드"
+      description: "소시드 집중매매 ($0~$500) — 1포지션 풀시드, 알트 위주 공격 롱"
       features:
         symbols: ["ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"]
         max_positions: 1
         concentration_mode: true
-        sizing_method: confidence        # confidence | kelly_fractional | hrp
-        order_routing: market_only        # market_only | limit_first | twap | smart
-        kelly_enabled: false
-        kelly_fraction: 0.0
+        sizing_method: kelly_fractional   # micro부터 Kelly 활성 ($100K 빠른 도달)
+        order_routing: market_only
+        kelly_enabled: true
+        kelly_fraction: 0.35              # 공격적 (낮은 시드 = 빠른 성장 필요)
         limit_order_pref: false
         hmm_regime: false
         meta_labeling: false
         walk_forward_cv: false
         cvar_risk: false
         stat_arb_pairs: false
-        max_leverage: 5
+        max_leverage: 3                   # 공격 롱은 레버리지 낮추고 holding으로
 
     - name: small
       min: 500
       max: 2000
-      description: "소형 시드 ($500~$2K) — 2포지션 + 제한주문 선호"
+      description: "소형 시드 ($500~$2K) — 2포지션 + 알트 확장"
       features:
-        symbols: ["ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"]
+        symbols: ["ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
         max_positions: 2
         concentration_mode: false
-        sizing_method: confidence
+        sizing_method: kelly_fractional
         order_routing: limit_first
-        kelly_enabled: false
-        kelly_fraction: 0.0
+        kelly_enabled: true
+        kelly_fraction: 0.30
         limit_order_pref: true
         hmm_regime: false
         meta_labeling: false
         walk_forward_cv: true
         cvar_risk: false
         stat_arb_pairs: false
-        max_leverage: 5
+        max_leverage: 3
 
     - name: mid
       min: 2000
       max: 10000
       description: "중형 시드 ($2K~$10K) — Kelly + BTC 재진입 + CVaR"
       features:
-        symbols: ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"]
+        symbols: ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
         max_positions: 3
         concentration_mode: false
         sizing_method: kelly_fractional
@@ -244,12 +269,12 @@ capital_tiers:
         walk_forward_cv: true
         cvar_risk: true
         stat_arb_pairs: false
-        max_leverage: 4
+        max_leverage: 3
 
     - name: large
       min: 10000
       max: 50000
-      description: "대형 시드 ($10K~$50K) — HMM + 메타라벨링 + TWAP"
+      description: "대형 시드 ($10K~$50K) — HMM + 메타라벨링 + TWAP + 적극 모드"
       features:
         symbols:
           - "BTC/USDT:USDT"
@@ -263,7 +288,7 @@ capital_tiers:
         sizing_method: kelly_fractional
         order_routing: twap
         kelly_enabled: true
-        kelly_fraction: 0.30
+        kelly_fraction: 0.20            # 0.30 → 0.20 (시드↑ = 보수화)
         limit_order_pref: true
         hmm_regime: true
         meta_labeling: true
@@ -275,7 +300,7 @@ capital_tiers:
     - name: pro
       min: 50000
       max: .inf
-      description: "프로 ($50K+) — 풀 포트폴리오 + 통계차익"
+      description: "프로 ($50K+) — 풀 포트폴리오 + 통계차익 + 수확 모드($100K→)"
       features:
         symbols:
           - "BTC/USDT:USDT"
@@ -291,7 +316,7 @@ capital_tiers:
         sizing_method: hrp
         order_routing: smart
         kelly_enabled: true
-        kelly_fraction: 0.35
+        kelly_fraction: 0.12             # 0.35 → 0.12 (수확 모드, $100K 타겟 달성 근접)
         limit_order_pref: true
         hmm_regime: true
         meta_labeling: true
