@@ -32,6 +32,13 @@ from core.strategy.manager import StrategyManager
 from core.external.listing_detector import ListingDetector
 from core.quant_signals import QuantSignals
 from core.capital_tiers import CapitalTierManager
+from core.learning.ic_tracker import ICTracker
+from core.learning.meta_labeler import MetaLabeler
+from core.strategy.regime_hmm import HMMRegimeClassifier
+from core.strategy.cointegration import CointegrationTester
+from core.strategy.pairs_trading import PairsTradingStrategy
+from core.portfolio.hrp import HRPAllocator
+from core.execution.smart_router import SmartRouter
 from dashboard.app import app as dashboard_app, set_state, add_live_log
 
 # Telegram 알림 (실패해도 트레이딩에 영향 없음)
@@ -123,6 +130,30 @@ class AutoTrader:
 
         # 퀀트 시그널 (오더북, VPIN, 베이시스, 크래시보호, 알파, 레짐)
         self.quant_signals = QuantSignals()
+
+        # === 고급 퀀트 모듈 (tier 기반 활성화) ===
+        # IC Tracker — 시그널 품질 추적 (always-on, 저비용)
+        self.ic_tracker = ICTracker()
+        # HMM Regime Classifier — tier=large+ 활성 (학습/추론은 별도 트리거)
+        self.hmm_regime = HMMRegimeClassifier(n_states=3)
+        self.hmm_regime.load()  # 있으면 로드
+        # Meta-Labeler — tier=large+ 활성 (학습은 trainer에서)
+        self.meta_labeler = MetaLabeler()
+        self.meta_labeler.load()
+        # HRP Allocator — tier=pro 활성 (포트폴리오 가중치 산출)
+        self.hrp = HRPAllocator()
+        # Cointegration + Pairs Trading — tier=pro 활성
+        self.coint_tester = CointegrationTester()
+        self.pairs_strategy = PairsTradingStrategy(
+            exchange=None,  # 첫 번째 exchange 주입됨 (runtime)
+            coint_tester=self.coint_tester,
+        )
+        # Smart Router — tier=pro 활성 (여러 거래소 주입 시)
+        self.smart_router: SmartRouter | None = None
+        # 일일 pairs 탐색 타이머
+        self._last_pairs_discovery: datetime | None = None
+        self._last_hmm_fit: datetime | None = None
+        self._last_ic_log: datetime | None = None
 
         # 최소 주문 notional (거래소 최소수량 충족용)
         self.min_order_notional = self.config["risk"].get("min_order_notional", 100)
@@ -445,6 +476,19 @@ class AutoTrader:
                     trade_profiles=self.config.get("trade_profiles", {}),
                 )
 
+            # Smart Router (tier=pro) — 다거래소 있으면 자동 주입
+            if len(self.exchange_clients) >= 2:
+                self.smart_router = SmartRouter(
+                    exchanges=dict(self.exchange_clients),
+                    taker_fees={n: self.config["exchanges"][n].get("taker_fee", 0.0004)
+                                for n in self.exchange_clients},
+                )
+                logger.info(f"[SmartRouter] 활성화 — {list(self.exchange_clients.keys())}")
+
+            # Pairs Strategy에 첫 번째 exchange 주입
+            if self.exchange_clients:
+                self.pairs_strategy.exchange = next(iter(self.exchange_clients.values()))
+
         # 기존 모델 로드 시도
         if self.ensemble.load_all():
             logger.info("기존 ML 모델 로드 성공")
@@ -626,10 +670,12 @@ class AutoTrader:
         timeframes = self.config["trading"]["timeframes"]  # 멀티타임프레임
         primary_tf = timeframes[0]  # 메인 타임프레임 (5m)
 
-        # 자기학습 트레이너 (tier_manager 주입 → Walk-Forward CV 자동 활성화)
+        # 자기학습 트레이너 (tier_manager + meta/hmm 주입 → Walk-Forward CV + Meta/HMM 자동 학습)
         trainer = SelfLearningTrainer(
             self.collector, self.storage, self.ensemble, self.rl_agent, self.config,
             tier_manager=self.tier_manager,
+            meta_labeler=self.meta_labeler,
+            hmm_regime=self.hmm_regime,
         )
 
         # 모델이 없으면 초기 학습
@@ -679,16 +725,20 @@ class AutoTrader:
                 live_routing = self.tier_manager.get_feature(
                     "order_routing", mode="live", default="market_only"
                 )
-                # PaperTrader
+                # PaperTrader (limit_first 시뮬만 가능 — TWAP/smart는 live 전용)
                 self.paper_trader.set_routing(
                     limit_first=(paper_routing in ("limit_first", "twap", "smart"))
                 )
-                # OrderManager (LIVE)
+                # OrderManager (LIVE) — mode별 세부 설정 전달
                 for om_obj in self.order_managers.values():
                     om_obj.set_routing(
+                        mode=live_routing,
                         limit_first=(live_routing in ("limit_first", "twap", "smart")),
                         wait_seconds=20,
                         offset_pct=0.0001,
+                        twap_slices=5,
+                        twap_duration_s=60,
+                        smart_router=getattr(self, "smart_router", None),
                     )
 
                 # 재학습 체크 (일반 + stuck 감지)
@@ -945,6 +995,62 @@ class AutoTrader:
                     except Exception as e:
                         logger.debug(f"[VC언락펌프] 스캔 실패: {e}")
 
+                # === 고급 퀀트 주기적 작업 ===
+                now_utc = datetime.utcnow()
+
+                # 1) Pairs Trading — tier=pro 에서만 (stat_arb_pairs 플래그), 24h마다 탐색
+                try:
+                    pairs_on = self.tier_manager.feature_enabled("stat_arb_pairs", mode="live") \
+                        or self.tier_manager.feature_enabled("stat_arb_pairs", mode="paper")
+                    if pairs_on:
+                        need_discover = (
+                            self._last_pairs_discovery is None
+                            or (now_utc - self._last_pairs_discovery).total_seconds() > 86400
+                        )
+
+                        async def _fetch_prices_for_pair(sym):
+                            try:
+                                d = await self.collector.fetch_ohlcv(exchange_name, sym, primary_tf, limit=500)
+                                return d["close"] if d is not None and len(d) > 0 else pd.Series(dtype=float)
+                            except Exception:
+                                import pandas as _pd
+                                return _pd.Series(dtype=float)
+
+                        import pandas as pd  # local rebind (outer import 있음)
+                        if need_discover:
+                            try:
+                                await self.pairs_strategy.discover_pairs(
+                                    symbols=list(symbols), fetch_prices_fn=_fetch_prices_for_pair,
+                                )
+                                self._last_pairs_discovery = now_utc
+                            except Exception as e:
+                                logger.debug(f"[Pairs] discover 실패: {e}")
+
+                        # 매 루프 시그널 스캔 (order_manager는 첫 LIVE 거래소)
+                        try:
+                            om_first = next(iter(self.order_managers.values())) if self.order_managers else None
+                            equity_for_pairs = max(self.live_equity, self.paper_trader.equity, 1.0)
+                            await self.pairs_strategy.scan_and_trade(
+                                equity=equity_for_pairs,
+                                fetch_prices_fn=_fetch_prices_for_pair,
+                                order_manager=om_first if self.mode in ("live", "dual") else None,
+                            )
+                        except Exception as e:
+                            logger.debug(f"[Pairs] scan 실패: {e}")
+                except Exception as e:
+                    logger.debug(f"[Pairs] 주기 체크 실패: {e}")
+
+                # 2) IC summary log (1h마다)
+                try:
+                    if (
+                        self._last_ic_log is None
+                        or (now_utc - self._last_ic_log).total_seconds() > 3600
+                    ):
+                        self.ic_tracker.log_summary()
+                        self._last_ic_log = now_utc
+                except Exception as e:
+                    logger.debug(f"[IC] 주기 summary 실패: {e}")
+
                 loop_count += 1
 
                 # === equity_curve 기록 (5분마다 = 10루프) ===
@@ -1035,10 +1141,31 @@ class AutoTrader:
             sample = {c: round(float(df[c].iloc[-1]), 4) for c in quant_cols[:8]}
             logger.info(f"[ML-Features] 퀀트 피처 {len(quant_cols)}개 주입됨: {sample}")
 
-        # 2. 시장 레짐 감지
+        # 2. 시장 레짐 감지 — 룰 기반 + HMM(tier=large+)
         prices = df["close"].values
         volumes = df["volume"].values
         adaptive_params = self.adaptive.update(prices, volumes)
+
+        # 2b. HMM regime (tier=large+) — posterior 확률 기반 overlay
+        if self.tier_manager.feature_enabled("hmm_regime", mode="paper") and self.hmm_regime.fitted:
+            try:
+                hmm_label = self.hmm_regime.predict(prices)
+                hmm_proba = self.hmm_regime.predict_proba(prices)
+                # HMM 결과를 adaptive_params에 주입 (룰 기반 우선, HMM은 overlay)
+                adaptive_params["hmm_regime"] = hmm_label
+                adaptive_params["hmm_proba"] = hmm_proba
+                # HMM이 bull/bear를 확신(>0.7)하면 룰 기반 regime 오버라이드
+                max_prob = max(hmm_proba.values()) if hmm_proba else 0
+                if max_prob > 0.7 and hmm_label != "normal":
+                    mapped = self.hmm_regime.regime_to_adaptive(hmm_label)
+                    if mapped != adaptive_params.get("regime"):
+                        logger.info(
+                            f"[HMM] regime 오버라이드: {adaptive_params['regime']} → {mapped} "
+                            f"(p={max_prob:.2f})"
+                        )
+                        adaptive_params["regime"] = mapped
+            except Exception as e:
+                logger.debug(f"[HMM] predict 실패: {e}")
 
         # 3. ML 시그널
         ml_signal = self.ensemble.predict(df)
@@ -1428,6 +1555,17 @@ class AutoTrader:
                     trade_context["confirming_sources"] = getattr(decision, "confirming_sources", [])
                     trade_context["entry_path"] = "+".join(sorted(getattr(decision, "confirming_sources", [])))
                     self.feedback.record_trade(result, trade_context)
+                    # IC Tracker — 실현 수익률 vs 예측 시그널 기록 (알파 품질 모니터)
+                    try:
+                        entry_signal = trade_context.get("signal", 0.0)
+                        realized = result["pnl"] / max(result.get("notional", 1.0), 1.0)
+                        self.ic_tracker.record(
+                            signal=entry_signal,
+                            realized_return=realized,
+                            source="ensemble",
+                        )
+                    except Exception as e:
+                        logger.debug(f"[IC] 기록 실패: {e}")
                     if result["pnl"] < 0:
                         self.strategy_manager.record_loss()
                     else:
@@ -1480,6 +1618,18 @@ class AutoTrader:
                              "confirming_sources": getattr(decision, "confirming_sources", []),
                              "entry_path": "+".join(sorted(getattr(decision, "confirming_sources", [])))},
                         )
+                        # IC Tracker — LIVE 실현 vs 예측
+                        try:
+                            entry_signal = ml_signal.get("signal", 0.0) if isinstance(ml_signal, dict) else float(ml_signal or 0.0)
+                            notional = live_result.get("notional") or (live_result.get("size", 0) * max(live_result.get("entry_price", 0), 1e-9))
+                            realized = live_pnl / max(notional, 1.0)
+                            self.ic_tracker.record(
+                                signal=entry_signal,
+                                realized_return=realized,
+                                source="ensemble_live",
+                            )
+                        except Exception as e:
+                            logger.debug(f"[IC-LIVE] 기록 실패: {e}")
                         if live_pnl < 0:
                             self.strategy_manager.record_loss()
                         else:
@@ -1875,6 +2025,25 @@ class AutoTrader:
                         })
                         return
 
+                # === Meta-Labeler 2차 결정 (tier=large+ 활성화) ===
+                if self.tier_manager.feature_enabled("meta_labeling", mode="paper") and self.meta_labeler.model is not None:
+                    try:
+                        df_c = c.get("df")
+                        if df_c is not None and len(df_c) > 0:
+                            feature_cols = [col for col in self.meta_labeler.feature_columns[:-2] if col in df_c.columns]
+                            if feature_cols:
+                                row = df_c[feature_cols].iloc[-1].values.astype(float)
+                                primary_sig = c["ml_signal"].get("signal", 0.0) if isinstance(c["ml_signal"], dict) else 0.0
+                                primary_conf = c["confidence"]
+                                meta = self.meta_labeler.predict(row, primary_sig, primary_conf)
+                                if not meta["take"]:
+                                    logger.info(
+                                        f"[Meta-PAPER] {symbol} 진입 SKIP (prob={meta['prob']:.2f} < {meta['threshold']})"
+                                    )
+                                    return
+                    except Exception as e:
+                        logger.debug(f"[Meta-PAPER] 체크 실패 → 통과: {e}")
+
                 tp_pct = c.get("tp_pct", self.config["risk"]["take_profit_pct"])
                 sl_pct = c.get("sl_pct", self.config["risk"]["stop_loss_pct"])
                 self.paper_trader.open_position(
@@ -2251,6 +2420,32 @@ class AutoTrader:
                     })
                     return
 
+            # === Meta-Labeler 2차 결정 (tier=large+ 활성화) ===
+            if self.tier_manager.feature_enabled("meta_labeling", mode="live") and self.meta_labeler.model is not None:
+                try:
+                    df_c = c.get("df")
+                    if df_c is not None and len(df_c) > 0:
+                        feature_cols = [col for col in self.meta_labeler.feature_columns[:-2] if col in df_c.columns]
+                        if feature_cols:
+                            row = df_c[feature_cols].iloc[-1].values.astype(float)
+                            primary_sig = c["ml_signal"].get("signal", 0.0) if isinstance(c["ml_signal"], dict) else 0.0
+                            primary_conf = c["confidence"]
+                            meta = self.meta_labeler.predict(row, primary_sig, primary_conf)
+                            if not meta["take"]:
+                                logger.info(
+                                    f"[Meta-LIVE] {symbol} 진입 SKIP (prob={meta['prob']:.2f} < {meta['threshold']})"
+                                )
+                                add_live_log({
+                                    "time": datetime.utcnow().strftime("%H:%M:%S"),
+                                    "type": "meta_block",
+                                    "mode": "LIVE",
+                                    "symbol": symbol,
+                                    "prob": round(meta["prob"], 3),
+                                })
+                                return
+                except Exception as e:
+                    logger.debug(f"[Meta-LIVE] 체크 실패 → 통과: {e}")
+
             result = await om.open_position(
                 symbol, c["action"], c["size"], c["dynamic_lev"],
                 sl_pct=c.get("sl_pct"), tp_pct=c.get("tp_pct"),
@@ -2306,6 +2501,19 @@ class AutoTrader:
                      "confirming_sources": c.get("confirming_sources", []),
                      "entry_path": "+".join(sorted(c.get("confirming_sources", [])))},
                 )
+                # IC Tracker — LIVE 실현 수익률 vs 예측 시그널 (알파 품질 모니터)
+                try:
+                    ml_sig = c.get("ml_signal", 0)
+                    entry_signal = ml_sig.get("signal", 0.0) if isinstance(ml_sig, dict) else float(ml_sig or 0.0)
+                    notional = live_result.get("notional") or (live_result.get("size", 0) * max(live_result.get("entry_price", 0), 1e-9))
+                    realized = live_pnl / max(notional, 1.0)
+                    self.ic_tracker.record(
+                        signal=entry_signal,
+                        realized_return=realized,
+                        source="ensemble_live",
+                    )
+                except Exception as e:
+                    logger.debug(f"[IC-LIVE] 기록 실패: {e}")
                 if live_pnl < 0:
                     self.strategy_manager.record_loss()
                 else:

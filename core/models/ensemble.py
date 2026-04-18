@@ -17,16 +17,28 @@ class EnsembleSignalGenerator:
         self.weights = {"xgboost": 0.5, "lstm": 0.5}
         self._performance_history: list[dict] = []
 
-    def train_all(self, df: pd.DataFrame, feature_cols: list[str], walk_forward: bool = False):
+    def train_all(
+        self,
+        df: pd.DataFrame,
+        feature_cols: list[str],
+        walk_forward: bool = False,
+        use_purged_kfold: bool = False,
+        embargo_pct: float = 0.01,
+    ):
         """모든 모델 학습
 
         Args:
-            walk_forward: True이면 TimeSeriesSplit 기반 walk-forward CV
-                          (Capital Tier small+ 활성화 — 정보누수 차단된 OOS 평가)
+            walk_forward: True이면 walk-forward CV (Capital Tier small+)
+            use_purged_kfold: True이면 PurgedKFold + Embargo (tier=large+ 권장, Lopez de Prado)
+            embargo_pct: PurgedKFold에서 test 직후 제거할 비율
         """
         if walk_forward:
-            logger.info("=== 앙상블 모델 Walk-Forward CV 학습 시작 ===")
-            xgb_acc = self.xgb.train_walkforward(df, feature_cols)
+            cv_name = "PurgedKFold+Embargo" if use_purged_kfold else "TimeSeriesSplit"
+            logger.info(f"=== 앙상블 모델 Walk-Forward CV 학습 시작 ({cv_name}) ===")
+            xgb_acc = self.xgb.train_walkforward(
+                df, feature_cols,
+                use_purged_kfold=use_purged_kfold, embargo_pct=embargo_pct,
+            )
             lstm_acc = self.lstm.train_walkforward(df, feature_cols)
         else:
             logger.info("=== 앙상블 모델 학습 시작 ===")

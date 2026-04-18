@@ -27,6 +27,8 @@ class SelfLearningTrainer:
         rl_agent: RLAgent,
         config: dict,
         tier_manager=None,  # CapitalTierManager (optional, walk-forward CV gating용)
+        meta_labeler=None,  # MetaLabeler (optional, tier=large+)
+        hmm_regime=None,    # HMMRegimeClassifier (optional, tier=large+)
     ):
         self.collector = collector
         self.storage = storage
@@ -34,6 +36,8 @@ class SelfLearningTrainer:
         self.rl_agent = rl_agent
         self.config = config
         self.tier_manager = tier_manager
+        self.meta_labeler = meta_labeler
+        self.hmm_regime = hmm_regime
         self.feature_engineer = FeatureEngineer(config.get("ml", {}).get("features"))
         self._train_time_file = Path("models_saved/.last_train_time")
         self.last_train_time = self._load_last_train_time()
@@ -111,7 +115,73 @@ class SelfLearningTrainer:
                 f"[WalkForward] 활성화 — tier(paper={self.tier_manager.get_tier('paper').name}"
                 f", live={self.tier_manager.get_tier('live').name})"
             )
-        self.ensemble.train_all(df, all_feature_cols, walk_forward=use_walk_forward)
+
+        # tier=large+ 에서 PurgedKFold + Embargo (Lopez de Prado) 활성화 — meta_labeling 플래그와 동일 gating
+        use_purged = False
+        if self.tier_manager is not None:
+            try:
+                use_purged = (
+                    self.tier_manager.feature_enabled("meta_labeling", mode="paper")
+                    or self.tier_manager.feature_enabled("meta_labeling", mode="live")
+                )
+            except Exception:
+                pass
+
+        self.ensemble.train_all(
+            df, all_feature_cols,
+            walk_forward=use_walk_forward,
+            use_purged_kfold=use_purged,
+        )
+
+        # === Meta-Labeler 학습 (tier=large+) ===
+        if self.meta_labeler is not None and self.tier_manager is not None:
+            try:
+                meta_on = (
+                    self.tier_manager.feature_enabled("meta_labeling", mode="paper")
+                    or self.tier_manager.feature_enabled("meta_labeling", mode="live")
+                )
+                if meta_on and "tb_label" in df.columns:
+                    # 1차 시그널 주입: XGB 예측값을 DF에 컬럼으로 추가
+                    df_meta = df.copy()
+                    try:
+                        X_all = df_meta[all_feature_cols].values
+                        if self.ensemble.xgb.model is not None:
+                            proba = self.ensemble.xgb.model.predict_proba(X_all)
+                            # signal = P(up) - P(down), confidence = max proba
+                            df_meta["primary_signal"] = proba[:, 2] - proba[:, 0]
+                            df_meta["primary_confidence"] = proba.max(axis=1)
+                            feats_for_meta = [c for c in all_feature_cols
+                                              if c not in ("primary_signal", "primary_confidence")]
+                            self.meta_labeler.train(
+                                df_meta,
+                                primary_signal_col="primary_signal",
+                                primary_confidence_col="primary_confidence",
+                                outcome_col="tb_label",
+                                feature_cols=feats_for_meta,
+                            )
+                            self.meta_labeler.save()
+                            logger.info(
+                                f"[Meta] 학습 완료 → precision={self.meta_labeler.precision:.3f} "
+                                f"acc={self.meta_labeler.accuracy:.3f}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"[Meta] 학습 실패: {e}")
+            except Exception as e:
+                logger.debug(f"[Meta] gating 실패: {e}")
+
+        # === HMM Regime Classifier 학습 (tier=large+) ===
+        if self.hmm_regime is not None and self.tier_manager is not None:
+            try:
+                hmm_on = (
+                    self.tier_manager.feature_enabled("hmm_regime", mode="paper")
+                    or self.tier_manager.feature_enabled("hmm_regime", mode="live")
+                )
+                if hmm_on and "close" in df.columns and len(df) >= 200:
+                    self.hmm_regime.fit(df["close"])
+                    self.hmm_regime.save()
+                    logger.info("[HMM] 레짐 분류기 학습 완료")
+            except Exception as e:
+                logger.warning(f"[HMM] 학습 실패: {e}")
 
         # 3. RL 에이전트 학습 (기존 모델 이어서 / 기본 피처만)
         ohlcv_cols = ["open", "high", "low", "close", "volume"]

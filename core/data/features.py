@@ -4,16 +4,27 @@ import numpy as np
 import pandas as pd
 import ta
 
+from core.data.labeling import triple_barrier_labels
+
 
 class FeatureEngineer:
     """OHLCV 데이터로부터 ML/RL에 사용할 피처를 생성"""
 
-    def __init__(self, feature_list: list[str] | None = None):
+    def __init__(self, feature_list: list[str] | None = None,
+                 use_triple_barrier: bool = True,
+                 tb_pt_mult: float = 2.0,
+                 tb_sl_mult: float = 1.0,
+                 tb_max_hold: int = 24):
         self.feature_list = feature_list or [
             "rsi", "macd", "bbands", "atr", "volume_profile",
             "ema", "stoch", "adx", "obv", "vwap",
         ]
         self.external_features: dict = {}  # 외부 요인 피처 저장
+        # Triple-Barrier 라벨링 (Lopez de Prado) — 전통 forward-return 대비 정보량↑
+        self.use_triple_barrier = use_triple_barrier
+        self.tb_pt_mult = tb_pt_mult
+        self.tb_sl_mult = tb_sl_mult
+        self.tb_max_hold = tb_max_hold
 
     def generate(self, df: pd.DataFrame) -> pd.DataFrame:
         """전체 피처 생성 파이프라인"""
@@ -125,13 +136,33 @@ class FeatureEngineer:
         return df
 
     def _add_labels(self, df: pd.DataFrame, forward_periods: int = 12, threshold: float = 0.005) -> pd.DataFrame:
-        """미래 수익률 기반 레이블 생성 (ML 학습용)
+        """레이블 생성 — Triple-Barrier (Lopez de Prado) 또는 전통 forward-return.
 
-        v2 (2026-04-16): 0.2%/5캔들 → 0.5%/12캔들로 상향
-        - 이유: 이전 타겟은 노이즈 수준이라 ML이 대부분 "횡보"로 수렴 (정확도 47~50%)
-        - 새 타겟: 5분봉 = 1시간 뒤 ±0.5% / 1시간봉 = 12시간 뒤 ±0.5%
-        - SL 1.0% 보다 작은 움직임이라 TP 도달에 유리
+        Triple-Barrier (use_triple_barrier=True, 기본):
+          - TP 배리어 = ATR × pt_mult
+          - SL 배리어 = ATR × sl_mult
+          - 시간 배리어 = max_hold bars
+          - 먼저 닿은 배리어로 라벨링 → 경로 기반, 노이즈 강건
+
+        Forward-return fallback (use_triple_barrier=False):
+          - 단순 N캔들 뒤 수익률 ±threshold
         """
+        # 1) Triple-Barrier 우선
+        if self.use_triple_barrier:
+            df = triple_barrier_labels(
+                df,
+                pt_mult=self.tb_pt_mult,
+                sl_mult=self.tb_sl_mult,
+                max_hold=self.tb_max_hold,
+                atr_col="atr_14",
+                min_ret=threshold / 2,
+            )
+            # 기존 학습 코드 호환 — label 컬럼을 tb_label로 덮어씀
+            df["label"] = df["tb_label"]
+            df["future_return"] = df["tb_ret"]
+            return df
+
+        # 2) Forward-return fallback (기존 방식)
         future_return = df["close"].pct_change(forward_periods).shift(-forward_periods)
         df["label"] = 1  # 횡보
         df.loc[future_return > threshold, "label"] = 2   # 상승
@@ -157,10 +188,16 @@ class FeatureEngineer:
 
     def get_feature_columns(self, df: pd.DataFrame) -> list[str]:
         """ML 모델에 입력할 피처 컬럼만 반환 (외부 피처 포함)"""
-        exclude = {"open", "high", "low", "close", "volume", "label", "future_return"}
-        return [c for c in df.columns if c not in exclude]
+        exclude = {"open", "high", "low", "close", "volume", "label", "future_return",
+                   "tb_label", "tb_ret", "tb_hit", "tb_t1"}
+        # tb_hit은 string이라 제외 — 혹시 남아있을 수 있으니 type 체크도
+        cols = [c for c in df.columns if c not in exclude]
+        # numeric만 (object dtype 제외)
+        return [c for c in cols if df[c].dtype != object]
 
     def get_base_feature_columns(self, df: pd.DataFrame) -> list[str]:
         """RL 모델용 기본 피처만 반환 (외부 피처 제외 - 차원 고정)"""
-        exclude = {"open", "high", "low", "close", "volume", "label", "future_return"}
-        return [c for c in df.columns if c not in exclude and not c.startswith("ext_")]
+        exclude = {"open", "high", "low", "close", "volume", "label", "future_return",
+                   "tb_label", "tb_ret", "tb_hit", "tb_t1"}
+        cols = [c for c in df.columns if c not in exclude and not c.startswith("ext_")]
+        return [c for c in cols if df[c].dtype != object]

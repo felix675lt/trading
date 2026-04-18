@@ -93,15 +93,16 @@ class XGBoostPredictor:
         label_col: str = "label",
         n_splits: int = 5,
         purge_gap: int = 12,
+        use_purged_kfold: bool = False,
+        embargo_pct: float = 0.01,
     ) -> float:
         """Walk-forward Cross-Validation 학습 (tier=small+ 활성화)
-
-        TimeSeriesSplit으로 n_splits개의 expanding window 폴드 생성.
-        각 폴드 train/test 사이에 purge_gap만큼 공백 — 정보 누수 방지 (Lopez de Prado).
 
         Args:
             n_splits: 시간순 분할 개수 (기본 5)
             purge_gap: train 끝과 test 시작 사이 버리는 샘플 수 (label horizon 고려)
+            use_purged_kfold: True면 PurgedKFold + Embargo (tier=large+ 권장)
+            embargo_pct: PurgedKFold에서 test 직후 제거할 비율 (0.01=1%)
 
         Returns:
             모든 폴드의 out-of-sample 평균 accuracy.
@@ -117,15 +118,28 @@ class XGBoostPredictor:
             )
             return self.train(df, feature_cols, label_col)
 
-        tscv = TimeSeriesSplit(n_splits=n_splits)
+        # CV 선택: PurgedKFold (Lopez de Prado) vs TimeSeriesSplit
+        if use_purged_kfold:
+            from core.ml.cv import PurgedKFold
+            t1 = df["tb_t1"].values if "tb_t1" in df.columns else None
+            cv = PurgedKFold(n_splits=n_splits, embargo_pct=embargo_pct, purge_bars=purge_gap)
+            splits = list(cv.split(X, y, t1=t1))
+            logger.info(
+                f"[WalkForward-XGB] PurgedKFold 시작 (n_splits={n_splits}, embargo={embargo_pct:.1%}, "
+                f"purge_bars={purge_gap}, folds_yielded={len(splits)})"
+            )
+        else:
+            tscv = TimeSeriesSplit(n_splits=n_splits)
+            splits = list(tscv.split(X))
+            logger.info(f"[WalkForward-XGB] TimeSeriesSplit 시작 ({n_splits}-fold, purge_gap={purge_gap})")
+
         fold_accs = []
 
-        logger.info(f"[WalkForward-XGB] {n_splits}-fold CV 시작 (purge_gap={purge_gap})")
-
         last_model = None
-        for fold_idx, (train_idx, test_idx) in enumerate(tscv.split(X)):
-            # Purge: train 끝 purge_gap개 샘플 버림 (label horizon 보호)
-            if len(train_idx) > purge_gap:
+        for fold_idx, (train_idx, test_idx) in enumerate(splits):
+            # TimeSeriesSplit 모드: train 끝 purge_gap개 샘플 버림 (label horizon 보호)
+            # PurgedKFold 모드: 이미 내부에서 purge + embargo 처리됨
+            if not use_purged_kfold and len(train_idx) > purge_gap:
                 train_idx = train_idx[:-purge_gap]
 
             X_tr, X_te = X[train_idx], X[test_idx]
@@ -146,8 +160,9 @@ class XGBoostPredictor:
             acc = accuracy_score(y_te, y_pred)
             fold_accs.append(acc)
             last_model = fold_model
+            cv_name = "PurgedKFold" if use_purged_kfold else "TSS"
             logger.info(
-                f"[WalkForward-XGB] Fold {fold_idx+1}/{n_splits}: "
+                f"[WalkForward-XGB][{cv_name}] Fold {fold_idx+1}/{n_splits}: "
                 f"train={len(train_idx)} test={len(test_idx)} acc={acc:.4f}"
             )
 

@@ -72,22 +72,56 @@ class OrderManager:
         # 수수료 (왕복: 진입 + 청산)
         self.commission_pct = risk_config.get("commission_pct", 0.0004)  # 편도 0.04%
 
-        # Limit-first order routing (tier=small+ 활성화)
+        # Order routing modes (tier 연동):
+        #   market_only (micro): 시장가 단일 체결
+        #   limit_first (small+): maker fee 우선, 미체결 시 market fallback
+        #   twap (large+): N-slice TWAP (내부적으로 limit-first 사용)
+        #   smart (pro): 다거래소 비교 라우팅 (SmartRouter 주입 시)
+        self.routing_mode: str = "market_only"
         self.limit_first_enabled = False  # main.py에서 tier 기반으로 set
         self.limit_wait_seconds = 20      # 지정가 대기 시간
         self.limit_offset_pct = 0.0001    # best-bid/ask에서 소폭 offset (체결 확률 ↑)
 
-    def set_routing(self, limit_first: bool, wait_seconds: int = 20, offset_pct: float = 0.0001):
-        """Capital Tier에 따라 주문 라우팅 방식 설정 (main.py에서 호출)"""
-        self.limit_first_enabled = limit_first
+        # TWAP 설정 (tier=large)
+        self.twap_slices = 5
+        self.twap_duration_s = 60
+        self._twap_threshold_usdt = 500  # 이 notional 이상이면 TWAP 적용
+
+        # Smart routing (tier=pro) — SmartRouter 인스턴스 주입
+        self.smart_router = None
+
+    def set_routing(
+        self,
+        limit_first: bool = False,
+        wait_seconds: int = 20,
+        offset_pct: float = 0.0001,
+        mode: str = "limit_first",
+        twap_slices: int = 5,
+        twap_duration_s: int = 60,
+        smart_router=None,
+    ):
+        """Capital Tier에 따라 주문 라우팅 방식 설정 (main.py에서 호출).
+
+        Args:
+            mode: market_only / limit_first / twap / smart
+            limit_first: legacy 파라미터 — mode로 통합 판단
+            twap_slices: TWAP 분할 수
+            twap_duration_s: TWAP 총 지속시간 (초)
+            smart_router: SmartRouter 인스턴스 (mode=smart일 때 사용)
+        """
+        self.routing_mode = mode
+        self.limit_first_enabled = limit_first or mode in ("limit_first", "twap", "smart")
         self.limit_wait_seconds = wait_seconds
         self.limit_offset_pct = offset_pct
-        if limit_first:
-            logger.info(
-                f"[Routing] Limit-first 활성화 (wait={wait_seconds}s, offset={offset_pct*100:.3f}%)"
-            )
-        else:
-            logger.info("[Routing] Market-only 모드")
+        self.twap_slices = twap_slices
+        self.twap_duration_s = twap_duration_s
+        self.smart_router = smart_router
+
+        logger.info(
+            f"[Routing] mode={mode} | limit_first={self.limit_first_enabled} "
+            f"(wait={wait_seconds}s, offset={offset_pct*100:.3f}%) | "
+            f"twap_slices={twap_slices} | smart_router={'ON' if smart_router else 'OFF'}"
+        )
 
     def _get_profile(self, trade_type: str) -> dict:
         return self.trade_profiles.get(trade_type, {})
@@ -287,15 +321,51 @@ class OrderManager:
             if notional < min_notional:
                 amount = math.ceil(min_notional / price / step) * step
 
-            # === 주문 라우팅: limit-first 또는 market-only ===
+            # === 주문 라우팅: market_only / limit_first / twap / smart ===
             order_side = "buy" if side == "long" else "sell"
             order = None
+            notional_est = amount * price
 
-            if self.limit_first_enabled:
+            # [1] SMART — 다거래소 라우팅 (tier=pro)
+            if self.routing_mode == "smart" and self.smart_router is not None:
+                try:
+                    smart_result = await self.smart_router.route(symbol, order_side, amount)
+                    if smart_result.get("total_filled", 0) > 0:
+                        order = {
+                            "average": smart_result["avg_price"],
+                            "filled": smart_result["total_filled"],
+                            "routed_to": smart_result.get("routed_to"),
+                        }
+                        logger.info(f"[Smart] {symbol} routed to {smart_result.get('routed_to')}")
+                except Exception as e:
+                    logger.warning(f"[Smart] 실패 → TWAP/limit fallback: {e}")
+
+            # [2] TWAP — 분할 체결 (tier=large, 주문 크기 threshold 이상일 때)
+            if order is None and self.routing_mode == "twap" and notional_est >= self._twap_threshold_usdt:
+                try:
+                    from core.execution.twap import TWAPExecutor
+                    twap = TWAPExecutor(self, default_slices=self.twap_slices, default_duration_s=self.twap_duration_s)
+                    twap_result = await twap.execute(
+                        symbol, order_side, amount,
+                        n_slices=self.twap_slices,
+                        duration_seconds=self.twap_duration_s,
+                    )
+                    if twap_result.get("total_filled", 0) > 0:
+                        order = {
+                            "average": twap_result["avg_price"],
+                            "filled": twap_result["total_filled"],
+                            "routing": "twap",
+                            "slices": len(twap_result.get("slices", [])),
+                        }
+                except Exception as e:
+                    logger.warning(f"[TWAP] 실패 → limit/market fallback: {e}")
+
+            # [3] LIMIT-FIRST — maker fee 우선 (tier=small+)
+            if order is None and self.limit_first_enabled:
                 order = await self._try_limit_first(symbol, order_side, amount)
 
+            # [4] MARKET — 최종 fallback
             if order is None:
-                # limit-first 비활성화 or 미체결 → market fallback
                 order = await self.exchange.create_market_order(symbol, order_side, amount)
 
             fill_price = float(order.get("average", price) or price)
