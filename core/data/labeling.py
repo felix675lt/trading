@@ -58,7 +58,7 @@ def triple_barrier_labels(
     low = out["low"].values.astype(np.float64)
 
     if atr_col in out.columns:
-        atr = out[atr_col].fillna(method="ffill").fillna(close * 0.01).values.astype(np.float64)
+        atr = out[atr_col].ffill().fillna(pd.Series(close * 0.01, index=out.index)).values.astype(np.float64)
     else:
         atr = close * 0.01
 
