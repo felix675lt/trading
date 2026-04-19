@@ -8,12 +8,7 @@ exchanges:
     testnet: false
     options:
       defaultType: future
-  bybit:
-    api_key: ${BYBIT_API_KEY}
-    secret: ${BYBIT_SECRET}
-    testnet: true
-    options:
-      defaultType: future
+  # bybit 제거됨 (2026-04-20) — 사용자가 바이낸스만 사용
 
 trading:
   symbols:
