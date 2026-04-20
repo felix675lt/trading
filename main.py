@@ -1275,11 +1275,13 @@ class AutoTrader:
             self._btc_ref_cache = None
 
     def _apply_btc_reference(self, symbol: str):
-        """alt 심볼일 때 BTC 캐시 주입, BTC 자신일 때 None으로 리셋 (자기참조 방지)"""
-        if symbol == "BTC/USDT:USDT":
-            self.feature_engineer.set_btc_reference(None)
-        else:
-            self.feature_engineer.set_btc_reference(getattr(self, "_btc_ref_cache", None))
+        """BTC reference 주입 — 모든 심볼이 동일한 피처 차원(39개) 유지.
+
+        [2026-04-20 수정] BTC 자신도 자기 자신을 reference로 사용.
+        btc_returns_1 == returns_1 (동어반복)이 되지만 단일 모델이 모든 심볼에서
+        같은 피처 수로 동작 (ETH/SOL/DOGE 학습 시 LSTM input_size 불일치 방지).
+        """
+        self.feature_engineer.set_btc_reference(getattr(self, "_btc_ref_cache", None))
 
     async def _process_symbol(self, exchange_name: str, symbol: str, timeframe: str):
         """개별 심볼 처리"""

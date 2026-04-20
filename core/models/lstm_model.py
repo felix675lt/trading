@@ -88,14 +88,39 @@ class LSTMPredictor:
               epochs: int = 50, batch_size: int = 64, lr: float = 0.001):
         """모델 학습 (기존 모델이 있으면 fine-tuning, 없으면 최초 학습)"""
         gc.collect()  # 학습 시작 전 메모리 정리
+
+        # === 피처 수 불일치 감지 (2026-04-20 추가) ===
+        # 기존 버그: self.feature_columns = feature_cols를 먼저 한 뒤 is_finetune을
+        # len(feature_cols) == len(self.feature_columns)로 비교 → 항상 True가 되어
+        # 실제 LSTMNetwork.lstm.input_size (아키텍처) 와 다를 때도 fine-tune 시도 → RuntimeError.
+        # 수정: 실제 모델의 LSTM input_size와 비교.
+        if self.model is not None:
+            try:
+                prev_input_size = self.model.lstm.input_size
+                if prev_input_size != len(feature_cols):
+                    logger.warning(
+                        f"LSTM 피처 수 불일치 감지: 기존 input_size={prev_input_size} vs "
+                        f"신규={len(feature_cols)} → fine-tune 불가, 최초학습으로 전환"
+                    )
+                    self.model = None
+                    self.accuracy = 0.0
+            except Exception as e:
+                logger.debug(f"LSTM 피처 수 비교 실패 (무시): {e}")
+
         self.feature_columns = feature_cols
         X = df[feature_cols].values.astype(np.float32)
         y = df[label_col].values.astype(np.int64)
+
+        # inf/nan 방어 (2026-04-20 추가) — bb_pct, ema_cross 등이 0 나눗셈으로
+        # inf를 만들면 std 계산이 inf가 되어 LSTM loss=nan 유발.
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 정규화
         self.mean = X.mean(axis=0)
         self.std = X.std(axis=0) + 1e-8
         X = (X - self.mean) / self.std
+        # 정규화 후에도 inf/nan 한 번 더 (std=0인 상수 컬럼 방어)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         X_seq, y_seq = self._create_sequences(X, y)
         # 원본 X, y는 더 이상 필요 없음 — 메모리 해제

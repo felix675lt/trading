@@ -136,11 +136,11 @@ class SelfLearningTrainer:
         logger.info(f"=== 자기학습 사이클 시작: {symbol} {timeframe} ===")
 
         # 0. Cross-Asset BTC Reference 주입 (통찰 #2) —
-        #    BTC 학습 시에는 None으로 해제 (자기참조 방지)
-        if symbol == "BTC/USDT:USDT":
-            self.feature_engineer.set_btc_reference(None)
-        else:
-            await self._prepare_btc_reference(exchange_name, timeframe)
+        #    [2026-04-20 수정] 피처 수 일관성을 위해 BTC 학습 시에도 자기 자신을
+        #    reference로 사용. btc_returns_1 == returns_1 (동어반복) 이 되지만
+        #    단일 XGBoost/LSTM 모델이 모든 심볼에서 같은 피처 차원(39개)으로 동작.
+        #    중복 피처는 XGBoost가 자동으로 split importance=0에 근접하게 처리.
+        await self._prepare_btc_reference(exchange_name, timeframe)
 
         # 1. 데이터 수집
         df = await self.collect_training_data(exchange_name, symbol, timeframe)
