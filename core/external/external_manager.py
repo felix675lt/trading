@@ -70,6 +70,14 @@ class ExternalDataManager:
         self.composite_signal: dict = {}
         self.all_features: dict = {}
 
+        # Storage hook for historical derivatives snapshots (통찰 #3)
+        # set_storage()로 외부에서 주입 → 매 update 시 DB에 시계열 저장
+        self._storage = None
+
+    def set_storage(self, storage):
+        """Storage 인스턴스 주입 — 파생 스냅샷 시계열 누적용 (통찰 #3)"""
+        self._storage = storage
+
     async def update(self, symbol: str = "BTC/USDT:USDT") -> dict:
         """모든 외부 데이터 수집 및 분석"""
         if not self.enabled:
@@ -153,6 +161,14 @@ class ExternalDataManager:
             )
 
             self.last_update = datetime.utcnow()
+
+            # === 파생 스냅샷 DB 저장 (통찰 #3, 2026-04-20) ===
+            # 학습 시 역사적 시계열로 쓰기 위해 매 update 마다 timestamp+symbol로 누적
+            if self._storage is not None and derivatives_features:
+                try:
+                    self._storage.save_derivatives_snapshot(symbol, derivatives_features)
+                except Exception as e:
+                    logger.debug(f"[External] derivatives snapshot 저장 실패: {e}")
 
             # 파생상품 리포트
             deriv = self.derivatives.get_signal_for_strategy()

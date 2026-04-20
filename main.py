@@ -537,6 +537,12 @@ class AutoTrader:
 
         # 외부 데이터 초기 수집
         if self.external_manager.enabled:
+            # Storage 주입 — 통찰 #3: 파생 스냅샷 시계열 누적용 (2026-04-20)
+            try:
+                self.external_manager.set_storage(self.storage)
+                logger.info("[External] Storage 주입 완료 — derivatives_snapshots 시계열 누적 활성")
+            except Exception as e:
+                logger.debug(f"[External] set_storage 실패: {e}")
             logger.info("외부 데이터 초기 수집 시작...")
             await self.external_manager.update()
             logger.info("외부 데이터 초기 수집 완료")
@@ -965,6 +971,11 @@ class AutoTrader:
                 )
                 scalp_profiles = self.config["risk"].get("scalp_profiles", {})
 
+                # === Cross-Asset BTC Reference 갱신 (통찰 #2, 2026-04-20) ===
+                # 심볼 루프마다 새로 계산하면 중복 → 루프당 1회 캐시
+                # _process_symbol / _analyze_symbol 내부에서 alt 심볼은 이 캐시를 사용
+                await self._refresh_btc_reference(exchange_name, primary_tf)
+
                 if concentration:
                     # 모든 심볼의 시그널 수집
                     candidates = []
@@ -1238,8 +1249,43 @@ class AutoTrader:
                 logger.error(f"트레이딩 루프 에러: {e}")
                 await asyncio.sleep(60)
 
+    async def _refresh_btc_reference(self, exchange_name: str, timeframe: str):
+        """Cross-Asset BTC 선행 피처용 reference 캐시 (통찰 #2)
+
+        루프당 1회 호출 → BTC OHLCV + 최소 피처 계산 → self._btc_ref_cache 저장.
+        이후 _process_symbol / _analyze_symbol이 alt 심볼 처리 시 이 캐시를
+        feature_engineer.btc_reference 로 주입.
+        """
+        try:
+            import ta as _ta
+            btc_df = await self.collector.fetch_ohlcv(
+                exchange_name, "BTC/USDT:USDT", timeframe, limit=200
+            )
+            if btc_df is None or len(btc_df) < 20:
+                self._btc_ref_cache = None
+                return
+            btc_df["returns_1"] = btc_df["close"].pct_change(1)
+            btc_df["returns_5"] = btc_df["close"].pct_change(5)
+            btc_df["returns_20"] = btc_df["close"].pct_change(20)
+            btc_df["rsi_14"] = _ta.momentum.RSIIndicator(btc_df["close"], window=14).rsi()
+            btc_df["volatility_20"] = btc_df["returns_1"].rolling(20).std()
+            self._btc_ref_cache = btc_df
+        except Exception as e:
+            logger.debug(f"[CrossAsset] BTC reference refresh 실패: {e}")
+            self._btc_ref_cache = None
+
+    def _apply_btc_reference(self, symbol: str):
+        """alt 심볼일 때 BTC 캐시 주입, BTC 자신일 때 None으로 리셋 (자기참조 방지)"""
+        if symbol == "BTC/USDT:USDT":
+            self.feature_engineer.set_btc_reference(None)
+        else:
+            self.feature_engineer.set_btc_reference(getattr(self, "_btc_ref_cache", None))
+
     async def _process_symbol(self, exchange_name: str, symbol: str, timeframe: str):
         """개별 심볼 처리"""
+        # 0. Cross-Asset BTC reference 주입 (통찰 #2)
+        self._apply_btc_reference(symbol)
+
         # 1. 최신 데이터 수집
         df = await self.collector.fetch_ohlcv(exchange_name, symbol, timeframe, limit=200)
         df = self.feature_engineer.generate(df)
@@ -1837,6 +1883,9 @@ class AutoTrader:
     async def _analyze_symbol(self, exchange_name: str, symbol: str, timeframe: str) -> dict | None:
         """심볼 분석만 수행하고 시그널 반환 (실행 X)"""
         try:
+            # 0. Cross-Asset BTC reference 주입 (통찰 #2)
+            self._apply_btc_reference(symbol)
+
             df = await self.collector.fetch_ohlcv(exchange_name, symbol, timeframe, limit=200)
             df = self.feature_engineer.generate(df)
             feature_cols = self.feature_engineer.get_feature_columns(df)

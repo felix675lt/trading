@@ -63,16 +63,84 @@ class SelfLearningTrainer:
         return (datetime.utcnow() - self.last_train_time) > timedelta(hours=interval)
 
     async def collect_training_data(self, exchange_name: str, symbol: str, timeframe: str) -> pd.DataFrame:
-        """학습 데이터 수집 및 피처 생성"""
+        """학습 데이터 수집 및 피처 생성
+
+        통찰 #3 (2026-04-20): 파생 스냅샷(funding/OI/LS ratio) 역사 데이터를
+        DB에서 로드하여 학습 DF에 시간 조인 — 기존 상수값 ext_deriv_* 컬럼을
+        실제 시계열로 덮어써서 XGBoost가 의미있는 split을 생성하도록.
+        """
         lookback = self.config.get("ml", {}).get("lookback_days", 90)
         df = await self.collector.fetch_all_ohlcv(exchange_name, symbol, timeframe, days=lookback)
         self.storage.save_candles(exchange_name, symbol, timeframe, df)
         df = self.feature_engineer.generate(df)
+
+        # === 통찰 #3: 역사적 파생 스냅샷 조인 ===
+        try:
+            deriv_df = self.storage.load_derivatives_snapshots(symbol, days=lookback)
+            if deriv_df is not None and not deriv_df.empty:
+                # 컬럼 prefix를 `ext_deriv_` 로 맞춤 (기존 상수값 컬럼명과 동일)
+                deriv_df = deriv_df.add_prefix("ext_deriv_")
+                # df.index(타임스탬프)에 맞춰 ffill — 미래 정보 유입 차단
+                # (스냅샷이 캔들 시각 직전에 찍힌 마지막 값만 사용)
+                deriv_aligned = deriv_df.reindex(df.index, method="ffill")
+                # 기존에 external_features 로부터 주입된 상수 ext_deriv_* 컬럼은
+                # 시계열로 덮어씀 (존재하면). 없으면 새로 추가.
+                overlap = [c for c in deriv_aligned.columns if c in df.columns]
+                new_cols = [c for c in deriv_aligned.columns if c not in df.columns]
+                if overlap:
+                    df[overlap] = deriv_aligned[overlap]
+                if new_cols:
+                    df = pd.concat([df, deriv_aligned[new_cols]], axis=1)
+                logger.info(
+                    f"[Derivatives] 역사 스냅샷 {len(deriv_df)}개 조인 완료 — "
+                    f"overwrite={len(overlap)}, new={len(new_cols)}"
+                )
+            else:
+                logger.debug(
+                    f"[Derivatives] {symbol} 역사 스냅샷 없음 — 상수값 ext_deriv_* 유지 "
+                    f"(시간 누적 후 재학습 시 활성화)"
+                )
+        except Exception as e:
+            logger.warning(f"[Derivatives] 역사 스냅샷 조인 실패: {e} — 기존 상수값 유지")
+
         return df
+
+    async def _prepare_btc_reference(self, exchange_name: str, timeframe: str):
+        """BTC 데이터를 먼저 준비하여 cross-asset 피처용 reference 세팅
+
+        통찰 #2: alt 심볼 학습 시 BTC 5m 선행 피처 주입 — set_btc_reference() 호출.
+        BTC 자신의 학습에는 btc_reference=None 으로 복구 (자기참조 방지).
+        """
+        btc_symbol = "BTC/USDT:USDT"
+        try:
+            # BTC raw OHLCV (피처 없이, 순수 OHLCV + 기본 returns/rsi만 계산)
+            lookback = self.config.get("ml", {}).get("lookback_days", 90)
+            btc_raw = await self.collector.fetch_all_ohlcv(
+                exchange_name, btc_symbol, timeframe, days=lookback
+            )
+            # 최소한의 선행 피처만 계산 (전체 feature 생성은 과중)
+            import ta
+            btc_raw["returns_1"] = btc_raw["close"].pct_change(1)
+            btc_raw["returns_5"] = btc_raw["close"].pct_change(5)
+            btc_raw["returns_20"] = btc_raw["close"].pct_change(20)
+            btc_raw["rsi_14"] = ta.momentum.RSIIndicator(btc_raw["close"], window=14).rsi()
+            btc_raw["volatility_20"] = btc_raw["returns_1"].rolling(20).std()
+            self.feature_engineer.set_btc_reference(btc_raw)
+            logger.info(f"[CrossAsset] BTC reference 준비 완료 — {len(btc_raw)}개 캔들")
+        except Exception as e:
+            logger.warning(f"[CrossAsset] BTC reference 준비 실패: {e} — 독립 학습으로 fallback")
+            self.feature_engineer.set_btc_reference(None)
 
     async def train_cycle(self, exchange_name: str, symbol: str, timeframe: str = "1h"):
         """전체 학습 사이클 실행 (기존 모델이 있으면 이어서 학습)"""
         logger.info(f"=== 자기학습 사이클 시작: {symbol} {timeframe} ===")
+
+        # 0. Cross-Asset BTC Reference 주입 (통찰 #2) —
+        #    BTC 학습 시에는 None으로 해제 (자기참조 방지)
+        if symbol == "BTC/USDT:USDT":
+            self.feature_engineer.set_btc_reference(None)
+        else:
+            await self._prepare_btc_reference(exchange_name, timeframe)
 
         # 1. 데이터 수집
         df = await self.collect_training_data(exchange_name, symbol, timeframe)

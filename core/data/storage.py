@@ -79,6 +79,26 @@ class Storage:
                 drawdown REAL,
                 positions TEXT
             );
+
+            -- === Derivatives Snapshots (2026-04-20 추가, 통찰 #3) ===
+            -- 학습 시 역사적 펀딩/OI/LS ratio를 피처로 쓰기 위한 시계열 누적 테이블.
+            -- External manager가 주기적으로 여기에 INSERT → trainer가 시간 조인.
+            CREATE TABLE IF NOT EXISTS derivatives_snapshots (
+                timestamp TEXT,
+                symbol TEXT,
+                funding_rate REAL,           -- bp 단위 (current_rate * 10000)
+                funding_annualized REAL,     -- 연율 / 100
+                oi_change_1h REAL,
+                oi_change_4h REAL,
+                top_ls_ratio REAL,
+                global_ls_ratio REAL,
+                smart_crowd_div REAL,
+                taker_ratio REAL,
+                composite_score REAL,
+                PRIMARY KEY (timestamp, symbol)
+            );
+            CREATE INDEX IF NOT EXISTS idx_deriv_symbol_ts
+                ON derivatives_snapshots(symbol, timestamp);
         """)
         self.conn.commit()
 
@@ -150,6 +170,62 @@ class Storage:
             (str(datetime.utcnow()), equity, drawdown, json.dumps(positions)),
         )
         self.conn.commit()
+
+    # === Derivatives Snapshots (통찰 #3) ===
+    def save_derivatives_snapshot(self, symbol: str, features: dict):
+        """현재 시점의 파생 지표를 DB에 저장 (시계열 누적)
+
+        Args:
+            symbol: 심볼 (예: BTC/USDT:USDT)
+            features: derivatives_data.get_features() 반환 dict
+                      (ext_ 접두사 없는 원본 키 사용)
+        """
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO derivatives_snapshots "
+                "(timestamp, symbol, funding_rate, funding_annualized, "
+                " oi_change_1h, oi_change_4h, top_ls_ratio, global_ls_ratio, "
+                " smart_crowd_div, taker_ratio, composite_score) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(datetime.utcnow()), symbol,
+                    float(features.get("deriv_funding_rate", 0) or 0),
+                    float(features.get("deriv_funding_annualized", 0) or 0),
+                    float(features.get("deriv_oi_change_1h", 0) or 0),
+                    float(features.get("deriv_oi_change_4h", 0) or 0),
+                    float(features.get("deriv_top_ls_ratio", 1.0) or 1.0),
+                    float(features.get("deriv_global_ls_ratio", 1.0) or 1.0),
+                    float(features.get("deriv_smart_crowd_div", 0) or 0),
+                    float(features.get("deriv_taker_ratio", 1.0) or 1.0),
+                    float(features.get("deriv_composite_score", 0) or 0),
+                ),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.debug(f"[Storage] derivatives snapshot 저장 실패 ({symbol}): {e}")
+
+    def load_derivatives_snapshots(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """특정 심볼의 최근 N일 파생 스냅샷 로드 (학습 시 사용)
+
+        Returns:
+            DataFrame with timestamp index. 비어있으면 empty DF.
+        """
+        query = """
+            SELECT timestamp, funding_rate, funding_annualized,
+                   oi_change_1h, oi_change_4h, top_ls_ratio, global_ls_ratio,
+                   smart_crowd_div, taker_ratio, composite_score
+            FROM derivatives_snapshots
+            WHERE symbol=? AND timestamp > datetime('now', ?)
+            ORDER BY timestamp ASC
+        """
+        df = pd.read_sql_query(
+            query, self.conn, params=(symbol, f"-{days} days")
+        )
+        if df.empty:
+            return df
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+        return df
 
     def save_model_performance(self, model_name: str, accuracy: float, sharpe: float, win_rate: float):
         self.conn.execute(
