@@ -270,29 +270,39 @@ class SelfLearningTrainer:
             except Exception as e:
                 logger.warning(f"[HMM] 학습 실패: {e}")
 
+        # === ML 모델 먼저 저장 (2026-04-20 수정) ===
+        # RL 학습에서 예외 발생해도 XGBoost/LSTM은 이미 잘 학습된 상태이므로 선저장.
+        # 기존 로직은 RL 실패 시 전체 train_cycle이 터져서 ML 저장도 누락됨.
+        try:
+            self.ensemble.save_all()
+            logger.info("[모델저장] ML 앙상블(XGB/LSTM) 저장 완료 — RL 학습 시작 전")
+        except Exception as e:
+            logger.error(f"[모델저장] ML 앙상블 저장 실패: {e}")
+
         # 3. RL 에이전트 학습 (기존 모델 이어서 / 기본 피처만)
-        ohlcv_cols = ["open", "high", "low", "close", "volume"]
-        rl_data = np.hstack([df[base_feature_cols].values, df[ohlcv_cols].values]).astype(np.float32)
-        rl_data = np.nan_to_num(rl_data, nan=0.0, posinf=0.0, neginf=0.0)
+        rl_metrics = {"sharpe_ratio": 0, "win_rate": 0}
+        try:
+            ohlcv_cols = ["open", "high", "low", "close", "volume"]
+            rl_data = np.hstack([df[base_feature_cols].values, df[ohlcv_cols].values]).astype(np.float32)
+            rl_data = np.nan_to_num(rl_data, nan=0.0, posinf=0.0, neginf=0.0)
 
-        is_incremental = self.rl_agent.model is not None
-        logger.info(
-            f"{'증분' if is_incremental else '최초'}학습 | "
-            f"RL 피처: {len(base_feature_cols)}개 / ML 피처: {len(all_feature_cols)}개"
-        )
+            is_incremental = self.rl_agent.model is not None
+            logger.info(
+                f"{'증분' if is_incremental else '최초'}학습 | "
+                f"RL 피처: {len(base_feature_cols)}개 / ML 피처: {len(all_feature_cols)}개"
+            )
 
-        env = self.rl_agent.create_env(
-            data=rl_data,
-            feature_dim=len(base_feature_cols),
-            initial_capital=self.config.get("backtest", {}).get("initial_capital", 10000),
-            commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
-            leverage=self.config.get("trading", {}).get("leverage", 5),
-        )
-        rl_metrics = self.rl_agent.train(env)
-
-        # 4. 모델 저장
-        self.ensemble.save_all()
-        self.rl_agent.save()
+            env = self.rl_agent.create_env(
+                data=rl_data,
+                feature_dim=len(base_feature_cols),
+                initial_capital=self.config.get("backtest", {}).get("initial_capital", 10000),
+                commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
+                leverage=self.config.get("trading", {}).get("leverage", 5),
+            )
+            rl_metrics = self.rl_agent.train(env)
+            self.rl_agent.save()
+        except Exception as e:
+            logger.exception(f"[RL학습] 실패 — ML 모델은 이미 저장됨, RL만 건너뜀: {e}")
 
         # 5. 성능 기록
         self.storage.save_model_performance(

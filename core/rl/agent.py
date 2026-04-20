@@ -54,6 +54,23 @@ class RLAgent:
         """PPO 에이전트 학습 (기존 모델이 있으면 이어서 학습)"""
         timesteps = total_timesteps or self.config.get("total_timesteps", 100000)
 
+        # === Observation space 불일치 감지 (2026-04-20 추가) ===
+        # 통찰 #2로 base_feature_cols 차원이 바뀌면 (예: 29 → 34) 기존 PPO 모델의
+        # observation_space와 env.observation_space가 달라서 set_env() 실패.
+        # → 기존 모델 버리고 최초학습 경로로 전환.
+        if self.model is not None:
+            try:
+                prev_obs_shape = self.model.observation_space.shape
+                new_obs_shape = env.observation_space.shape
+                if prev_obs_shape != new_obs_shape:
+                    logger.warning(
+                        f"PPO observation space 불일치 감지: 기존={prev_obs_shape} vs "
+                        f"신규={new_obs_shape} → 이어서 학습 불가, 최초학습으로 전환"
+                    )
+                    self.model = None
+            except Exception as e:
+                logger.debug(f"PPO obs space 비교 실패 (무시): {e}")
+
         if self.model is not None:
             # === 기존 모델에서 이어서 학습 (continual learning) ===
             logger.info(f"PPO 이어서 학습 시작 - {timesteps // 2} steps (기존 모델 기반)")
