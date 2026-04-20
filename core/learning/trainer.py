@@ -86,6 +86,25 @@ class SelfLearningTrainer:
 
         # 1.5. 기존 모델 로드 (이어서 학습하기 위해)
         #      이미 메모리에 있으면 그대로, 없으면 파일에서 로드
+        # ⚠️ 비대 가드 (2026-04-20 추가): xgboost.pkl이 200MB 초과하면
+        #    증분학습 누적으로 비정상 부풀었다는 뜻 → 백업 후 처음부터 재학습
+        xgb_path = Path("models_saved/xgboost.pkl")
+        if xgb_path.exists():
+            size_mb = xgb_path.stat().st_size / (1024 * 1024)
+            if size_mb > 200:
+                from datetime import datetime as _dt
+                backup_dir = Path("models_saved/auto_reset")
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                ts = _dt.utcnow().strftime("%Y%m%d_%H%M%S")
+                backup_path = backup_dir / f"xgboost_{size_mb:.0f}MB_{ts}.pkl"
+                logger.warning(
+                    f"[모델가드] xgboost.pkl 비정상 비대 감지 ({size_mb:.0f}MB > 200MB) "
+                    f"→ {backup_path} 로 백업 후 초기화"
+                )
+                xgb_path.rename(backup_path)
+                # 메모리의 모델 참조도 리셋
+                self.ensemble.xgb.model = None
+
         if self.ensemble.xgb.model is None:
             self.ensemble.load_all()
             if self.ensemble.xgb.model:
