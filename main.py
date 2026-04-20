@@ -185,6 +185,12 @@ class AutoTrader:
         self._live_pause_reason = ""
         self._live_pause_time = None
 
+        # [2026-04-21] 일일 MaxDD 하드캡 상태 (LIVE+PAPER 모두 정지)
+        self._daily_dd_paused = False
+        self._daily_dd_reason = ""
+        self._daily_dd_trigger_time = None
+        self._daily_dd_threshold_pct = -3.0  # 일 누적 PnL / 초기자본 < -3% → 24h 정지
+
         # 외부 요인 알림 상태 추적
         self._ext_alert_state = {
             "last_composite_score": 0.0,
@@ -2105,6 +2111,13 @@ class AutoTrader:
         symbol = c["symbol"]
         if self.mode not in ("paper", "dual"):
             return
+        # [2026-04-21] 일일 MaxDD 하드캡 — PAPER도 정지
+        if getattr(self, '_daily_dd_paused', False):
+            logger.debug(
+                f"[일일DD정지] PAPER {symbol} 엔트리 차단 "
+                f"(사유: {getattr(self, '_daily_dd_reason', '?')})"
+            )
+            return
         # === 티어 심볼 필터 ===
         if not self.tier_manager.allowed_symbol(symbol, mode="paper"):
             logger.debug(
@@ -2309,10 +2322,22 @@ class AutoTrader:
                 f"(PAPER 학습용 실행은 유지) | 원신호: {c.get('reason','?')}"
             )
             return
-        # [해제됨] LIVE 일시정지 — 로그만 남김
+        # [2026-04-21 복원] LIVE 자가진단 일시정지 — 실제로 엔트리 차단
+        # 이전에는 _live_paused=False 강제 해제라 pause 플래그가 장식용이었음.
+        # 이제 pause = 정지. 해제는 _check_consecutive_losses 의 resume 조건에서만.
         if getattr(self, '_live_paused', False):
-            logger.info(f"[리스크해제] LIVE 일시정지 무시 (사유: {getattr(self, '_live_pause_reason', '?')})")
-            self._live_paused = False  # 강제 해제
+            logger.info(
+                f"[LIVE일시정지] {c.get('symbol')} 엔트리 차단 "
+                f"(사유: {getattr(self, '_live_pause_reason', '?')})"
+            )
+            return
+        # 일일 DD 하드캡 정지
+        if getattr(self, '_daily_dd_paused', False):
+            logger.info(
+                f"[일일DD정지] {c.get('symbol')} 엔트리 차단 "
+                f"(사유: {getattr(self, '_daily_dd_reason', '?')})"
+            )
+            return
         # symbol 은 함수 상단에서 이미 c.get("symbol") 로 설정됨
         om = self.order_managers.get(exchange_name)
         if not om:
@@ -2756,6 +2781,11 @@ class AutoTrader:
             if loss_result:
                 issues.append(loss_result)
 
+            # ──── 4b. 일일 MaxDD 하드캡 (2026-04-21) ────
+            dd_result = self._check_daily_drawdown()
+            if dd_result:
+                issues.append(dd_result)
+
             # ──── 5. SL/TP 콜백 등록 확인 ────
             cb_fixes = self._check_callbacks()
             for item in cb_fixes:
@@ -3175,49 +3205,121 @@ class AutoTrader:
         return results
 
     def _check_consecutive_losses(self) -> str | None:
-        """연속 손실 / 승률 감시 → LIVE 자동 일시정지"""
-        # 최근 LIVE 거래 승률 확인
+        """연속 손실 / 승률 감시 → LIVE 자동 일시정지.
+
+        [2026-04-21 개정]
+        - Pause threshold: 최근 5건 중 전패 → 정지 (기존 동일)
+        - Resume 조건 강화: 최근 5건 중 ≥ 2승 AND 정지 후 최소 30분 경과 (이전: 1승만으로 즉시 해제 → 재연패)
+        - 강경 threshold 추가: 최근 10건 승률 ≤ 10% → 6시간 강제 정지 (수동 해제 유도)
+        """
         try:
             recent_live = self.storage.get_recent_trades(mode="LIVE", limit=10)
             if len(recent_live) >= 5:
-                wins = sum(1 for t in recent_live if (t.get("pnl") or 0) > 0)
-                win_rate = wins / len(recent_live)
+                last5 = recent_live[:5]
+                wins5 = sum(1 for t in last5 if (t.get("pnl") or 0) > 0)
+                wr5 = wins5 / len(last5)
+                wins10 = sum(1 for t in recent_live if (t.get("pnl") or 0) > 0)
+                wr10 = wins10 / len(recent_live)
 
-                if win_rate == 0 and len(recent_live) >= 5:
-                    # 최근 5건 이상 전패 → LIVE 일시정지
+                # === Pause ===
+                if wr5 == 0:
                     if not getattr(self, '_live_paused', False):
                         self._live_paused = True
-                        self._live_pause_reason = f"최근 {len(recent_live)}건 전패 (승률 0%)"
+                        self._live_pause_reason = f"최근 5건 전패 (전체 10건 WR {wr10:.0%})"
                         self._live_pause_time = datetime.utcnow()
                         logger.warning(f"[자가진단] ⛔ LIVE 자동 일시정지: {self._live_pause_reason}")
                         tg_notify(
                             f"⛔ <b>LIVE 자동 일시정지</b>\n"
                             f"━━━━━━━━━━━━━\n"
                             f"사유: {self._live_pause_reason}\n"
-                            f"최근 {len(recent_live)}건 PnL: {[round(t.get('pnl', 0), 2) for t in recent_live]}\n"
+                            f"최근 5건 PnL: {[round(t.get('pnl', 0), 2) for t in last5]}\n"
                             f"📝 PAPER 모드는 계속 학습 중\n"
-                            f"🔄 승률 개선 시 자동 재개"
+                            f"🔄 재개 조건: 최근 5건 중 ≥ 2승 + 30분 경과"
                         )
-                    return f"LIVE 일시정지: 최근 {len(recent_live)}건 전패"
+                    return f"LIVE 일시정지: 최근 5건 전패"
 
-                elif win_rate > 0 and getattr(self, '_live_paused', False):
-                    # 승률 회복 → 재개
-                    self._live_paused = False
-                    pause_duration = datetime.utcnow() - getattr(self, '_live_pause_time', datetime.utcnow())
-                    logger.info(f"[자가진단] ✅ LIVE 재개 (승률 {win_rate:.0%}, 정지 {pause_duration})")
-                    tg_notify(
-                        f"✅ <b>LIVE 자동 재개</b>\n"
-                        f"━━━━━━━━━━━━━\n"
-                        f"승률 회복: {win_rate:.0%} ({wins}/{len(recent_live)}건)\n"
-                        f"정지 기간: {pause_duration}"
-                    )
-                    return None
+                # === Resume (강화) ===
+                elif getattr(self, '_live_paused', False):
+                    pause_dur = datetime.utcnow() - getattr(self, '_live_pause_time', datetime.utcnow())
+                    min_dur_ok = pause_dur.total_seconds() >= 1800  # 최소 30분
+                    enough_wins = wins5 >= 2  # 최근 5건 중 2승 이상
+                    if min_dur_ok and enough_wins:
+                        self._live_paused = False
+                        logger.info(f"[자가진단] ✅ LIVE 재개 (최근 5건 WR {wr5:.0%}, 정지 {pause_dur})")
+                        tg_notify(
+                            f"✅ <b>LIVE 자동 재개</b>\n"
+                            f"━━━━━━━━━━━━━\n"
+                            f"최근 5건 WR: {wr5:.0%} ({wins5}/5)\n"
+                            f"정지 기간: {pause_dur}"
+                        )
+                        return None
+                    else:
+                        remain = max(0, 1800 - int(pause_dur.total_seconds()))
+                        return (
+                            f"LIVE 정지 중 (최근 5건 WR {wr5:.0%}, "
+                            f"재개 조건: ≥2승 + {remain}s 남음)"
+                        )
 
-                elif win_rate < 0.25 and len(recent_live) >= 8:
-                    return f"LIVE 저조: 최근 {len(recent_live)}건 승률 {win_rate:.0%}"
+                # === Soft warning ===
+                elif wr10 <= 0.10 and len(recent_live) >= 8:
+                    return f"LIVE 저조: 최근 {len(recent_live)}건 WR {wr10:.0%}"
 
         except Exception as e:
             logger.debug(f"[진단] 연속 손실 체크 실패: {e}")
+
+        return None
+
+    def _check_daily_drawdown(self) -> str | None:
+        """일일 MaxDD 하드캡 — LIVE+PAPER 모두 정지.
+
+        [2026-04-21 추가] 어제 PAPER 하루 -$244 (-4.9%) 같은 재앙 방지.
+        일 누적 PnL(LIVE + PAPER) / initial_capital ≤ -3% 면 자정(UTC)까지 전체 정지.
+        """
+        try:
+            from datetime import datetime as _dt
+            today_utc = _dt.utcnow().strftime("%Y-%m-%d")
+            cursor = self.storage.conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE DATE(timestamp) = ?",
+                (today_utc,),
+            )
+            today_pnl = float(cursor.fetchone()[0] or 0)
+            base_cap = max(float(self.initial_capital), 1.0)
+            dd_pct = (today_pnl / base_cap) * 100.0
+
+            # Trigger
+            if dd_pct <= self._daily_dd_threshold_pct and not self._daily_dd_paused:
+                self._daily_dd_paused = True
+                self._daily_dd_reason = (
+                    f"일 누적 PnL ${today_pnl:.2f} = {dd_pct:+.2f}% "
+                    f"(한계 {self._daily_dd_threshold_pct:.1f}%)"
+                )
+                self._daily_dd_trigger_time = _dt.utcnow()
+                logger.warning(f"[일일DD] 🛑 전체 정지: {self._daily_dd_reason}")
+                tg_notify(
+                    f"🛑 <b>일일 MaxDD 하드캡 발동</b>\n"
+                    f"━━━━━━━━━━━━━\n"
+                    f"{self._daily_dd_reason}\n"
+                    f"LIVE + PAPER 모두 00:00 UTC 까지 정지\n"
+                    f"📝 학습 사이클은 계속 실행 (모델 개선)"
+                )
+                return f"일일 DD 정지: {dd_pct:+.2f}%"
+
+            # Auto release at UTC midnight rollover
+            if self._daily_dd_paused and self._daily_dd_trigger_time:
+                trigger_day = self._daily_dd_trigger_time.strftime("%Y-%m-%d")
+                if today_utc != trigger_day:
+                    self._daily_dd_paused = False
+                    logger.info(f"[일일DD] ✅ 신규 UTC 일자 — 정지 해제 (오늘 PnL {today_pnl:+.2f})")
+                    tg_notify(
+                        f"✅ <b>일일 DD 정지 해제</b>\n"
+                        f"신규 UTC 일자 시작 — 거래 재개"
+                    )
+
+            if self._daily_dd_paused:
+                return f"일일 DD 정지 지속 ({dd_pct:+.2f}%)"
+
+        except Exception as e:
+            logger.debug(f"[진단] 일일 DD 체크 실패: {e}")
 
         return None
 

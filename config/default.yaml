@@ -53,13 +53,15 @@ trading:
   long_only: false
   live_long_only: true
 
-  # === LIVE 공격 롱 모드 (2026-04-18, 사용자 지시) ===
-  # "국제정세/지정학 이슈에 시장이 반응 안 한다" 판단 → 매크로 하방 필터 완화
-  # LIVE는 알트 위주로 공격적 롱, 손절 최대한 안 치는 방향
-  live_aggressive_long: true
-  live_min_confidence: 0.30        # LIVE만 0.40 → 0.30 완화 (PAPER는 0.40 유지)
-  live_long_conf_boost: 1.25       # 롱 확신도 +25% 부스트 (LIVE 전용)
-  live_disable_macro_block: true   # LIVE 롱에 한해 고임팩트/지정학 차단 해제
+  # === LIVE 공격 롱 모드 (2026-04-21 보수화) ===
+  # 이전(04-18): live_min_confidence=0.30, boost=1.25, 매크로차단해제=True
+  # 결과: 최근 10건 전패 → 자가진단 LIVE 일시정지 반복 발동 (4월 중순 이후 LIVE 연속 적자)
+  # 원인: min_conf 0.30은 3-class 분류 random(0.33)과 거의 동일 → 필터링 무효
+  # 수정: 기본 모드로 복귀 (live_aggressive_long=false), 보조 파라미터는 보수값으로.
+  live_aggressive_long: false       # ON(true) 시 아래 파라미터 적용; 현재 OFF
+  live_min_confidence: 0.55        # 0.30 → 0.55 (ML 통계적 우위 구간)
+  live_long_conf_boost: 1.00       # 1.25 → 1.00 (인공 부스트 제거)
+  live_disable_macro_block: false  # true → false (매크로 필터 복구)
 
   # === $100K 타겟 ===
   # 전체 시스템이 이 목표를 향해 공격성 자동 조절
