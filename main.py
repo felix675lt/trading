@@ -29,7 +29,6 @@ from core.risk.manager import RiskManager
 from core.learning.feedback import AnomalyDetector, TradeFeedbackAnalyzer
 from core.strategy.adaptive import AdaptiveOptimizer, StrategyOptimizer
 from core.strategy.manager import StrategyManager
-from core.external.listing_detector import ListingDetector
 from core.quant_signals import QuantSignals
 from core.capital_tiers import CapitalTierManager
 from core.treasury.btc_reserve import BTCReserve
@@ -171,9 +170,6 @@ class AutoTrader:
 
         # 최소 주문 notional (거래소 최소수량 충족용)
         self.min_order_notional = self.config["risk"].get("min_order_notional", 100)
-
-        # 상장 시그널 감지기
-        self.listing_detector = ListingDetector()
 
         # 상태 — PAPER 가상 시드 기준 (dual/paper 모드에서 포트폴리오 지표 산출용)
         self.equity = paper_initial
@@ -556,11 +552,6 @@ class AutoTrader:
 
         self.risk_manager.initialize(self.equity)
 
-        # 상장 감지기에 거래소 클라이언트 연결
-        if self.exchange_clients:
-            first_client = list(self.exchange_clients.values())[0]
-            self.listing_detector.exchange = first_client
-
         # SL/TP 콜백 등록 (체결 시 피드백 학습 + 텔레그램 알림)
         def _make_trade_callback(close_type: str):
             """SL/TP 공통 콜백 생성"""
@@ -616,14 +607,6 @@ class AutoTrader:
                     f"레짐: {regime}\n"
                     f"📝 피드백 학습에 기록됨"
                 )
-
-                # 선매집 거래 쿨다운 등록 (2시간 재진입 차단)
-                try:
-                    coin_name = symbol.split("/")[0]
-                    if hasattr(self, 'listing_detector'):
-                        self.listing_detector.register_trade_cooldown(coin_name)
-                except Exception:
-                    pass
 
                 # 손실 시 즉시 원인분석 리포트
                 if pnl < 0:
@@ -1009,7 +992,7 @@ class AutoTrader:
                             await om.update_positions()
 
                     # 스나이핑 포지션 펀비 기반 익절 체크
-                    await self._check_snipe_funding_exit()
+                    await self._check_funding_rate_exit()
 
                     # LIVE: 포지션 여유 있을 때만 신규 진입
                     if live_positions < max_live and candidates:
@@ -1029,58 +1012,10 @@ class AutoTrader:
                     for symbol in symbols:
                         await self._process_symbol(exchange_name, symbol, primary_tf)
 
-                # === 상장 시그널 스캔 (5분마다 = 10루프) ===
-                if self.listing_detector.exchange and loop_count % 10 == 0:
-                    try:
-                        listing_signals = await self.listing_detector.scan_signals()
-                        if listing_signals:
-                            # 알림: 0.50 이상 전부 텔레그램
-                            for sig in listing_signals:
-                                if sig["score"] >= 0.50:
-                                    source_tag = "📰 상장뉴스" if sig.get("source") == "news" else "🔍 선매집"
-                                    tg_notify(
-                                        f"🎯 <b>{source_tag} 감지</b>\n"
-                                        f"━━━━━━━━━━━━━\n"
-                                        f"코인: <b>{sig['coin']}</b> ({sig.get('tier', '?')})\n"
-                                        f"점수: {sig['score']:.2f}\n"
-                                        f"24h: {sig.get('pct_24h', 0):+.1f}% | 볼륨: ${sig.get('volume_m', 0):.0f}M"
-                                        f"{' | 볼륨배율: ' + str(sig.get('vol_ratio', 0)) + 'x' if sig.get('vol_ratio', 0) > 1 else ''}\n"
-                                        f"사유: {', '.join(sig.get('reasons', []))}"
-                                    )
-
-                            # 거래: 0.65 이상 → 10% 시드 + 고배율 스나이핑
-                            tradeable = self.listing_detector.get_tradeable_signals()
-                            for sig in tradeable[:2]:
-                                await self._execute_listing_snipe(exchange_name, sig)
-
-                            self.last_external["listing"] = self.listing_detector.get_report()
-                    except Exception as e:
-                        logger.debug(f"[ListingDetector] 스캔 실패: {e}")
-
-                # === VC 언락 펌프 스캐너 (12시간마다) ===
-                if self.listing_detector.exchange and loop_count % 1440 == 5:
-                    # 1440 루프 × 30초 ≈ 12시간, +5 오프셋으로 상장 스캔과 분리
-                    try:
-                        vc_candidates = self.listing_detector.scan_vc_unlock_pumps()
-                        if vc_candidates:
-                            # 텔레그램 알림: VC 펌프 후보 리스트
-                            top5 = vc_candidates[:5]
-                            lines = [f"🏦 <b>VC 언락 펌프 후보 ({len(vc_candidates)}건)</b>", "━━━━━━━━━━━━━"]
-                            for c in top5:
-                                lines.append(
-                                    f"<b>{c['coin']}</b> | 점수: {c['score']:.2f}\n"
-                                    f"  언락: {c['unlock_pct']}% ({c['first_unlock_date']})\n"
-                                    f"  백커: {c['backer_tier']}-Tier {', '.join(c['backers'][:2])}"
-                                )
-                            tg_notify("\n".join(lines))
-
-                            # 자동 진입: 상위 2개, score 0.60 이상
-                            for c in top5[:2]:
-                                if c["score"] >= 0.60:
-                                    await self._execute_vc_pump_entry(exchange_name, c)
-
-                    except Exception as e:
-                        logger.debug(f"[VC언락펌프] 스캔 실패: {e}")
+                # [2026-04-20 제거] 상장 스나이핑 / VC 언락 펌프 진입 로직 삭제
+                # 사유: 18일 실증 결과 -$47.24 (WR 39.5%, 후행 시그널 구조),
+                # 퀀트 앙상블(XGB/LSTM/PPO)과 분리된 독립 엔트리로 리스크 관리 우회.
+                # 상세 리포트: commit log 참조.
 
                 # === 고급 퀀트 주기적 작업 ===
                 now_utc = datetime.utcnow()
@@ -2285,192 +2220,16 @@ class AutoTrader:
                 logger.info(f"[PAPER] 청산 {symbol} | PnL: ${paper_pnl:.2f} → 학습기록 완료")
                 tg_notify(format_trade_close("PAPER", symbol, paper_pnl, c["reason"], result.get("duration_minutes", 0)), silent=True)
 
-    async def _execute_listing_snipe(self, exchange_name: str, sig: dict):
-        """상장 스나이핑 — 시드 10% + 고배율(10x) + 안전 필터 + 펀비 익절
+    # [2026-04-20 제거] _execute_listing_snipe / _execute_vc_pump_entry 제거.
+    # 사유: 상장 스나이핑 18일 실증 -$47.24 / WR 39.5% / 후행 시그널 구조.
+    # 퀀트 앙상블(XGB/LSTM/PPO) 외부의 독립 엔트리 경로로 리스크 관리 우회했음.
 
-        선매집 또는 상장 뉴스 감지 시 바이낸스 선물에서 즉시 롱 진입.
-        안전 필터: 유통비율 30% 미만 or 언락 뉴스 → 진입 금지.
-        펀비 익절: 펀비 -0.5% 이하(숏 극단) + 수익권 → 즉시 익절.
-        """
-        if self.mode not in ("live", "dual"):
-            return
+    async def _check_funding_rate_exit(self):
+        """극단 펀딩비(숏 최대치) 익절 — 매 루프 모든 포지션 대상.
 
-        om = self.order_managers.get(exchange_name)
-        if not om:
-            return
-
-        symbol = sig["symbol"]
-        coin = sig["coin"]
-
-        # 이미 포지션 보유 중이면 스킵
-        if symbol in om.positions:
-            return
-        if symbol in self.paper_trader.positions:
-            return
-
-        # === 안전 체크: 유통비율 + 언락 뉴스 ===
-        safe, reason = self.listing_detector.check_token_safety(coin)
-        if not safe:
-            logger.info(f"[스나이핑] ⚠️ {coin} 진입 차단: {reason}")
-            tg_notify(
-                f"⚠️ <b>스나이핑 차단</b>\n"
-                f"코인: {coin} | 사유: {reason}"
-            )
-            return
-
-        # === 추가 안전 체크: 시총 $30M 이상 (조회 실패 시에도 차단) ===
-        mcap_m = self.listing_detector._get_mcap(coin)
-        if mcap_m < 0:
-            logger.info(
-                f"[스나이핑] ⚠️ {coin} 시총 조회 실패 → 정보 없는 코인 거래 차단"
-            )
-            return
-        if mcap_m < self.listing_detector.MIN_MCAP_M:
-            logger.info(
-                f"[스나이핑] ⚠️ {coin} 시총 차단: ${mcap_m:.0f}M < ${self.listing_detector.MIN_MCAP_M:.0f}M"
-            )
-            return
-
-        try:
-            balance = await om.exchange.get_balance()
-            live_free = balance.get("free", 0)
-
-            snipe_size = live_free * 0.10
-            snipe_leverage = 10
-
-            if snipe_size < 2:
-                logger.info(f"[스나이핑] {coin} 잔고 부족 (free=${live_free:.2f})")
-                return
-
-            result = await om.open_position(
-                symbol=symbol,
-                side="long",
-                size_usdt=snipe_size,
-                leverage=snipe_leverage,
-                sl_pct=0.05,
-                tp_pct=0.20,
-                trade_type="scalp",
-            )
-
-            if result:
-                notional = snipe_size * snipe_leverage
-                source_tag = "📰상장뉴스" if sig.get("source") == "news" else "🔍선매집"
-                logger.info(
-                    f"[스나이핑🎯] LONG {symbol} | "
-                    f"${snipe_size:.2f} × {snipe_leverage}x = ${notional:.2f} | "
-                    f"SL:5% TP:20% | {source_tag} score={sig['confidence']:.2f}"
-                )
-                tg_notify(
-                    f"🎯 <b>상장 스나이핑 진입!</b>\n"
-                    f"━━━━━━━━━━━━━\n"
-                    f"코인: <b>{coin}</b> ({sig.get('tier', '?')})\n"
-                    f"방향: LONG × {snipe_leverage}x\n"
-                    f"마진: ${snipe_size:.2f} (시드 10%)\n"
-                    f"노셔널: ${notional:.2f}\n"
-                    f"SL: 5% | TP: 20% (트레일링)\n"
-                    f"점수: {sig['confidence']:.2f} | {source_tag}\n"
-                    f"사유: {', '.join(sig.get('reasons', []))}"
-                )
-            else:
-                logger.warning(f"[스나이핑] {coin} 진입 실패")
-
-        except Exception as e:
-            logger.error(f"[스나이핑] {coin} 실행 오류: {e}")
-
-    async def _execute_vc_pump_entry(self, exchange_name: str, candidate: dict):
-        """VC 언락 펌프 전략 — 4주 전 롱 매집
-
-        조건: S/A-Tier 백커 + 28일 내 대규모 언락 예정
-        전략: 시드 10% × 5x 레버리지 (스나이핑보다 보수적), SL 8%, TP 30%
-        원리: VC가 언락 전 가격을 올려서 더 높은 가격에 매도하는 패턴 활용
-        데이터: Keyrock 16,000건 중 S-Tier VC + 대규모 언락 = 상위 10% 펌프
-        """
-        if self.mode not in ("live", "dual"):
-            return
-
-        om = self.order_managers.get(exchange_name)
-        if not om:
-            return
-
-        coin = candidate["coin"]
-        # 바이낸스 선물 심볼 조회
-        symbol = self.listing_detector._binance_futures.get(coin)
-        if not symbol:
-            logger.debug(f"[VC펌프] {coin} 바이낸스 선물 심볼 없음")
-            return
-
-        # 이미 포지션 보유 중이면 스킵
-        if symbol in om.positions:
-            return
-        if symbol in self.paper_trader.positions:
-            return
-
-        # 이미 너무 올랐으면 진입 금지 (늦은 진입 방지)
-        try:
-            ticker = await om.exchange.exchange.fetch_ticker(symbol)
-            pct_24h = ticker.get("percentage", 0) or 0
-            if abs(pct_24h) > 50:
-                logger.info(f"[VC펌프] {coin} 이미 24h {pct_24h:+.0f}% — 늦은 진입 스킵")
-                return
-        except Exception:
-            pass
-
-        try:
-            balance = await om.exchange.get_balance()
-            live_free = balance.get("free", 0)
-
-            # 시드 10% × 5x (스나이핑보다 보수적 — 4주 홀딩이므로)
-            pump_size = live_free * 0.10
-            pump_leverage = 5
-            pump_sl = 0.08       # SL 8% (넓은 스탑 — 4주 변동성 수용)
-            pump_tp = 0.30       # TP 30%
-
-            if pump_size < 2:
-                logger.info(f"[VC펌프] {coin} 잔고 부족 (free=${live_free:.2f})")
-                return
-
-            result = await om.open_position(
-                symbol=symbol,
-                side="long",
-                size_usdt=pump_size,
-                leverage=pump_leverage,
-                sl_pct=pump_sl,
-                tp_pct=pump_tp,
-                trade_type="swing",  # 스윙 트레이드 (장기 홀딩)
-            )
-
-            if result:
-                notional = pump_size * pump_leverage
-                logger.info(
-                    f"[VC펌프🏦] LONG {symbol} | "
-                    f"${pump_size:.2f} × {pump_leverage}x = ${notional:.2f} | "
-                    f"SL:{pump_sl:.0%} TP:{pump_tp:.0%} | "
-                    f"{candidate['backer_tier']}-Tier: {', '.join(candidate['backers'][:2])} | "
-                    f"언락: {candidate['unlock_pct']}% in {candidate['days_until_unlock']:.0f}일"
-                )
-                tg_notify(
-                    f"🏦 <b>VC 언락 펌프 진입!</b>\n"
-                    f"━━━━━━━━━━━━━\n"
-                    f"코인: <b>{coin}</b>\n"
-                    f"방향: LONG × {pump_leverage}x\n"
-                    f"마진: ${pump_size:.2f} (시드 10%)\n"
-                    f"노셔널: ${notional:.2f}\n"
-                    f"SL: {pump_sl:.0%} | TP: {pump_tp:.0%}\n"
-                    f"백커: {candidate['backer_tier']}-Tier | {', '.join(candidate['backers'][:3])}\n"
-                    f"언락: {candidate['unlock_pct']}% | {candidate['first_unlock_date']}\n"
-                    f"전략: {candidate.get('strategy', '')}"
-                )
-            else:
-                logger.warning(f"[VC펌프] {coin} 진입 실패")
-
-        except Exception as e:
-            logger.error(f"[VC펌프] {coin} 실행 오류: {e}")
-
-    async def _check_snipe_funding_exit(self):
-        """스나이핑 포지션 펀비 기반 익절 — 매 루프마다 호출
-
-        펀비가 극단적 음수(-0.5% 이하) = 숏 최대치 = 세력 던지기 직전
-        이 시점에 수익권이면 바로 익절하고 나옴.
+        펀비 -0.5% 이하 + 수익 1%+ → 즉시 익절
+        펀비 -1.0% 이하 + 수익 > 0 → 긴급 탈출
+        (과거 상장 스나이핑 전용이었으나, 펀비 극단은 일반 포지션에도 유효한 신호라 유지)
         """
         for name, om in self.order_managers.items():
             for symbol, pos in list(om.positions.items()):
