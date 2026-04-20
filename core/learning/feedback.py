@@ -22,10 +22,20 @@ class TradeFeedbackAnalyzer:
     6. 이상 시장 경고
     """
 
-    def __init__(self, storage_dir: str = "data"):
+    def __init__(self, storage_dir: str = "data", variant: str = ""):
+        """
+        Args:
+            storage_dir: 피드백 JSON 저장 디렉토리
+            variant: A/B 분기 이름 (예: "macro_on", "macro_off"). 빈 문자열이면 레거시 경로 사용.
+                     variant가 주어지면 feedback_history_<variant>.json 로 격리 저장.
+                     → 각 분기가 독립된 패턴 학습/조정을 하도록 오염 방지.
+        """
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self.feedback_path = self.storage_dir / "feedback_history.json"
+        self.variant = variant
+        # variant별 격리 파일 — A/B 학습 데이터 오염 방지
+        suffix = f"_{variant}" if variant else ""
+        self.feedback_path = self.storage_dir / f"feedback_history{suffix}.json"
         self.feedback: dict = self._load()
 
         # 실시간 추적

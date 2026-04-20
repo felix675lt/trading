@@ -62,7 +62,8 @@ class PaperTrader:
 
     def __init__(self, initial_capital: float = 10000.0, commission: float = 0.0004,
                  trailing_config: dict | None = None,
-                 trade_profiles: dict | None = None):
+                 trade_profiles: dict | None = None,
+                 variant: str = "PAPER"):
         self.initial_capital = initial_capital
         self.equity = initial_capital
         self.commission = commission                       # taker fee (기본 0.04%)
@@ -72,6 +73,9 @@ class PaperTrader:
         self.trade_history: list[dict] = []
         self.equity_history: list[dict] = []
         self._sl_cooldown: dict[str, datetime] = {}  # symbol → SL 청산 시각
+        # A/B 테스트 variant 태그 (2026-04-21) — storage/feedback 에서 격리용
+        # 값: "PAPER" (legacy) / "PAPER_MACRO_ON" / "PAPER_MACRO_OFF"
+        self.variant = variant
 
         # 트레일링 스탑 기본값 (fallback)
         tc = trailing_config or {}
@@ -340,6 +344,7 @@ class PaperTrader:
             "reason": reason,
             "duration_minutes": duration_minutes,
             "leverage": pos.leverage,
+            "variant": self.variant,  # A/B 테스트용 태그 (2026-04-21)
         }
         self.trade_history.append(trade)
         del self.positions[symbol]

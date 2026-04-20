@@ -180,11 +180,20 @@ class StrategyManager:
         feedback_blacklist: list | None = None,
         funding_rate: float = 0.0,
         mode: str = "paper",
+        variant_override: dict | None = None,
     ) -> TradeDecision:
-        """최종 트레이딩 결정 (v4 - 다중확인 시스템)
+        """최종 트레이딩 결정 (v5 - A/B variant 지원)
 
         mode: "paper" 또는 "live" — LIVE 공격 롱 모드 적용 여부 결정
+        variant_override: A/B 테스트용 정책 오버라이드 (2026-04-21)
+            - "disable_macro_block": bool — True면 2.7/2.8 매크로 차단 스킵
+            - "min_confidence_override": float | None — 최소 신뢰도 대체
+            ※ variant_override는 순수 함수 오버라이드 (self 상태 변경 금지)
         """
+        vo = variant_override or {}
+        # variant 오버라이드: 매크로 차단 정책
+        # (self.live_disable_macro_block은 LIVE 공격 모드용 별개 플래그)
+        variant_disable_macro = bool(vo.get("disable_macro_block", False))
         action_map = {0: "hold", 1: "long", 2: "short", 3: "close"}
         rl_direction = action_map.get(rl_action, "hold")
 
@@ -319,8 +328,10 @@ class StrategyManager:
         # 2.7. 고임팩트 이벤트 오버라이드 [재활성화]
         # 강한 외부 시그널 + 고임팩트 뉴스 반대 방향 진입 → 차단
         # LIVE 공격 롱 모드 + macro_disable: 롱 차단만 해제 (숏 차단은 유지)
+        # variant_override.disable_macro_block=True면 모든 방향 매크로 차단 스킵
         macro_disabled_long = live_aggro and self.live_disable_macro_block
-        if has_high_impact and abs(ext_score) > 0.4:
+        macro_fully_disabled = variant_disable_macro  # A/B variant용
+        if has_high_impact and abs(ext_score) > 0.4 and not macro_fully_disabled:
             if ext_direction == "bearish" and final_action == "long":
                 if macro_disabled_long:
                     logger.info(
@@ -337,16 +348,23 @@ class StrategyManager:
                 final_action = "hold"
                 reason = f"고임팩트 불리시 이벤트 → 숏 차단 (ext={ext_score:.2f})"
                 confidence = 0.0
+        elif has_high_impact and abs(ext_score) > 0.4 and macro_fully_disabled:
+            logger.debug(
+                f"[A/B:MACRO_OFF] 고임팩트 이벤트 차단 무시 (ext_score={ext_score:.2f}) — variant 정책"
+            )
 
         # 2.8. 레짐 방향 바이어스 [재활성화 v3] — funding_rate 극값 + 모멘텀/RSI만 사용
         # 공포탐욕 지수 완전 제거됨 (후행 지표, 예측력 없음)
         # LIVE 공격 롱 + macro_disable: 롱 차단만 무시 (숏 차단은 유지 — 펀비 스퀴즈 리스크 보호)
+        # variant_override.disable_macro_block=True면 레짐 차단도 스킵
         if final_action in ["long", "short"]:
             direction_block = self._regime_direction_bias(
                 final_action, funding_rate, mom_direction, mom_rsi,
             )
             if direction_block:
-                if macro_disabled_long and final_action == "long":
+                if macro_fully_disabled:
+                    logger.debug(f"[A/B:MACRO_OFF] 레짐 차단 무시: {direction_block}")
+                elif macro_disabled_long and final_action == "long":
                     logger.info(
                         f"[LIVE-AGGRO] 레짐 롱차단 무시: {direction_block}"
                     )

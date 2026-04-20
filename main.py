@@ -97,7 +97,13 @@ class AutoTrader:
             trade_profiles=self.config.get("trade_profiles", {}),
         )
         self.adaptive = AdaptiveOptimizer()
-        self.feedback = TradeFeedbackAnalyzer()
+        # === Feedback — A/B variant 격리 (2026-04-21) ===
+        # self.feedback: MACRO_ON 기본 정책 — data/feedback_history_macro_on.json
+        # self.feedback_off: MACRO_OFF 섀도우 정책 — data/feedback_history_macro_off.json
+        # 각 분기의 losing_streak/regime_scale/direction_scale 조정이 상대에 오염되지 않음.
+        # LIVE는 MACRO_ON 기본 정책과 동일 feedback 사용 (LIVE는 MACRO_ON 결과로 운영).
+        self.feedback = TradeFeedbackAnalyzer(variant="macro_on")
+        self.feedback_off = TradeFeedbackAnalyzer(variant="macro_off")
         self.anomaly_detector = AnomalyDetector()
 
         # 외부 데이터 매니저 (뉴스/센티먼트/온체인/매크로/공포탐욕)
@@ -111,15 +117,34 @@ class AutoTrader:
         # LIVE 잔고는 별도(order_manager가 실 거래소에서 조회)
         paper_initial = self.tier_manager.paper_virtual_seed
 
-        # Paper 트레이더 (paper / dual 모드에서 사용)
+        # === A/B 듀얼북 Paper 트레이더 (2026-04-21) ===
+        # 같은 시장 입력을 두 정책(MACRO_ON / MACRO_OFF)으로 병렬 실행 → 통계적 비교.
+        # 수학적 격리 원칙:
+        #   1) 자본(equity)/포지션 완전 분리 — capital contamination 없음
+        #   2) feedback(학습 이력) 분리 — 상호 간섭 없음
+        #   3) storage 저장 시 variant 태그 — 표본 오염 없음
+        #   4) 동일 가상시드에서 시작 — 초기 조건 편향 없음
+        #   5) 동일 slippage/commission 모델 — 실행 편향 없음
+        # 주의: paper_trader(MACRO_ON)는 기본/운영 기준 — BTC reserve/LIVE 연계도 이쪽 사용.
         self.paper_trader = PaperTrader(
             initial_capital=paper_initial,
             commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
             trailing_config=self.config.get("trailing_stop", {}),
             trade_profiles=self.config.get("trade_profiles", {}),
+            variant="PAPER_MACRO_ON",
+        )
+        # 섀도우 variant — 같은 조건에서 macro_block OFF로 실행 → 순수 정책 A/B
+        self.paper_trader_off = PaperTrader(
+            initial_capital=paper_initial,
+            commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
+            trailing_config=self.config.get("trailing_stop", {}),
+            trade_profiles=self.config.get("trade_profiles", {}),
+            variant="PAPER_MACRO_OFF",
         )
         # PAPER 자동청산 콜백 (SL/TP/트레일링 → DB 저장 + 학습)
+        # 콜백은 trade["variant"]로 분기해서 올바른 feedback/optimizer에 기록
         self.paper_trader.set_auto_close_callback(self._on_paper_auto_close)
+        self.paper_trader_off.set_auto_close_callback(self._on_paper_auto_close)
 
         # === BTC Treasury Reserve (2026-04-18) ===
         # 선물 실현수익의 일부를 현물 BTC로 자동 적립. 티어별 적립률 적용.
@@ -137,8 +162,9 @@ class AutoTrader:
         # Binance spot 클라이언트 (BTC Reserve 실매수용) — initialize()에서 생성
         self.spot_exchange_client = None
 
-        # StrategyOptimizer — Paper/Live 각각 독립 추적
+        # StrategyOptimizer — Paper/Live 각각 독립 추적 + PAPER_OFF 변종
         self.strategy_optimizer_paper = StrategyOptimizer()
+        self.strategy_optimizer_paper_off = StrategyOptimizer()
         self.strategy_optimizer_live = StrategyOptimizer()
 
         # 퀀트 시그널 (오더북, VPIN, 베이시스, 크래시보호, 알파, 레짐)
@@ -423,7 +449,23 @@ class AutoTrader:
             logger.debug(f"[ExtAlert] 외부 알림 체크 실패: {e}")
 
     def _save_trade_with_context(self, trade: dict, context: dict = None):
-        """save_trade 래퍼 — 퀀트 시그널/레짐/확신도 등 메타데이터 자동 포함"""
+        """save_trade 래퍼 — 퀀트 시그널/레짐/확신도 등 메타데이터 자동 포함
+
+        [2026-04-21] A/B variant 기본값 자동 설정:
+            - mode=LIVE → variant="LIVE"
+            - mode=PAPER, variant 미지정 → "PAPER_MACRO_ON" (기본 정책)
+            - mode=PAPER, variant="PAPER_MACRO_OFF" → 섀도우 variant
+        호출부가 trade["variant"]를 명시하면 그대로 사용.
+        """
+        # A/B variant 기본값 — 표본 분류의 신뢰성을 위해 반드시 채움
+        if "variant" not in trade or not trade.get("variant"):
+            mode_upper = str(trade.get("mode", "")).upper()
+            if mode_upper == "LIVE":
+                trade["variant"] = "LIVE"
+            elif mode_upper == "PAPER":
+                trade["variant"] = "PAPER_MACRO_ON"
+            else:
+                trade["variant"] = ""
         meta = {}
         if context:
             meta.update(context)
@@ -1392,6 +1434,9 @@ class AutoTrader:
         # 5.5. 이상 시장 감지
         price = float(df["close"].iloc[-1])
         volume = float(df["volume"].iloc[-1])
+        # volatility / atr_pct — A/B 섀도우도 primary가 hold일 때 필요 → 항상 선계산
+        volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
+        atr_pct = float(df["atr_pct"].iloc[-1]) if "atr_pct" in df.columns and df["atr_pct"].iloc[-1] == df["atr_pct"].iloc[-1] else 0.0
         alerts = self.anomaly_detector.update(price, volume)
         if alerts:
             self.last_signals["anomalies"] = [a["message"] for a in alerts]
@@ -1421,12 +1466,7 @@ class AutoTrader:
 
         # 7. 주문 실행
         if decision.action in ["long", "short"]:
-            volatility = df["returns_1"].std() if "returns_1" in df.columns else 0.01
-
-            # ATR 값 추출 (동적 SL/TP + Paper 슬리피지용)
-            atr_pct = float(df["atr_pct"].iloc[-1]) if "atr_pct" in df.columns else 0.0
-            if atr_pct != atr_pct:  # NaN
-                atr_pct = 0.0
+            # volatility/atr_pct 는 위에서 선계산됨 (A/B 섀도우 일관성 보장)
             # Paper 슬리피지 모델에 ATR 주입 (포지션 유지 중 close 슬리피지도 최신 ATR 사용)
             try:
                 self.paper_trader.set_atr(symbol, atr_pct)
@@ -1800,6 +1840,36 @@ class AutoTrader:
                         logger.info(f"[자기수정] PAPER stale 청산 {symbol} | PnL: ${stale_pnl:.2f} | {age_minutes:.0f}분 보유 → 학습기록 완료")
                         tg_notify(format_trade_close("PAPER", symbol, stale_pnl, f"자기수정: stale 청산 ({age_minutes:.0f}분)"), silent=True)
 
+        # === A/B 섀도우 variant (MACRO_OFF) 병렬 실행 (2026-04-21) ===
+        # 같은 시장 입력을 매크로 차단 OFF 정책으로 paper_trader_off 에 동시 실행.
+        # LIVE에 흐르지 않는 순수 관측용 표본 — A/B 비교용 독립 표본 수집.
+        if self.mode in ("paper", "dual"):
+            try:
+                # 예외 경로 대비 — locals()에 없으면 안전 기본값
+                _local = locals()
+                _q_regime_obj = _local.get("quant_regime", {})
+                _q_regime_name = _q_regime_obj.get("regime", "?") if isinstance(_q_regime_obj, dict) else "?"
+                await self._run_shadow_macro_off(
+                    symbol=symbol,
+                    exchange_name=exchange_name,
+                    df=df,
+                    ml_signal=ml_signal,
+                    rl_action=rl_action,
+                    rl_confidence=rl_confidence,
+                    ext_signal=ext_signal,
+                    momentum_signal=momentum_signal,
+                    mtf_signal=mtf_signal,
+                    quant_score=_local.get("quant_score", 0.0),
+                    quant_regime_name=_q_regime_name,
+                    quant_risk_scale=_local.get("quant_risk_scale", 1.0),
+                    adaptive_params=adaptive_params,
+                    funding_rate=funding_rate,
+                    atr_pct=_local.get("atr_pct", 0.0),
+                    volatility=_local.get("volatility", 0.01),
+                )
+            except Exception as e:
+                logger.debug(f"[A/B-Shadow] {symbol} 실행 생략: {e}")
+
     # =========================================================================
     # 집중 매매 모드 메서드 (concentration_mode=true)
     # =========================================================================
@@ -2046,6 +2116,31 @@ class AutoTrader:
                 )
             except Exception as e:
                 logger.debug(f"[DB] signal 저장 실패: {e}")
+
+            # === A/B 섀도우 variant (MACRO_OFF) — 집중모드에서도 병렬 실행 ===
+            # primary가 hold여도 shadow는 독립 결정 → 매 tick 병렬 관측
+            if self.mode in ("paper", "dual"):
+                try:
+                    await self._run_shadow_macro_off(
+                        symbol=symbol,
+                        exchange_name=exchange_name,
+                        df=df,
+                        ml_signal=ml_signal,
+                        rl_action=rl_action,
+                        rl_confidence=rl_confidence,
+                        ext_signal=ext_signal,
+                        momentum_signal=momentum_signal,
+                        mtf_signal=mtf_signal,
+                        quant_score=quant_score,
+                        quant_regime_name=quant_regime.get("regime", "?") if isinstance(quant_regime, dict) else "?",
+                        quant_risk_scale=quant_risk_scale,
+                        adaptive_params=adaptive_params,
+                        funding_rate=funding_rate,
+                        atr_pct=atr_pct,
+                        volatility=volatility,
+                    )
+                except Exception as e:
+                    logger.debug(f"[A/B-Shadow-집중] {symbol} 실행 생략: {e}")
 
             if decision.action not in ("long", "short", "close"):
                 return None
@@ -2543,14 +2638,23 @@ class AutoTrader:
     # ========== PAPER 자동청산 콜백 ==========
 
     def _on_paper_auto_close(self, trade: dict):
-        """PaperTrader SL/TP/트레일링 자동 청산 시 호출 → DB 저장 + 학습"""
+        """PaperTrader SL/TP/트레일링 자동 청산 시 호출 → DB 저장 + 학습
+
+        [2026-04-21] variant-aware:
+            trade["variant"]에 따라 해당 variant의 feedback/optimizer에 기록.
+            MACRO_ON → self.feedback, self.strategy_optimizer_paper  (기본 정책, BTC 리저브 적립 대상)
+            MACRO_OFF → self.feedback_off, self.strategy_optimizer_paper_off  (섀도우 정책)
+        risk_manager.record_pnl / strategy_manager 연패 기록은 MACRO_ON만 반영 — LIVE 운영 기준.
+        """
         try:
             symbol = trade.get("symbol", "?")
             pnl = trade.get("pnl", 0)
             reason = trade.get("reason", "auto")
             side = trade.get("side", "")
+            variant = trade.get("variant", "PAPER_MACRO_ON")
+            is_shadow = (variant == "PAPER_MACRO_OFF")
 
-            # DB 저장
+            # DB 저장 — variant 명시 태그
             self._save_trade_with_context({
                 "exchange": "paper", "symbol": symbol, "side": side or "close",
                 "price": trade.get("exit_price", 0),
@@ -2558,46 +2662,283 @@ class AutoTrader:
                 "pnl": pnl, "fee": trade.get("fee", 0),
                 "strategy": f"paper_{reason.replace(' ', '_')}",
                 "mode": "PAPER",
+                "variant": variant,
             })
 
-            # 학습 기록
+            # 학습 기록 — variant별 격리
             regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "unknown"
-            self.feedback.record_trade(
+            target_feedback = self.feedback_off if is_shadow else self.feedback
+            target_feedback.record_trade(
                 {"pnl": pnl, "side": side, "symbol": symbol},
                 {"regime": regime, "signal": 0, "confidence": 0,
                  "external_score": 0, "external_direction": "neutral",
                  "exit_reason": reason},
             )
-            self.risk_manager.record_pnl(pnl)
-            if pnl < 0:
-                self.strategy_manager.record_loss()
-            else:
-                self.strategy_manager.record_win()
 
-            # StrategyOptimizer 기록
-            p_hash = self.strategy_optimizer_paper._config_to_hash(
-                self.strategy_optimizer_paper.current_config
-            )
-            self.strategy_optimizer_paper.record_trade(p_hash, {
+            # LIVE 운영 기준(MACRO_ON)만 risk_manager/strategy_manager 상태 반영.
+            # 섀도우 variant는 관찰 전용 — 공통 리스크 상태 오염 금지.
+            if not is_shadow:
+                self.risk_manager.record_pnl(pnl)
+                if pnl < 0:
+                    self.strategy_manager.record_loss()
+                else:
+                    self.strategy_manager.record_win()
+
+            # StrategyOptimizer 기록 — variant별 격리
+            target_opt = self.strategy_optimizer_paper_off if is_shadow else self.strategy_optimizer_paper
+            p_hash = target_opt._config_to_hash(target_opt.current_config)
+            target_opt.record_trade(p_hash, {
                 "pnl": pnl, "timestamp": datetime.utcnow(),
                 "symbol": symbol, "hour": datetime.utcnow().hour,
             })
 
+            variant_tag = "PAPER-OFF" if is_shadow else "PAPER"
             add_live_log({
                 "time": datetime.utcnow().strftime("%H:%M:%S"),
-                "type": "trade_close", "mode": "PAPER",
+                "type": "trade_close", "mode": variant_tag,
                 "symbol": symbol, "pnl": round(pnl, 2),
                 "reason": reason,
             })
-            logger.info(f"[PAPER-Auto] {reason} {symbol} {side} | PnL: ${pnl:+.2f} → DB+학습 저장")
-            tg_notify(format_trade_close("PAPER", symbol, pnl, reason), silent=True)
+            logger.info(f"[{variant_tag}-Auto] {reason} {symbol} {side} | PnL: ${pnl:+.2f} → DB+학습 저장")
+            # 알림 — MACRO_ON만 (MACRO_OFF는 관찰 전용, 알림 스팸 방지)
+            if not is_shadow:
+                tg_notify(format_trade_close("PAPER", symbol, pnl, reason), silent=True)
 
-            # 손실 시 즉시 원인분석 리포트
-            if pnl < 0:
+            # 손실 시 즉시 원인분석 리포트 — MACRO_ON만 (운영 기준)
+            if pnl < 0 and not is_shadow:
                 self._generate_loss_report(trade, mode="PAPER")
 
         except Exception as e:
             logger.error(f"[PAPER-Auto] 콜백 실패: {e}")
+
+    # ========== A/B 섀도우 variant 실행 (MACRO_OFF) ==========
+
+    async def _run_shadow_macro_off(
+        self,
+        *,
+        symbol: str,
+        exchange_name: str,
+        df,
+        ml_signal: dict,
+        rl_action: int,
+        rl_confidence: float,
+        ext_signal: dict,
+        momentum_signal: dict,
+        mtf_signal: dict,
+        quant_score: float,
+        quant_regime_name: str,
+        quant_risk_scale: float,
+        adaptive_params: dict,
+        funding_rate: float,
+        atr_pct: float,
+        volatility: float,
+    ) -> None:
+        """A/B 섀도우 variant (MACRO_OFF) 실행.
+
+        수학적 격리 원칙 (2026-04-21):
+            - 같은 시장 입력(ML/RL/EXT/MTF/Quant/ATR/Vol)을 primary와 동일하게 수용
+            - strategy_manager.decide()에 variant_override={"disable_macro_block": True} 주입
+            - 동일한 post-processing(MTF/Quant) 로직 적용 → 정책 차이만이 결과 차이를 설명
+            - 자체 paper_trader_off(equity/positions) + feedback_off(learning) → 완전 격리
+            - risk_manager.check_can_trade는 호출하지 않음 — shadow는 학습용,
+              primary의 MaxDD/연패 상태에 오염되면 A/B 독립성 훼손
+            - LIVE에 흘러가지 않음 — 순수 관찰/비교 목적
+        """
+        if self.mode not in ("paper", "dual"):
+            return
+        try:
+            price = float(df["close"].iloc[-1])
+            pt = self.paper_trader_off
+            fb = self.feedback_off
+            opt = self.strategy_optimizer_paper_off
+
+            # ATR 슬리피지 모델 갱신 + 가격 업데이트(SL/TP 자동체크)
+            try:
+                pt.set_atr(symbol, atr_pct)
+            except Exception:
+                pass
+            pt.update_prices({symbol: price})
+
+            current_position = 1.0 if symbol in pt.positions else 0.0
+            fb_blacklist = fb.get_entry_blacklist()
+
+            # variant 결정: macro_block OFF
+            decision = self.strategy_manager.decide(
+                ml_signal, rl_action, rl_confidence, current_position,
+                adaptive_params["regime"], external_signal=ext_signal,
+                momentum=momentum_signal,
+                feedback_blacklist=fb_blacklist,
+                funding_rate=funding_rate,
+                mode="paper",
+                variant_override={"disable_macro_block": True},
+            )
+
+            # MTF 필터 — primary와 동일 로직 (양쪽 동일 적용해야 macro 차이만 분리됨)
+            if decision.action in ["long", "short"]:
+                mtf_agreement = mtf_signal.get("agreement", 0) if isinstance(mtf_signal, dict) else 0
+                mtf_dir = mtf_signal.get("direction", "neutral") if isinstance(mtf_signal, dict) else "neutral"
+                action_opposes_mtf = (
+                    (decision.action == "long" and mtf_dir == "bearish") or
+                    (decision.action == "short" and mtf_dir == "bullish")
+                )
+                action_agrees_mtf = (
+                    (decision.action == "long" and mtf_dir == "bullish") or
+                    (decision.action == "short" and mtf_dir == "bearish")
+                )
+                if action_opposes_mtf and mtf_agreement >= 0.75:
+                    decision.action = "hold"
+                    decision.confidence = 0.0
+                    decision.size = 0.0
+                elif action_opposes_mtf and mtf_agreement >= 0.5:
+                    decision.confidence *= 0.75
+                elif action_agrees_mtf and mtf_agreement > 0.7:
+                    decision.confidence = min(decision.confidence * 1.15, 1.0)
+
+            # 퀀트 필터 — primary와 동일 로직
+            if quant_regime_name == "ranging" and decision.action in ("long", "short"):
+                decision.confidence *= 0.6
+                if decision.confidence < self.strategy_manager.min_confidence:
+                    decision.action = "hold"
+                    decision.size = 0.0
+            if quant_score != 0 and decision.action in ("long", "short"):
+                quant_agrees = (
+                    (decision.action == "long" and quant_score > 0) or
+                    (decision.action == "short" and quant_score < 0)
+                )
+                if not quant_agrees and abs(quant_score) > 0.3:
+                    decision.confidence *= 0.7
+                elif quant_agrees and abs(quant_score) > 0.3:
+                    decision.confidence = min(decision.confidence * 1.15, 1.0)
+
+            if decision.action not in ("long", "short", "close"):
+                return
+
+            # Sizing — shadow equity 독립, feedback_off의 Kelly stats 사용
+            ext_agrees = (
+                (decision.action == "long" and ext_signal.get("direction") == "bullish") or
+                (decision.action == "short" and ext_signal.get("direction") == "bearish")
+            )
+            dynamic_lev = self.risk_manager.calculate_dynamic_leverage(
+                confidence=decision.confidence,
+                volatility=volatility,
+                regime=adaptive_params["regime"],
+                external_agreement=ext_agrees,
+            )
+            trade_type = decision.trade_type
+            tp_profile = self.config.get("trade_profiles", {}).get(trade_type, {})
+            sl_pct_for_cap = tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"])
+            max_risk_pct = tp_profile.get("max_risk_pct", 0.05)
+            dynamic_lev = self.risk_manager.cap_leverage_by_risk(
+                dynamic_lev, sl_pct_for_cap, max_risk_pct
+            )
+            fb_scale = fb.get_position_scale(adaptive_params["regime"], decision.action)
+            kelly_enabled = self.tier_manager.feature_enabled("kelly_enabled", mode="paper")
+            kelly_fraction = self.tier_manager.get_feature("kelly_fraction", mode="paper", default=0.25) or 0.25
+            kelly_stats = (
+                fb.get_kelly_stats(regime=adaptive_params["regime"], side=decision.action)
+                if kelly_enabled else None
+            )
+            size = self.risk_manager.calculate_position_size(
+                pt.equity, decision.confidence, volatility,
+                adaptive_params["position_scale"] * fb_scale * quant_risk_scale,
+                kelly_enabled=kelly_enabled,
+                kelly_fraction=float(kelly_fraction),
+                kelly_stats=kelly_stats,
+            )
+            notional = size * dynamic_lev
+            min_notional = self.min_order_notional * 1.05
+            if notional < min_notional:
+                size = max(size, min_notional / dynamic_lev)
+                size = min(size, pt.equity * 0.50)
+                notional = size * dynamic_lev
+
+            # === 실행 ===
+            if decision.action in ("long", "short"):
+                if symbol not in pt.positions:
+                    pt.open_position(
+                        symbol, decision.action, size, price,
+                        leverage=dynamic_lev,
+                        sl_pct=tp_profile.get("sl_pct", self.config["risk"]["stop_loss_pct"])
+                        * adaptive_params["stop_loss_mult"],
+                        tp_pct=tp_profile.get("tp_pct", self.config["risk"]["take_profit_pct"]),
+                        atr_pct=atr_pct,
+                        trade_type=decision.trade_type,
+                    )
+                    logger.info(
+                        f"[PAPER-OFF] {decision.action.upper()} {symbol} | "
+                        f"${size:.2f} × {dynamic_lev}x = ${notional:.2f} | {decision.reason}"
+                    )
+                    add_live_log({
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "type": "trade_open",
+                        "mode": "PAPER-OFF",
+                        "symbol": symbol,
+                        "action": decision.action,
+                        "size": round(size, 2),
+                        "price": price,
+                        "leverage": dynamic_lev,
+                        "notional": round(notional, 2),
+                        "reason": decision.reason,
+                    })
+            elif decision.action == "close" and symbol in pt.positions:
+                result = pt.close_position(symbol, price, decision.reason)
+                if result:
+                    pnl = result["pnl"]
+                    self._save_trade_with_context({
+                        "exchange": exchange_name, "symbol": symbol, "side": result.get("side", "close"),
+                        "price": price, "amount": result["size"], "pnl": pnl,
+                        "fee": result["fee"], "strategy": "hybrid_shadow",
+                        "mode": "PAPER", "variant": "PAPER_MACRO_OFF",
+                    })
+                    fb.record_trade(result, {
+                        "regime": adaptive_params["regime"],
+                        "signal": ml_signal.get("signal", 0) if isinstance(ml_signal, dict) else 0,
+                        "confidence": decision.confidence,
+                        "volatility": volatility,
+                        "external_score": ext_signal.get("score", 0) if isinstance(ext_signal, dict) else 0,
+                        "external_direction": ext_signal.get("direction", "neutral") if isinstance(ext_signal, dict) else "neutral",
+                        "exit_reason": "strategy_close_shadow",
+                        "confirming_sources": getattr(decision, "confirming_sources", []),
+                        "entry_path": "+".join(sorted(getattr(decision, "confirming_sources", []))),
+                    })
+                    p_hash = opt._config_to_hash(opt.current_config)
+                    opt.record_trade(p_hash, {
+                        "pnl": pnl, "timestamp": datetime.utcnow(),
+                        "symbol": symbol, "hour": datetime.utcnow().hour,
+                    })
+                    logger.info(f"[PAPER-OFF] 청산 {symbol} | PnL: ${pnl:+.2f} → shadow 학습저장")
+                    add_live_log({
+                        "time": datetime.utcnow().strftime("%H:%M:%S"),
+                        "type": "trade_close",
+                        "mode": "PAPER-OFF",
+                        "symbol": symbol,
+                        "pnl": round(pnl, 2),
+                        "reason": decision.reason,
+                    })
+
+            # stale 포지션 자기수정 — shadow도 동일 기준
+            if symbol in pt.positions:
+                pos = pt.positions[symbol]
+                age_minutes = (datetime.utcnow() - pos.entry_time).total_seconds() / 60
+                if age_minutes > 240 and pos.unrealized_pnl < 0:
+                    result = pt.close_position(symbol, price, f"자기수정: {age_minutes:.0f}분 stale (shadow)")
+                    if result:
+                        pnl = result["pnl"]
+                        self._save_trade_with_context({
+                            "exchange": exchange_name, "symbol": symbol, "side": result.get("side", "close"),
+                            "price": price, "amount": result["size"], "pnl": pnl,
+                            "fee": result["fee"], "strategy": "auto_close_shadow",
+                            "mode": "PAPER", "variant": "PAPER_MACRO_OFF",
+                        })
+                        fb.record_trade(result, {
+                            "regime": adaptive_params["regime"],
+                            "signal": 0, "confidence": 0,
+                            "external_score": 0, "external_direction": "neutral",
+                            "exit_reason": "stale_shadow",
+                        })
+                        logger.info(f"[PAPER-OFF-자기수정] stale 청산 {symbol} | PnL: ${pnl:+.2f}")
+        except Exception as e:
+            logger.warning(f"[PAPER-OFF] shadow variant 실행 실패: {e}")
 
     # ========== 손실 자동 피드백 리포트 ==========
 
@@ -3553,6 +3894,58 @@ class AutoTrader:
                 f"\n⚙️ min_conf: {self.strategy_manager.base_min_confidence:.2f} | "
                 f"min_confirm: {self.strategy_manager.min_confirming}"
             )
+
+            # === 7. A/B 비교 (MACRO_ON vs MACRO_OFF) — 2026-04-21 ===
+            # 동일 시장 · 동일 ML/RL 입력에서 매크로 차단 정책만 변경한 변종.
+            # Welch's t + Cohen's d + 부트스트랩 CI — pre-registered 정지규칙.
+            try:
+                from core.learning.ab_tester import (
+                    compare_variants,
+                    load_variant_pnls,
+                )
+                pnls_on = load_variant_pnls(self.storage, "PAPER_MACRO_ON", limit=5000)
+                pnls_off = load_variant_pnls(self.storage, "PAPER_MACRO_OFF", limit=5000)
+                if len(pnls_on) >= 5 and len(pnls_off) >= 5:
+                    ab = compare_variants(
+                        "PAPER_MACRO_ON", pnls_on,
+                        "PAPER_MACRO_OFF", pnls_off,
+                        alpha=0.05, n_min=100, d_min=0.3,
+                    )
+                    report_lines.append("\n🧪 <b>A/B: MACRO_ON vs MACRO_OFF</b>")
+                    a, b = ab.variant_a, ab.variant_b
+                    report_lines.append(
+                        f"  N: {a.n} / {b.n} | WR: {a.wr:.0%} / {b.wr:.0%}"
+                    )
+                    report_lines.append(
+                        f"  mean PnL: {a.mean_pnl:+.2f} / {b.mean_pnl:+.2f} "
+                        f"(Δ={ab.mean_diff:+.2f}, CI [{ab.mean_diff_ci95[0]:+.2f}, {ab.mean_diff_ci95[1]:+.2f}])"
+                    )
+                    report_lines.append(
+                        f"  Sharpe/trade: {a.sharpe_pt:.2f} / {b.sharpe_pt:.2f}"
+                    )
+                    report_lines.append(
+                        f"  p={ab.p_welch:.4f} | d={ab.cohens_d:+.2f} ({ab.significance})"
+                    )
+                    if ab.stopping_rule_met:
+                        report_lines.append(
+                            f"  ✅ <b>정지규칙 충족 → winner={ab.winner}</b>"
+                        )
+                        report_lines.append(f"  해석: {ab.reasoning}")
+                        logger.warning(
+                            f"[A/B] 정지규칙 충족 — winner={ab.winner} "
+                            f"p={ab.p_welch:.4f} d={ab.cohens_d:+.2f}"
+                        )
+                    else:
+                        report_lines.append(
+                            f"  🔬 수집 중 ({ab.significance}): {ab.reasoning}"
+                        )
+                else:
+                    report_lines.append(
+                        f"\n🧪 A/B 표본: ON={len(pnls_on)} / OFF={len(pnls_off)} "
+                        f"(각 5건 이상 필요)"
+                    )
+            except Exception as e:
+                logger.debug(f"[A/B] 리포트 생성 실패: {e}")
 
             report_text = "\n".join(report_lines)
             logger.info(f"[SelfReview] 완료 | {len(close_trades)}건 승률 {win_rate:.0%} PnL ${total_pnl:+.2f} | 조정 {len(adjustments)}건")

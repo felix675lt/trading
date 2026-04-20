@@ -50,8 +50,10 @@ class Storage:
                 fee REAL,
                 strategy TEXT,
                 mode TEXT DEFAULT '',
+                variant TEXT DEFAULT '',
                 metadata TEXT
             );
+            -- 인덱스는 _migrate_tables()에서 생성 (기존 DB 호환)
 
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +113,20 @@ class Storage:
                 self.conn.execute("ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT ''")
                 self.conn.commit()
                 logger.info("[Storage] trades 테이블에 mode 컬럼 추가 완료")
+            # A/B 테스트용 variant 컬럼 (2026-04-21 추가)
+            # 값: LIVE / PAPER_MACRO_ON / PAPER_MACRO_OFF / '' (legacy)
+            if "variant" not in columns:
+                self.conn.execute("ALTER TABLE trades ADD COLUMN variant TEXT DEFAULT ''")
+                self.conn.commit()
+                logger.info("[Storage] trades 테이블에 variant 컬럼 추가 완료 (A/B)")
+            # 인덱스 보장 (신규/구 DB 공통)
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trades_variant_ts ON trades(variant, timestamp)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trades_mode_ts ON trades(mode, timestamp)"
+            )
+            self.conn.commit()
         except Exception as e:
             logger.warning(f"[Storage] 마이그레이션 실패: {e}")
 
@@ -144,14 +160,15 @@ class Storage:
 
     def save_trade(self, trade: dict):
         self.conn.execute(
-            "INSERT INTO trades (timestamp, exchange, symbol, side, price, amount, pnl, fee, strategy, mode, metadata) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO trades (timestamp, exchange, symbol, side, price, amount, pnl, fee, strategy, mode, variant, metadata) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 trade.get("timestamp", str(datetime.utcnow())),
                 trade["exchange"], trade["symbol"], trade["side"],
                 trade["price"], trade["amount"],
                 trade.get("pnl", 0), trade.get("fee", 0),
                 trade.get("strategy", ""), trade.get("mode", ""),
+                trade.get("variant", ""),  # A/B variant tag (2026-04-21)
                 json.dumps(trade.get("metadata", {})),
             ),
         )
