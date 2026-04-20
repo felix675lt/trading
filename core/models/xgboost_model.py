@@ -8,6 +8,7 @@ import pandas as pd
 from loguru import logger
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 
@@ -31,24 +32,31 @@ class XGBoostPredictor:
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
 
+        # === 클래스 불균형 보정 (2026-04-20 추가) ===
+        # 이전 학습 결과: 하락 66% / 상승 32% / 횡보 2% → 모델이 "전부 하락"으로 lazy 수렴
+        # (상승 recall 0.00). sample_weight = "balanced"로 상승/횡보 클래스 가중치 상향 →
+        # strong_uptrend 환경에서의 13.8% WR 개선 기대 (Lopez de Prado '20)
+        sw_train = compute_sample_weight(class_weight="balanced", y=y_train)
+
         prev_accuracy = self.accuracy
 
         if self.model is not None:
             # === 기존 모델 이어서 학습 (incremental) ===
-            logger.info(f"XGBoost 증분학습 시작 (기존 정확도: {prev_accuracy:.4f})")
+            logger.info(f"XGBoost 증분학습 시작 (기존 정확도: {prev_accuracy:.4f}) | balanced sample_weight 적용")
             self.model.set_params(
                 n_estimators=self.model.n_estimators + 100,  # 트리 100개 추가
                 learning_rate=0.02,  # 학습률 낮춰서 기존 지식 보존
             )
             self.model.fit(
                 X_train, y_train,
+                sample_weight=sw_train,
                 eval_set=[(X_test, y_test)],
                 xgb_model=self.model.get_booster(),  # 기존 모델에서 이어서
                 verbose=False,
             )
         else:
             # === 최초 학습 ===
-            logger.info("XGBoost 최초 학습 시작")
+            logger.info("XGBoost 최초 학습 시작 | balanced sample_weight 적용")
             self.model = XGBClassifier(
                 n_estimators=300,
                 max_depth=6,
@@ -61,6 +69,7 @@ class XGBoostPredictor:
             )
             self.model.fit(
                 X_train, y_train,
+                sample_weight=sw_train,
                 eval_set=[(X_test, y_test)],
                 verbose=False,
             )
@@ -145,6 +154,9 @@ class XGBoostPredictor:
             X_tr, X_te = X[train_idx], X[test_idx]
             y_tr, y_te = y[train_idx], y[test_idx]
 
+            # 클래스 불균형 보정 (walk-forward도 동일)
+            sw_tr = compute_sample_weight(class_weight="balanced", y=y_tr)
+
             fold_model = XGBClassifier(
                 n_estimators=300,
                 max_depth=6,
@@ -155,7 +167,12 @@ class XGBoostPredictor:
                 eval_metric="mlogloss",
                 early_stopping_rounds=20,
             )
-            fold_model.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
+            fold_model.fit(
+                X_tr, y_tr,
+                sample_weight=sw_tr,
+                eval_set=[(X_te, y_te)],
+                verbose=False,
+            )
             y_pred = fold_model.predict(X_te)
             acc = accuracy_score(y_te, y_pred)
             fold_accs.append(acc)

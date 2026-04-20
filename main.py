@@ -1281,8 +1281,8 @@ class AutoTrader:
             except Exception as e:
                 logger.debug(f"[HMM] predict 실패: {e}")
 
-        # 3. ML 시그널
-        ml_signal = self.ensemble.predict(df)
+        # 3. ML 시그널 (레짐 전달 — strong_uptrend WR 13.8% 학습 기반 가중치 적용)
+        ml_signal = self.ensemble.predict(df, regime=adaptive_params.get("regime"))
 
         # 4. RL 행동 결정 (기본 피처만 사용 - 차원 고정 보장)
         base_feature_cols = self.feature_engineer.get_base_feature_columns(df)
@@ -1855,7 +1855,8 @@ class AutoTrader:
             volumes = df["volume"].values
             adaptive_params = self.adaptive.update(prices, volumes)
 
-            ml_signal = self.ensemble.predict(df)
+            # 레짐 기반 시그널 가중치 (ensemble.REGIME_SIGNAL_WEIGHT 참고)
+            ml_signal = self.ensemble.predict(df, regime=adaptive_params.get("regime"))
 
             base_feature_cols = self.feature_engineer.get_base_feature_columns(df)
             rl_obs_data = df[base_feature_cols].values[-1].astype(np.float32)
