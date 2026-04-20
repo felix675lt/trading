@@ -185,11 +185,11 @@ class AutoTrader:
         self._live_pause_reason = ""
         self._live_pause_time = None
 
-        # [2026-04-21] 일일 MaxDD 하드캡 상태 (LIVE+PAPER 모두 정지)
+        # [2026-04-21] 일일 MaxDD 하드캡 상태 — LIVE 전용 (PAPER는 학습 위해 무제한 지속)
         self._daily_dd_paused = False
         self._daily_dd_reason = ""
         self._daily_dd_trigger_time = None
-        self._daily_dd_threshold_pct = -3.0  # 일 누적 PnL / 초기자본 < -3% → 24h 정지
+        self._daily_dd_threshold_pct = -3.0  # LIVE 일 누적 PnL / 초기자본 < -3% → 24h LIVE 정지
 
         # 외부 요인 알림 상태 추적
         self._ext_alert_state = {
@@ -2107,16 +2107,14 @@ class AutoTrader:
             return None
 
     async def _execute_paper(self, c: dict):
-        """PAPER 포지션 실행"""
+        """PAPER 포지션 실행.
+
+        [2026-04-21] PAPER는 학습 데이터 수집이 목적 → 손실도 부정 샘플로 가치 있음.
+        _check_daily_drawdown / _check_consecutive_losses 의 정지 플래그는 PAPER에
+        적용하지 않는다 (LIVE 전용). 실제 돈 손실 없음.
+        """
         symbol = c["symbol"]
         if self.mode not in ("paper", "dual"):
-            return
-        # [2026-04-21] 일일 MaxDD 하드캡 — PAPER도 정지
-        if getattr(self, '_daily_dd_paused', False):
-            logger.debug(
-                f"[일일DD정지] PAPER {symbol} 엔트리 차단 "
-                f"(사유: {getattr(self, '_daily_dd_reason', '?')})"
-            )
             return
         # === 티어 심볼 필터 ===
         if not self.tier_manager.allowed_symbol(symbol, mode="paper"):
@@ -3270,16 +3268,19 @@ class AutoTrader:
         return None
 
     def _check_daily_drawdown(self) -> str | None:
-        """일일 MaxDD 하드캡 — LIVE+PAPER 모두 정지.
+        """일일 MaxDD 하드캡 — LIVE 전용 정지.
 
-        [2026-04-21 추가] 어제 PAPER 하루 -$244 (-4.9%) 같은 재앙 방지.
-        일 누적 PnL(LIVE + PAPER) / initial_capital ≤ -3% 면 자정(UTC)까지 전체 정지.
+        [2026-04-21 개정] 사용자 원칙 반영: PAPER는 학습 데이터 수집 목적이므로
+        손실도 부정 샘플로 가치 있음 → PAPER는 DD 체크 대상에서 제외.
+        LIVE 일 누적 PnL / initial_capital ≤ -3% 면 자정(UTC)까지 LIVE만 정지.
         """
         try:
             from datetime import datetime as _dt
             today_utc = _dt.utcnow().strftime("%Y-%m-%d")
+            # LIVE 거래만 집계 (PAPER 제외)
             cursor = self.storage.conn.execute(
-                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE DATE(timestamp) = ?",
+                "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                "WHERE DATE(timestamp) = ? AND mode = 'LIVE'",
                 (today_utc,),
             )
             today_pnl = float(cursor.fetchone()[0] or 0)
@@ -3290,33 +3291,33 @@ class AutoTrader:
             if dd_pct <= self._daily_dd_threshold_pct and not self._daily_dd_paused:
                 self._daily_dd_paused = True
                 self._daily_dd_reason = (
-                    f"일 누적 PnL ${today_pnl:.2f} = {dd_pct:+.2f}% "
+                    f"LIVE 일 누적 PnL ${today_pnl:.2f} = {dd_pct:+.2f}% "
                     f"(한계 {self._daily_dd_threshold_pct:.1f}%)"
                 )
                 self._daily_dd_trigger_time = _dt.utcnow()
-                logger.warning(f"[일일DD] 🛑 전체 정지: {self._daily_dd_reason}")
+                logger.warning(f"[일일DD] 🛑 LIVE 정지: {self._daily_dd_reason}")
                 tg_notify(
-                    f"🛑 <b>일일 MaxDD 하드캡 발동</b>\n"
+                    f"🛑 <b>일일 MaxDD 하드캡 (LIVE)</b>\n"
                     f"━━━━━━━━━━━━━\n"
                     f"{self._daily_dd_reason}\n"
-                    f"LIVE + PAPER 모두 00:00 UTC 까지 정지\n"
-                    f"📝 학습 사이클은 계속 실행 (모델 개선)"
+                    f"LIVE 만 00:00 UTC 까지 정지 (PAPER 는 학습 지속)\n"
+                    f"📝 학습 사이클도 계속 실행 (모델 개선)"
                 )
-                return f"일일 DD 정지: {dd_pct:+.2f}%"
+                return f"일일 DD 정지 (LIVE only): {dd_pct:+.2f}%"
 
             # Auto release at UTC midnight rollover
             if self._daily_dd_paused and self._daily_dd_trigger_time:
                 trigger_day = self._daily_dd_trigger_time.strftime("%Y-%m-%d")
                 if today_utc != trigger_day:
                     self._daily_dd_paused = False
-                    logger.info(f"[일일DD] ✅ 신규 UTC 일자 — 정지 해제 (오늘 PnL {today_pnl:+.2f})")
+                    logger.info(f"[일일DD] ✅ 신규 UTC 일자 — LIVE 정지 해제 (오늘 LIVE PnL {today_pnl:+.2f})")
                     tg_notify(
                         f"✅ <b>일일 DD 정지 해제</b>\n"
-                        f"신규 UTC 일자 시작 — 거래 재개"
+                        f"신규 UTC 일자 시작 — LIVE 재개"
                     )
 
             if self._daily_dd_paused:
-                return f"일일 DD 정지 지속 ({dd_pct:+.2f}%)"
+                return f"일일 DD 정지 지속 (LIVE only, {dd_pct:+.2f}%)"
 
         except Exception as e:
             logger.debug(f"[진단] 일일 DD 체크 실패: {e}")
