@@ -179,7 +179,6 @@ class StrategyManager:
         momentum: dict | None = None,
         feedback_blacklist: list | None = None,
         funding_rate: float = 0.0,
-        fear_greed_index: float = 50.0,
         mode: str = "paper",
     ) -> TradeDecision:
         """최종 트레이딩 결정 (v4 - 다중확인 시스템)
@@ -339,12 +338,12 @@ class StrategyManager:
                 reason = f"고임팩트 불리시 이벤트 → 숏 차단 (ext={ext_score:.2f})"
                 confidence = 0.0
 
-        # 2.8. 레짐 방향 바이어스 [재활성화 v2] — funding_rate 극값만 사용
-        # 공포탐욕 지수는 제거됨 (후행 지표, 예측력 없음)
+        # 2.8. 레짐 방향 바이어스 [재활성화 v3] — funding_rate 극값 + 모멘텀/RSI만 사용
+        # 공포탐욕 지수 완전 제거됨 (후행 지표, 예측력 없음)
         # LIVE 공격 롱 + macro_disable: 롱 차단만 무시 (숏 차단은 유지 — 펀비 스퀴즈 리스크 보호)
         if final_action in ["long", "short"]:
             direction_block = self._regime_direction_bias(
-                final_action, funding_rate, fear_greed_index, mom_direction, mom_rsi,
+                final_action, funding_rate, mom_direction, mom_rsi,
             )
             if direction_block:
                 if macro_disabled_long and final_action == "long":
@@ -436,7 +435,6 @@ class StrategyManager:
                 },
                 "regime_bias": {
                     "funding_rate": round(funding_rate, 3),
-                    "fear_greed": round(fear_greed_index, 1),
                 },
                 "adaptive": {
                     "min_confidence": round(self.min_confidence, 3),
@@ -465,7 +463,7 @@ class StrategyManager:
         return decision
 
     def _regime_direction_bias(
-        self, action: str, funding_rate: float, fear_greed: float,
+        self, action: str, funding_rate: float,
         mom_direction: str, mom_rsi: float,
     ) -> str | None:
         """레짐 기반 방향 필터 — funding_rate + 모멘텀/RSI 극값만 사용

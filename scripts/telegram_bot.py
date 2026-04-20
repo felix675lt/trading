@@ -228,16 +228,6 @@ def format_external_alert(alert_type: str, data: dict) -> str:
             f"  달러 {direction} → {crypto_impact}\n"
         )
 
-    elif alert_type == "fear_greed_extreme":
-        # 공포탐욕 극단값
-        header = "😱 <b>공포탐욕 지수 극단값</b>"
-        value = data.get("value", 50)
-        label = data.get("label", "")
-        body = (
-            f"  지수: <b>{value}</b> ({label})\n"
-            f"  💡 <i>극단적 공포는 역발상 매수 시그널 가능</i>\n"
-        )
-
     elif alert_type == "polymarket":
         # 폴리마켓 급변
         header = "🔮 <b>예측 시장(Polymarket) 변동</b>"

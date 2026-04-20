@@ -17,9 +17,9 @@
       "total_pnl": 114.8347125171255
     },
     "23": {
-      "wins": 85,
+      "wins": 86,
       "losses": 14,
-      "total_pnl": 299.23098521401755
+      "total_pnl": 310.06585787728244
     },
     "1": {
       "wins": 85,
@@ -57,9 +57,9 @@
       "total_pnl": -9.010780185169388
     },
     "14": {
-      "wins": 7,
-      "losses": 44,
-      "total_pnl": -46.61154206997085
+      "wins": 8,
+      "losses": 45,
+      "total_pnl": -24.700647942004647
     },
     "2": {
       "wins": 87,
@@ -73,13 +73,13 @@
     },
     "7": {
       "wins": 3,
-      "losses": 6,
-      "total_pnl": -9.563538678329213
+      "losses": 8,
+      "total_pnl": -253.96910872177295
     },
     "5": {
       "wins": 90,
-      "losses": 9,
-      "total_pnl": 688.5631959314528
+      "losses": 10,
+      "total_pnl": 684.2033534906528
     },
     "8": {
       "wins": 2,
@@ -107,9 +107,9 @@
       "total_pnl": 4.157205026831987
     },
     "18": {
-      "wins": 5,
-      "losses": 3,
-      "total_pnl": 4.9675159495664545
+      "wins": 7,
+      "losses": 4,
+      "total_pnl": 22.035323162993297
     },
     "3": {
       "wins": 83,
@@ -129,9 +129,9 @@
       "total_pnl": -9.08
     },
     "strong_uptrend": {
-      "wins": 14,
+      "wins": 15,
       "losses": 47,
-      "total_pnl": -61.209031966560495
+      "total_pnl": -45.98205736521228
     },
     "strong_downtrend": {
       "wins": 315,
@@ -139,14 +139,14 @@
       "total_pnl": 1362.4913915101504
     },
     "normal": {
-      "wins": 373,
-      "losses": 59,
-      "total_pnl": 1844.4881707154561
+      "wins": 374,
+      "losses": 60,
+      "total_pnl": 1846.3290033275346
     },
     "ranging": {
-      "wins": 221,
-      "losses": 36,
-      "total_pnl": 978.3476059912514
+      "wins": 222,
+      "losses": 39,
+      "total_pnl": 740.4170661702724
     },
     "extreme_volatility": {
       "wins": 0,
@@ -154,31 +154,31 @@
       "total_pnl": -24.16573077047686
     },
     "high_volume_breakout": {
-      "wins": 3,
-      "losses": 13,
-      "total_pnl": -23.588938227437772
+      "wins": 4,
+      "losses": 14,
+      "total_pnl": -1.678044099471566
     }
   },
   "symbol_performance": {
     "BTC/USDT:USDT": {
       "wins": 0,
-      "losses": 3,
-      "total_pnl": -3.15
+      "losses": 4,
+      "total_pnl": -105.45214898940867
     },
     "SOL/USDT:USDT": {
-      "wins": 20,
-      "losses": 47,
-      "total_pnl": -86.98848280573927
+      "wins": 22,
+      "losses": 48,
+      "total_pnl": -50.83856965930822
     },
     "DOGE/USDT:USDT": {
-      "wins": 17,
+      "wins": 18,
       "losses": 66,
-      "total_pnl": -58.842878906106456
+      "total_pnl": -53.86474197402781
     },
     "ETH/USDT:USDT": {
-      "wins": 15,
-      "losses": 33,
-      "total_pnl": -39.093833638491624
+      "wins": 16,
+      "losses": 34,
+      "total_pnl": -165.9702800911785
     },
     "ON/USDT:USDT": {
       "wins": 0,
@@ -289,6 +289,11 @@
       "wins": 0,
       "losses": 4,
       "total_pnl": -5.465914613280004
+    },
+    "PIEVERSE/USDT:USDT": {
+      "wins": 0,
+      "losses": 2,
+      "total_pnl": -10.901293115999987
     }
   },
   "direction_performance": {
@@ -298,20 +303,20 @@
       "total_pnl": -3.15
     },
     "short": {
-      "wins": 41,
-      "losses": 127,
-      "total_pnl": -150.0254605269321
+      "wins": 42,
+      "losses": 129,
+      "total_pnl": -383.596157907111
     },
     "long": {
-      "wins": 885,
-      "losses": 65,
-      "total_pnl": 4220.458927779315
+      "wins": 888,
+      "losses": 68,
+      "total_pnl": 4255.077786679907
     }
   },
   "signal_accuracy": {
     "weak": {
-      "wins": 926,
-      "losses": 195
+      "wins": 930,
+      "losses": 200
     }
   },
   "external_accuracy": {},
@@ -388,13 +393,13 @@
     "avoid_hour_9": true,
     "avoid_hour_10": true
   },
-  "total_analyzed": 1121,
+  "total_analyzed": 1130,
   "entry_path_performance": {},
   "exit_reason_analysis": {
     "SL \ub3c4\ub2ec": {
-      "count": 77,
-      "total_pnl": -152.14930031737052,
-      "avg_pnl": -1.97596493918663
+      "count": 79,
+      "total_pnl": -396.5548703608143,
+      "avg_pnl": -5.019681903301446
     },
     "tp": {
       "count": 2,
@@ -402,14 +407,14 @@
       "avg_pnl": 11.472221470332748
     },
     "\ud2b8\ub808\uc77c\ub9c1 SL \ub3c4\ub2ec": {
-      "count": 37,
-      "total_pnl": 75.67900907587759,
-      "avg_pnl": 2.0453786236723674
+      "count": 41,
+      "total_pnl": 135.17133807573552,
+      "avg_pnl": 3.2968619042862324
     },
     "sl": {
-      "count": 996,
-      "total_pnl": 4147.249407553207,
-      "avg_pnl": 4.163905027663862
+      "count": 999,
+      "total_pnl": 4133.210810117206,
+      "avg_pnl": 4.137348158275482
     }
   },
   "entry_blacklist": [],
@@ -455,8 +460,8 @@
       "total_loss": -7.131627139999974
     },
     "normal_long_us": {
-      "count": 8,
-      "total_loss": -13.387379391823202
+      "count": 9,
+      "total_loss": -16.524683711823226
     },
     "strong_downtrend_long_us": {
       "count": 3,
@@ -467,8 +472,8 @@
       "total_loss": -24.451386900000017
     },
     "ranging_short_asia": {
-      "count": 2,
-      "total_loss": -1.8891936168417525
+      "count": 4,
+      "total_loss": -246.29476366028553
     },
     "normal_long_europe": {
       "count": 6,
@@ -511,8 +516,8 @@
       "total_loss": -12.175863226799992
     },
     "ranging_long_asia": {
-      "count": 2,
-      "total_loss": -9.082076320000002
+      "count": 3,
+      "total_loss": -13.441918760799993
     },
     "high_volume_breakout_short_us": {
       "count": 2,
@@ -523,8 +528,8 @@
       "total_loss": -1.0573150657847983
     },
     "high_volume_breakout_long_europe": {
-      "count": 1,
-      "total_loss": -1.0606960423955787
+      "count": 2,
+      "total_loss": -7.602146717595574
     }
   }
 }

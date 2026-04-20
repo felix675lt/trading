@@ -244,10 +244,6 @@
                     <span class="gauge-label">Bull</span>
                 </div>
                 <div class="metric">
-                    <span class="label">Fear & Greed</span>
-                    <span class="value" id="ext-fg">-</span>
-                </div>
-                <div class="metric">
                     <span class="label">Sentiment Trend</span>
                     <span class="value" id="ext-sentiment">-</span>
                 </div>
@@ -257,7 +253,6 @@
         <div class="card external">
             <h2>Signal Components</h2>
             <div class="component-grid" id="ext-components">
-                <div class="component-item"><span class="name">Fear/Greed</span><span class="score" id="comp-fg">-</span></div>
                 <div class="component-item"><span class="name">Sentiment</span><span class="score" id="comp-sent">-</span></div>
                 <div class="component-item"><span class="name">Macro</span><span class="score" id="comp-macro">-</span></div>
                 <div class="component-item"><span class="name">Onchain</span><span class="score" id="comp-onchain">-</span></div>
@@ -491,18 +486,12 @@
                 document.getElementById('ext-gauge').style.left = `${Math.max(0, Math.min(100, gaugePct))}%`;
 
                 const comp = cs.components || {};
-                for (const [key, id] of [['fear_greed','comp-fg'],['sentiment','comp-sent'],['macro','comp-macro'],['onchain','comp-onchain'],['social','comp-social']]) {
+                // [공포탐욕 제거됨] 후행지표라 UI에서도 제거 — 2026-04-20
+                for (const [key, id] of [['sentiment','comp-sent'],['macro','comp-macro'],['onchain','comp-onchain'],['social','comp-social']]) {
                     const el = document.getElementById(id);
                     const v = comp[key] || 0;
                     el.textContent = fmt(v, 2);
                     el.className = `score ${scoreClass(v)}`;
-                }
-
-                if (ext.fear_greed?.value != null) {
-                    const fgVal = ext.fear_greed.value;
-                    const fgEl = document.getElementById('ext-fg');
-                    fgEl.textContent = `${fgVal} (${ext.fear_greed.classification || ''})`;
-                    fgEl.className = `value ${fgVal < 30 ? 'negative' : fgVal > 70 ? 'positive' : 'neutral'}`;
                 }
                 if (ext.sentiment_trend != null) {
                     const st = document.getElementById('ext-sentiment');

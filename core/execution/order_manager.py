@@ -416,25 +416,30 @@ class OrderManager:
                 except Exception:
                     pass  # 실패 시 원래 amount 사용
 
-            # SL/TP 계산 (내부 모니터링용)
+            # SL/TP 계산 (내부 모니터링용) — 수학적 RR 최소 강제 (2026-04-20)
+            # BE_WR = SL / (SL+TP). RR=2.5:1이면 BE_WR=28.6% (실적 34% 대비 여유)
             profile = self._get_profile(trade_type)
-            sl_floor = profile.get("sl_floor_pct", self.risk_config.get("sl_floor_pct", 0.005))
-            sl_cap = profile.get("sl_cap_pct", self.risk_config.get("sl_cap_pct", 0.030))
+            sl_floor = profile.get("sl_floor_pct", self.risk_config.get("sl_floor_pct", 0.020))
+            sl_cap = profile.get("sl_cap_pct", self.risk_config.get("sl_cap_pct", 0.045))
+            min_rr = self.risk_config.get("min_rr_ratio", 2.5)  # EV 양수 조건
 
             if atr_pct and atr_pct > 0 and not (atr_pct != atr_pct):
-                atr_sl_mult = profile.get("atr_sl_multiplier", self.risk_config.get("atr_sl_multiplier", 2.0))
-                atr_tp_mult = profile.get("atr_tp_multiplier", self.risk_config.get("atr_tp_multiplier", 3.5))
+                atr_sl_mult = profile.get("atr_sl_multiplier", self.risk_config.get("atr_sl_multiplier", 3.0))
+                atr_tp_mult = profile.get("atr_tp_multiplier", self.risk_config.get("atr_tp_multiplier", 7.5))
                 final_sl_pct = max(sl_floor, min(sl_cap, atr_pct * atr_sl_mult))
-                final_tp_pct = max(final_sl_pct * 1.5, atr_pct * atr_tp_mult)
+                # RR 최소 min_rr 강제: TP ≥ SL × min_rr (수학적 EV 양수 조건)
+                final_tp_pct = max(final_sl_pct * min_rr, atr_pct * atr_tp_mult)
                 logger.info(
                     f"[ATR-SL/TP] {symbol} ATR={atr_pct*100:.2f}% → "
                     f"SL={final_sl_pct*100:.2f}% TP={final_tp_pct*100:.2f}% "
-                    f"(RR {final_tp_pct/final_sl_pct:.1f}:1)"
+                    f"(RR {final_tp_pct/final_sl_pct:.1f}:1, BE_WR={final_sl_pct/(final_sl_pct+final_tp_pct)*100:.1f}%)"
                 )
             else:
-                final_sl_pct = sl_pct or profile.get("sl_pct", self.risk_config.get("stop_loss_pct", 0.015))
-                final_tp_pct = tp_pct or profile.get("tp_pct", self.risk_config.get("take_profit_pct", 0.025))
+                final_sl_pct = sl_pct or profile.get("sl_pct", self.risk_config.get("stop_loss_pct", 0.020))
+                final_tp_pct = tp_pct or profile.get("tp_pct", self.risk_config.get("take_profit_pct", 0.050))
                 final_sl_pct = max(sl_floor, min(sl_cap, final_sl_pct))
+                # RR 최소 min_rr 강제
+                final_tp_pct = max(final_sl_pct * min_rr, final_tp_pct)
 
             if side == "long":
                 stop_loss = fill_price * (1 - final_sl_pct)

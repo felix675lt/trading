@@ -22,9 +22,10 @@ trading:
   paper_symbols_override:
     - "BTC/USDT:USDT"
     - "ETH/USDT:USDT"
-  # LIVE: 알트 위주 (낮은 시드 → 변동성 기반 공격 롱)
-  #   티어 상승 시 tier.symbols에서 자동으로 더 많은 알트 추가됨
+  # LIVE: 엣지 검증된 메이저만 (수학적 최적화 2026-04-20)
+  #   알트 투기 제거 — whitelist와 동일
   live_symbols_override:
+    - "BTC/USDT:USDT"
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
     - "DOGE/USDT:USDT"
@@ -53,15 +54,32 @@ trading:
   long_only: false
   live_long_only: true
 
-  # === LIVE 공격 롱 모드 (2026-04-21 보수화) ===
-  # 이전(04-18): live_min_confidence=0.30, boost=1.25, 매크로차단해제=True
-  # 결과: 최근 10건 전패 → 자가진단 LIVE 일시정지 반복 발동 (4월 중순 이후 LIVE 연속 적자)
-  # 원인: min_conf 0.30은 3-class 분류 random(0.33)과 거의 동일 → 필터링 무효
-  # 수정: 기본 모드로 복귀 (live_aggressive_long=false), 보조 파라미터는 보수값으로.
-  live_aggressive_long: false       # ON(true) 시 아래 파라미터 적용; 현재 OFF
-  live_min_confidence: 0.55        # 0.30 → 0.55 (ML 통계적 우위 구간)
-  live_long_conf_boost: 1.00       # 1.25 → 1.00 (인공 부스트 제거)
-  live_disable_macro_block: false  # true → false (매크로 필터 복구)
+  # === LIVE 수학적 최적화 모드 (2026-04-20 재조정) ===
+  # 최근 empirical: WR 34%, avg_win $1.3, avg_loss $2.3 → BE_WR 64%, EV -$0.96/trade
+  # 진단: 신뢰도 게이트 0.55 도달한 시그널도 실제 WR는 34% → 모델 calibration 문제
+  # 수정: (1) 게이트 0.62로 BE_WR에 수렴, (2) RR 2.5:1 강제로 BE_WR 28.6%로 하향
+  # 둘이 만나는 지점에서 EV 양수화 — 수학적으로 일관된 접근
+  live_aggressive_long: false       # 공격 롱 완전 OFF
+  live_min_confidence: 0.62        # 0.55 → 0.62 (BE_WR 64%에 근접, 노이즈 구간 회피)
+  live_long_conf_boost: 1.00       # 인공 부스트 없음
+  live_disable_macro_block: false  # 매크로 필터 ON
+  live_quant_score_min: 0.25       # |quant_alpha_score| ≥ 0.25 강제 (엣지 없는 구간 차단)
+  live_symbol_whitelist:           # 실거래 심볼 엄격 제한 — 알트 투기 차단
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+    - "SOL/USDT:USDT"
+    - "DOGE/USDT:USDT"
+
+  # === Kelly 분수 기반 포지션 사이징 (2026-04-20 신설) ===
+  # f* = (p·b − q) / b, where b=win/loss_ratio, p=WR, q=1−p
+  # 최근 empirical로 f* 계산 후 1/4-Kelly cap (표준 risk-averse)
+  # f* ≤ 0 (negative edge)이면 min_size로 떨어짐 — 학습 지속 가능
+  kelly_sizing:
+    enabled: true
+    fraction: 0.25                  # 1/4-Kelly (보수)
+    lookback_trades: 50             # 최근 50트레이드 empirical로 WR/RR 추정
+    min_size_pct: 0.10              # f*≤0일 때 최소 10% (탐색 유지)
+    max_size_pct: 0.50              # f*>0일 때 상한 50% (과집중 방지)
 
   # === $100K 타겟 ===
   # 전체 시스템이 이 목표를 향해 공격성 자동 조절
@@ -96,73 +114,75 @@ treasury:
 risk:
   max_position_pct: 0.95        # 풀시드 집중: $188 × 95% = $178.6 마진
   min_order_notional: 5         # 알트코인 최소 $5
-  max_daily_loss_pct: 0.06      # 일 최대 손실 6% (공격 모드 완화)
-  max_drawdown_pct: 0.20        # MDD 20% (공격 모드 완화)
-  stop_loss_pct: 0.015          # 1.5% SL (fallback — ATR 없을 때만)
-  take_profit_pct: 0.030        # 3.0% TP (fallback — ATR 없을 때만)
+  max_daily_loss_pct: 0.04      # 0.06 → 0.04 (수학적: EV<0 구간에선 위축 필요)
+  max_drawdown_pct: 0.15        # 0.20 → 0.15 (MDD 타이트닝)
+  stop_loss_pct: 0.020          # 0.015 → 0.020 (ATR 없을 때 fallback)
+  take_profit_pct: 0.050        # 0.030 → 0.050 (RR 2.5:1 — 수학적 BE_WR 28.6%)
   max_open_positions: 1         # LIVE 1포지션 제한
-  cooldown_after_losses: 3      # 2→3 (공격 모드 — 손절 후 쿨다운 완화)
-  cooldown_minutes: 20          # 30→20
+  cooldown_after_losses: 2      # 3 → 2 (EV<0일 땐 쉬어가기)
+  cooldown_minutes: 30          # 20 → 30 (노이즈 구간 회피)
 
-  # === ATR 기반 동적 SL/TP (공격 롱 모드 — 손절 최대한 안치도록 wider) ===
-  atr_sl_multiplier: 2.5        # 2.0 → 2.5 (SL 더 멀리 = 노이즈 내성 ↑)
-  atr_tp_multiplier: 4.0        # 3.5 → 4.0 (RR 1.6:1 유지)
-  sl_floor_pct: 0.015           # 1.0 → 1.5% (최소 SL 넓힘)
-  sl_cap_pct: 0.040             # 3.0 → 4.0% (최대 SL 확장)
+  # === ATR 기반 동적 SL/TP (수학적 재조정 2026-04-20) ===
+  # 최근 empirical: avg_win $1.3 vs avg_loss $2.3 → BE_WR 64% (도달 불가)
+  # 수정: SL floor 2% (1σ 노이즈 밖), TP/SL RR 2.5:1 최소 → BE_WR 28.6%
+  atr_sl_multiplier: 3.0        # 2.5 → 3.0 (SL을 3σ 밖 = 노이즈 안전)
+  atr_tp_multiplier: 7.5        # 4.0 → 7.5 (RR 2.5:1 수학적 필수 조건)
+  sl_floor_pct: 0.020           # 0.015 → 0.020 (최소 2% — 1.5σ 노이즈 내성)
+  sl_cap_pct: 0.045             # 0.040 → 0.045 (상한 확대)
+  tp_floor_pct: 0.050           # 신설 — TP 최소 5% (RR 2.5:1 강제)
+  min_rr_ratio: 2.5             # 신설 — 모든 SL/TP에 대해 최소 RR 2.5:1 강제
 
   dynamic_leverage:
     enabled: true
-    base: 2                     # 3 → 2 (레버리지 하향 — SL 히트 방어)
-    min: 2                      # 약한 시그널도 2x 유지
-    max: 3                      # 5 → 3 (공격 롱은 레버리지 대신 holding으로)
+    base: 2                     # 레버리지 보수 — SL 히트 시 margin 충격 완화
+    min: 2
+    max: 3                      # 상한 3x (Kelly 분수 계산과 매칭)
 
-  # === 종목별 스캘핑 프로파일 (ATR fallback용) ===
+  # === 종목별 스캘핑 프로파일 (수학적 재조정 2026-04-20) ===
+  # 모든 프로파일 RR ≥ 2.5:1 강제 (EV 양수 조건: WR > 28.6%)
+  # SL은 각 심볼 15m ATR × 2.5~3.0 기준 (노이즈 밖)
   scalp_profiles:
     BTC:
-      tp_pct: 0.018       # 1.8% TP
-      sl_pct: 0.010       # 1.0% SL (RR 1.8:1)
+      tp_pct: 0.040       # 4.0% TP (1.8 → 4.0)
+      sl_pct: 0.016       # 1.6% SL (1.0 → 1.6) | RR 2.5:1
       priority: 2
     ETH:
-      tp_pct: 0.020       # 2.0% TP
-      sl_pct: 0.012       # 1.2% SL (RR 1.67:1)
+      tp_pct: 0.045       # 4.5% TP (2.0 → 4.5)
+      sl_pct: 0.018       # 1.8% SL (1.2 → 1.8) | RR 2.5:1
       priority: 3
     SOL:
-      tp_pct: 0.025       # 2.5% TP
-      sl_pct: 0.015       # 1.5% SL (RR 1.67:1)
+      tp_pct: 0.055       # 5.5% TP (2.5 → 5.5)
+      sl_pct: 0.022       # 2.2% SL (1.5 → 2.2) | RR 2.5:1
       priority: 1
     DOGE:
-      tp_pct: 0.025       # 2.5% TP
-      sl_pct: 0.015       # 1.5% SL (RR 1.67:1)
+      tp_pct: 0.060       # 6.0% TP (2.5 → 6.0)
+      sl_pct: 0.024       # 2.4% SL (1.5 → 2.4) | RR 2.5:1
       priority: 4
-    # 상장 시그널 코인
-    LISTING:
-      tp_pct: 0.050       # 5.0% TP (큰 움직임 기대)
-      sl_pct: 0.020       # 2.0% SL
-      priority: 0          # 최우선
 
 trailing_stop:
-  # fallback (trade_profiles 없을 때)
-  activate_pct: 0.015
-  distance_pct: 0.008
-  step_pct: 0.004
+  # fallback (trade_profiles 없을 때) — 수학적 재조정 2026-04-20
+  activate_pct: 0.025      # 0.015 → 0.025 (2.5% 수익 확보 후 트레일링 시작)
+  distance_pct: 0.015      # 0.008 → 0.015 (1.5% 간격, 찔끔 청산 방지)
+  step_pct: 0.005
 
-# === 공격 롱 + 시간 기반 가드 전략 (2026-04-18 재조정) ===
-# "손절 최대한 안치고 오래 hold" 방향 — SL 넓히고 max_hold를 시간 가드로 전환
+# === 수학적 최적화 전략 (2026-04-20 재조정) ===
+# 목표: EV 양수화 (현 -$0.96/trade → +값)
+# 수단: RR 2.5:1 강제 + SL widening + trailing stop 늦추기
 trade_profiles:
   scalp:
     sources: ["ML", "ML_val", "MOM", "RSI_extreme", "RL", "EXT", "EXT_boost"]
-    max_risk_pct: 0.06     # 4% → 6% (1거래 risk budget 완화)
-    sl_pct: 0.015          # 1.0 → 1.5% SL
-    tp_pct: 0.030          # 1.5 → 3.0% TP (RR 2.0:1)
-    sl_floor_pct: 0.015
-    sl_cap_pct: 0.025
-    atr_sl_multiplier: 2.0  # 1.5 → 2.0 (SL 멀리)
-    atr_tp_multiplier: 4.0  # 3.0 → 4.0
+    max_risk_pct: 0.04     # 0.06 → 0.04 (Kelly 분수 고려 — EV<0 구간에선 축소)
+    sl_pct: 0.020          # 0.015 → 0.020 SL
+    tp_pct: 0.050          # 0.030 → 0.050 TP (RR 2.5:1)
+    sl_floor_pct: 0.020    # 0.015 → 0.020
+    sl_cap_pct: 0.030      # 0.025 → 0.030
+    atr_sl_multiplier: 3.0  # 2.0 → 3.0 (3σ 노이즈 밖)
+    atr_tp_multiplier: 7.5  # 4.0 → 7.5 (RR 2.5:1 매칭)
     trailing:
-      activate_pct: 0.015   # 1.5% 수익 시 트레일링 활성화 (기존 1%)
-      distance_pct: 0.012   # 0.8% → 1.2% (찔끔 방지 강화)
-      step_pct: 0.004
-    max_hold_minutes: 240   # 60 → 240 (4시간 — SL 대신 시간 가드로 방어)
+      activate_pct: 0.025   # 0.015 → 0.025 (2.5% 수익 확보 후 시작)
+      distance_pct: 0.015   # 0.012 → 0.015 (찔끔 방지 강화)
+      step_pct: 0.005
+    max_hold_minutes: 240   # 4시간 유지
 
 ml:
   retrain_interval_hours: 24
@@ -197,7 +217,7 @@ external:
   weight: 0.2              # 외부 요인 가중치 완화 (0.3→0.2, 매크로 영향 축소)
   update_interval_min: 15
   sources:
-    fear_greed: true
+    # fear_greed 제거됨 (후행지표, 예측력 없음 — 2026-04-20)
     news: true
     sentiment: true
     onchain: true

@@ -11,7 +11,6 @@ from datetime import datetime
 
 from loguru import logger
 
-from .fear_greed import FearGreedCollector
 from .macro_collector import MacroCollector
 from .news_collector import NewsCollector
 from .onchain_collector import OnchainCollector
@@ -30,7 +29,7 @@ class ExternalDataManager:
     모든 외부 데이터 소스를 통합 관리
 
     데이터 흐름:
-    1. 뉴스/소셜/온체인/매크로/공포탐욕/파생상품 수집 (비동기 병렬)
+    1. 뉴스/소셜/온체인/매크로/파생상품 수집 (비동기 병렬) [공포탐욕 제거]
     2. 뉴스+소셜 텍스트 → 센티먼트 분석
     3. 계절 사이클 → 반감기/시즌 분석
     4. 멀티타임프레임 → 합류 분석 (별도 호출)
@@ -41,10 +40,9 @@ class ExternalDataManager:
     def __init__(self, config: dict | None = None):
         config = config or {}
 
-        # 기존 수집기
+        # 기존 수집기 (공포탐욕 제거됨 — 후행지표, 예측력 없음)
         self.news = NewsCollector()
         self.sentiment = SentimentAnalyzer()
-        self.fear_greed = FearGreedCollector()
         self.onchain = OnchainCollector()
         self.macro = MacroCollector()
         self.social = SocialCollector()
@@ -90,10 +88,9 @@ class ExternalDataManager:
             # 심볼 단축 (BTCUSDT → BTC)
             short_symbol = binance_symbol.replace("USDT", "")
 
-            # 병렬 데이터 수집 (모든 소스 동시)
+            # 병렬 데이터 수집 (모든 소스 동시) [공포탐욕 제거]
             await asyncio.gather(
                 self.news.fetch(),
-                self.fear_greed.fetch(),
                 self.onchain.fetch(),
                 self.macro.fetch(),
                 self.social.fetch(),
@@ -109,9 +106,7 @@ class ExternalDataManager:
             texts.extend(self.social.get_titles())
             sentiment_features = self.sentiment.analyze_batch(texts, symbol)
 
-            # 각 모듈의 피처 수집
-            # 공포탐욕은 수집은 하되 ML 피처로는 사용 안 함 (후행 지표, 예측력 없음)
-            fg_features = self.fear_greed.get_features()
+            # 각 모듈의 피처 수집 (공포탐욕 완전 제거)
             onchain_features = self.onchain.get_features()
             macro_features = self.macro.get_features()
             news_features = self.news.get_features(symbol)
@@ -152,9 +147,9 @@ class ExternalDataManager:
                 **real_macro_features,
             }
 
-            # 종합 외부 신호 계산
+            # 종합 외부 신호 계산 (공포탐욕 제거됨)
             self.composite_signal = self._compute_composite_signal(
-                fg_features, onchain_features, macro_features,
+                onchain_features, macro_features,
                 sentiment_features, news_features, social_features,
                 seasonal_features, derivatives_features, twitter_features,
                 polymarket_features, real_macro_features,
@@ -206,35 +201,29 @@ class ExternalDataManager:
         return self.multi_tf.calculate_confluence()
 
     def _compute_composite_signal(
-        self, fg: dict, onchain: dict, macro: dict,
+        self, onchain: dict, macro: dict,
         sentiment: dict, news: dict, social: dict,
         seasonal: dict, derivatives: dict, twitter: dict | None = None,
         polymarket: dict | None = None, real_macro: dict | None = None,
     ) -> dict:
         """
-        종합 외부 신호 계산 (v5 - 실제 매크로 데이터 추가)
+        종합 외부 신호 계산 (v7 - 공포탐욕 완전 제거)
 
-        가중치 (총 100%):
-        - 파생상품 (펀딩비/OI/롱숏): 16% ← 선물 핵심
-        - 크립토 트위터/Stocktwits:   14% ← 실시간 소셜
-        - 실제 매크로 (유가/DXY/VIX): 12% ← 전통 금융 (신규)
-        - Polymarket 예측 시장:        7% ← 내부자 베팅 패턴
-        - 계절 사이클:                 8% ← 10년 검증 패턴
-        - Fear & Greed:              10% (역발상 + 순방향)
-        - NLP 센티먼트:               9%
-        - 매크로 (CoinGecko):         6%
-        - 온체인:                      8%
-        - Reddit 소셜:                6%
-        - 뉴스:                        4%
+        가중치 (총 100%, 공포탐욕 10% → 파생/트위터/매크로에 재분배):
+        - 파생상품 (펀딩비/OI/롱숏): 20% ← 선물 핵심 (18→20)
+        - 크립토 트위터/Stocktwits:   16% ← 실시간 소셜 (15→16)
+        - 실제 매크로 (유가/DXY/VIX): 16% ← 전통 금융 (14→16)
+        - NLP 센티먼트:               11% (10→11)
+        - 온체인:                      11% (10→11)
+        - Polymarket 예측 시장:        8%
+        - 계절 사이클:                 8%
+        - 매크로 (CoinGecko):          7%
+        - Reddit 소셜:                 7% (6→7)
+        - 뉴스 (이벤트 임팩트 반영):  -
         """
         twitter = twitter or {}
         polymarket = polymarket or {}
         real_macro = real_macro or {}
-
-        # 각 카테고리 점수 (-1 ~ 1)
-        # [제거됨] 공포탐욕 지수 — 후행 지표, 예측력 없음, 노이즈만 추가
-        fg_score = 0.0
-        fg_contrarian = 0.0
 
         sentiment_score = sentiment.get("sentiment_avg", 0)
         macro_score = macro.get("macro_composite_score", 0)
@@ -263,18 +252,17 @@ class ExternalDataManager:
         real_macro_score = real_macro.get("real_macro_composite_score", 0)
         geo_risk = real_macro.get("real_macro_geo_risk", 0)
 
-        # 가중 평균 (v6 - 공포탐욕 제거, 비중 재분배)
+        # 가중 평균 (v7 - 공포탐욕 10% 완전 제거, 예측력 있는 소스에 재분배)
         composite = (
-            deriv_score * 0.18 +             # 파생상품 (16→18)
-            twitter_score * 0.15 +           # 크립토 트위터 (14→15)
-            real_macro_score * 0.14 +        # 실제 매크로 (12→14)
-            poly_score * 0.08 +              # Polymarket 예측 시장 (7→8)
-            seasonal_score * 0.08 +          # 계절 사이클 (유지)
-            sentiment_score * 0.10 +         # NLP 센티먼트 (9→10)
-            macro_score * 0.07 +             # 매크로 CoinGecko (6→7)
-            onchain_score * 0.10 +           # 온체인 (8→10)
-            social_score * 0.06 +            # Reddit 소셜 (유지)
-            0.0 * 0.04                       # 뉴스 (이벤트 임팩트로 반영)
+            deriv_score * 0.20 +             # 파생상품 (18→20)
+            twitter_score * 0.16 +           # 크립토 트위터 (15→16)
+            real_macro_score * 0.16 +        # 실제 매크로 (14→16)
+            sentiment_score * 0.11 +         # NLP 센티먼트 (10→11)
+            onchain_score * 0.11 +           # 온체인 (10→11)
+            poly_score * 0.08 +              # Polymarket 예측 시장
+            seasonal_score * 0.08 +          # 계절 사이클
+            macro_score * 0.07 +             # 매크로 CoinGecko
+            social_score * 0.07              # Reddit 소셜 (6→7)
         )
 
         # 지정학 리스크가 높으면 변동성 증가 → 포지션 축소 시그널
@@ -334,7 +322,6 @@ class ExternalDataManager:
                 "real_macro": round(real_macro_score, 3),
                 "polymarket": round(poly_score, 3),
                 "seasonal": round(seasonal_score, 3),
-                "fear_greed": round(fg_score, 3),
                 "sentiment": round(sentiment_score, 3),
                 "macro": round(macro_score, 3),
                 "onchain": round(onchain_score, 3),
@@ -371,7 +358,6 @@ class ExternalDataManager:
             "enabled": self.enabled,
             "last_update": self.last_update.isoformat() if self.last_update else None,
             "composite_signal": self.composite_signal,
-            "fear_greed": self.fear_greed.current,
             "news_count": len(self.news.news),
             "social_posts": len(self.social.posts),
             "sentiment_trend": self.sentiment.get_sentiment_trend(),

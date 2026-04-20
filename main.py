@@ -191,11 +191,10 @@ class AutoTrader:
         self._daily_dd_trigger_time = None
         self._daily_dd_threshold_pct = -3.0  # LIVE 일 누적 PnL / 초기자본 < -3% → 24h LIVE 정지
 
-        # 외부 요인 알림 상태 추적
+        # 외부 요인 알림 상태 추적 (공포탐욕 제거됨)
         self._ext_alert_state = {
             "last_composite_score": 0.0,
             "last_macro_score": 0.0,
-            "last_fg_value": 50,
             "last_oil_price": 0.0,
             "last_dxy": 0.0,
             "last_vix": 0.0,
@@ -392,22 +391,7 @@ class AutoTrader:
                     }))
                     _mark_alerted("composite_shift")
 
-            # === 4. 공포탐욕 극단값 ===
-            fg = self.external_manager.fear_greed.current
-            fg_value = fg.get("value", 50)
-
-            if _can_alert("fear_greed_extreme", cooldown_min=120):
-                # 극단적 공포 (10 이하) or 극단적 탐욕 (90 이상)
-                if fg_value <= 10 and st["last_fg_value"] > 10:
-                    tg_notify(format_external_alert("fear_greed_extreme", {
-                        "value": fg_value, "label": "극단적 공포 (Extreme Fear)",
-                    }))
-                    _mark_alerted("fear_greed_extreme")
-                elif fg_value >= 90 and st["last_fg_value"] < 90:
-                    tg_notify(format_external_alert("fear_greed_extreme", {
-                        "value": fg_value, "label": "극단적 탐욕 (Extreme Greed)",
-                    }))
-                    _mark_alerted("fear_greed_extreme")
+            # === 4. [제거됨] 공포탐욕 극단값 — 후행 지표라 알림 가치 없음 ===
 
             # === 5. 센티먼트 급변 ===
             sent = self.external_manager.all_features.get("sentiment_avg", 0)
@@ -427,8 +411,6 @@ class AutoTrader:
             # 상태 업데이트
             st["last_composite_score"] = new_cs_score
             st["last_macro_score"] = rm_score
-            if fg_value > 0:
-                st["last_fg_value"] = fg_value
             if oil > 0:
                 st["last_oil_price"] = oil
             if dxy > 0:
@@ -1294,9 +1276,9 @@ class AutoTrader:
         momentum_signal = self._calculate_momentum(df)
 
         # 5. 전략 결정 (ML + RL + 외부 요인 + MTF + 모멘텀 + 레짐 바이어스 통합)
+        # [공포탐욕 제거] 후행 지표라 예측력 없음 — 매크로/파생상품/센티먼트로 대체
         ext_features_all = self.external_manager.get_all_features()
         funding_rate = ext_features_all.get("deriv_funding_rate", 0)
-        fear_greed = 50.0  # [제거됨] 공포탐욕 지수 비활성화
 
         current_position = 0.0
         if self.mode in ("paper", "dual"):
@@ -1314,7 +1296,6 @@ class AutoTrader:
             momentum=momentum_signal,
             feedback_blacklist=fb_blacklist,
             funding_rate=funding_rate,
-            fear_greed_index=fear_greed,
             mode=decide_mode,
         )
 
@@ -1869,10 +1850,9 @@ class AutoTrader:
             # 피드백 블랙리스트 조회
             fb_blacklist = self.feedback.get_entry_blacklist()
 
-            # 펀딩비 + 공포탐욕 지수 (레짐 바이어스용)
+            # 펀딩비 (레짐 바이어스용) — 공포탐욕 제거됨
             ext_features = self.external_manager.get_all_features()
             funding_rate = ext_features.get("deriv_funding_rate", 0)
-            fear_greed = 50.0  # [제거됨] 공포탐욕 지수 비활성화
 
             current_position = 1.0 if symbol in self.paper_trader.positions else 0.0
             # concentration 모드에서 _analyze_symbol은 주로 LIVE 후보 선정 목적
@@ -1883,7 +1863,6 @@ class AutoTrader:
                 momentum=momentum_signal,
                 feedback_blacklist=fb_blacklist,
                 funding_rate=funding_rate,
-                fear_greed_index=fear_greed,
                 mode=decide_mode,
             )
 
@@ -2303,6 +2282,15 @@ class AutoTrader:
         if self.mode not in ("live", "dual"):
             return
         symbol = c.get("symbol", "?")
+        # === LIVE 심볼 화이트리스트 (수학적 최적화, 2026-04-20) ===
+        # 알트 투기 차단 — 엣지 검증된 심볼(BTC/ETH/SOL/DOGE)만 실거래 허용
+        live_whitelist = self.config.get("trading", {}).get("live_symbol_whitelist")
+        if live_whitelist and symbol not in live_whitelist:
+            logger.info(
+                f"[LIVE-Whitelist] {symbol} 차단 — 허용된 심볼 아님 "
+                f"(허용: {live_whitelist})"
+            )
+            return
         # === 티어 심볼 필터 (LIVE) ===
         if not self.tier_manager.allowed_symbol(symbol, mode="live"):
             logger.info(
@@ -2310,6 +2298,21 @@ class AutoTrader:
                 f"심볼 아님 (허용: {self.tier_manager.get_symbols('live')})"
             )
             return
+        # === Quant score 게이트 (엣지 없는 구간 차단, 2026-04-20) ===
+        # |quant_alpha_score| < 0.25 면 진입 포기 — 최근 LIVE 손실 대부분 |score|<0.2 구간
+        quant_min = self.config.get("trading", {}).get("live_quant_score_min", 0.25)
+        if quant_min > 0:
+            qs = c.get("quant_alpha_score")
+            if qs is None:
+                # 분석결과에서 quant score 추출 — 없으면 0으로 보수적 처리
+                qs_dict = c.get("quant", {}) or {}
+                qs = qs_dict.get("alpha_score", 0.0)
+            if abs(float(qs)) < quant_min:
+                logger.info(
+                    f"[Quant-Gate] {symbol} LIVE 차단 — |score|={abs(float(qs)):.3f} "
+                    f"< 최소 {quant_min:.2f} (엣지 부족)"
+                )
+                return
         # [LIVE_LONG_ONLY] LIVE만 숏 차단 (PAPER는 이미 상위에서 실행됨)
         if (
             getattr(self.strategy_manager, "live_long_only", False)
@@ -2354,10 +2357,33 @@ class AutoTrader:
             try:
                 balance = await om.exchange.get_balance()
                 live_free = balance.get("free", 0)
-                # 가용 잔고의 90% × optimizer 스케일
-                live_size = live_free * 0.90 * opt_scale
+
+                # === Kelly 분수 사이징 (수학적 최적화, 2026-04-20) ===
+                # f* = (p·b − q) / b, b=win/loss_ratio, p=WR, q=1-p
+                # 최근 50 LIVE 트레이드 empirical로 계산 → 1/4-Kelly cap
+                # f*≤0 (negative edge)이면 min_size로 축소 (탐색 유지)
+                kelly_cfg = self.config.get("trading", {}).get("kelly_sizing", {}) or {}
+                base_alloc = 0.90  # 기본 잔고 90%
+                if kelly_cfg.get("enabled", False):
+                    try:
+                        f_frac = self._compute_live_kelly(
+                            lookback=int(kelly_cfg.get("lookback_trades", 50)),
+                            fraction=float(kelly_cfg.get("fraction", 0.25)),
+                        )
+                        min_s = float(kelly_cfg.get("min_size_pct", 0.10))
+                        max_s = float(kelly_cfg.get("max_size_pct", 0.50))
+                        base_alloc = max(min_s, min(max_s, f_frac))
+                        logger.info(
+                            f"[Kelly-LIVE] {symbol} f*={f_frac:.3f} → alloc={base_alloc:.1%} "
+                            f"(min={min_s:.0%}, max={max_s:.0%})"
+                        )
+                    except Exception as e:
+                        logger.debug(f"[Kelly-LIVE] 계산 실패, 기본값 사용: {e}")
+
+                # 가용 잔고의 base_alloc × optimizer 스케일
+                live_size = live_free * base_alloc * opt_scale
                 if live_size < self.min_order_notional / c["dynamic_lev"]:
-                    logger.warning(f"[LIVE] 잔고 부족: ${live_free:.2f} × {opt_scale:.1f} (필요: ${self.min_order_notional / c['dynamic_lev']:.2f})")
+                    logger.warning(f"[LIVE] 잔고 부족: ${live_free:.2f} × {opt_scale:.1f} × {base_alloc:.2f} (필요: ${self.min_order_notional / c['dynamic_lev']:.2f})")
                     return
                 c["size"] = live_size
                 c["notional"] = live_size * c["dynamic_lev"]
@@ -3323,6 +3349,53 @@ class AutoTrader:
             logger.debug(f"[진단] 일일 DD 체크 실패: {e}")
 
         return None
+
+    def _compute_live_kelly(self, lookback: int = 50, fraction: float = 0.25) -> float:
+        """Kelly 분수 계산 — LIVE empirical WR/RR 기반.
+
+        공식: f* = (p·b − q) / b
+          p = WR (win rate), q = 1-p, b = avg_win / avg_loss
+
+        최근 N LIVE 트레이드(HIPPO 과거 노이즈 제외)에서 p, b 추정 →
+        fractional Kelly (1/4) 적용 → 최종 allocation 반환.
+
+        Returns: 0.0~1.0 (잔고 대비 포지션 비율). 엣지 없으면 0 반환 (콜러가 min_size 적용).
+        """
+        try:
+            cursor = self.storage.conn.execute(
+                """
+                SELECT pnl FROM trades
+                WHERE mode='LIVE' AND symbol != 'HIPPO/USDT:USDT'
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (int(lookback),),
+            )
+            pnls = [float(r[0]) for r in cursor.fetchall() if r and r[0] is not None]
+            if len(pnls) < 10:
+                # 표본 부족 — 보수적으로 낮은 값 반환 (min_size로 fallback)
+                return 0.0
+            wins = [p for p in pnls if p > 0]
+            losses = [abs(p) for p in pnls if p < 0]
+            if not wins or not losses:
+                return 0.0
+            p_win = len(wins) / len(pnls)
+            q_loss = 1.0 - p_win
+            avg_win = sum(wins) / len(wins)
+            avg_loss = sum(losses) / len(losses)
+            b = avg_win / avg_loss  # payoff ratio
+            # Kelly fraction
+            f_star_full = (p_win * b - q_loss) / b if b > 0 else 0.0
+            # 분수 Kelly (보수: 1/4-Kelly 표준)
+            f_star = f_star_full * float(fraction)
+            logger.debug(
+                f"[Kelly] n={len(pnls)} WR={p_win:.2%} RR(b)={b:.2f} "
+                f"full_Kelly={f_star_full:.3f} frac({fraction:.2f})={f_star:.3f}"
+            )
+            # 음수 엣지 → 0 반환 (min_size 로 안전망)
+            return max(0.0, f_star)
+        except Exception as e:
+            logger.debug(f"[Kelly] 계산 오류: {e}")
+            return 0.0
 
     async def _strategic_self_review(self):
         """4시간마다 실행 — 자체 거래 패턴 분석 + 전략 자동 조정
