@@ -40,6 +40,24 @@ class XGBoostPredictor:
 
         prev_accuracy = self.accuracy
 
+        # === 피처 수 불일치 감지 (2026-04-20 추가) ===
+        # BTC cross-asset 피처 추가 / derivatives 시계열 조인 등으로
+        # 새 데이터의 피처 수가 기존 booster와 다르면 증분학습 불가
+        # → 자동으로 최초학습으로 전환 (feature-drift resilience)
+        if self.model is not None:
+            try:
+                prev_n_feat = self.model.get_booster().num_features()
+                new_n_feat = X_train.shape[1]
+                if prev_n_feat != new_n_feat:
+                    logger.warning(
+                        f"XGBoost 피처 수 불일치 감지: 기존={prev_n_feat}개 vs 신규={new_n_feat}개 "
+                        f"→ 증분학습 불가, 최초학습으로 전환"
+                    )
+                    self.model = None
+                    prev_accuracy = 0.0  # 정확도 비교 비활성화 (롤백 방지)
+            except Exception as e:
+                logger.debug(f"XGBoost 피처 수 비교 실패 (무시): {e}")
+
         if self.model is not None:
             # === 기존 모델 이어서 학습 (incremental) ===
             logger.info(f"XGBoost 증분학습 시작 (기존 정확도: {prev_accuracy:.4f}) | balanced sample_weight 적용")
