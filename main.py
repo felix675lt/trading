@@ -1868,7 +1868,7 @@ class AutoTrader:
                     volatility=_local.get("volatility", 0.01),
                 )
             except Exception as e:
-                logger.debug(f"[A/B-Shadow] {symbol} 실행 생략: {e}")
+                logger.warning(f"[A/B-Shadow] {symbol} 실행 생략: {e}")
 
     # =========================================================================
     # 집중 매매 모드 메서드 (concentration_mode=true)
@@ -2115,7 +2115,7 @@ class AutoTrader:
                     },
                 )
             except Exception as e:
-                logger.debug(f"[DB] signal 저장 실패: {e}")
+                logger.warning(f"[DB] signal 저장 실패: {e}")
 
             # === A/B 섀도우 variant (MACRO_OFF) — 집중모드에서도 병렬 실행 ===
             # primary가 hold여도 shadow는 독립 결정 → 매 tick 병렬 관측
@@ -2140,7 +2140,7 @@ class AutoTrader:
                         volatility=volatility,
                     )
                 except Exception as e:
-                    logger.debug(f"[A/B-Shadow-집중] {symbol} 실행 생략: {e}")
+                    logger.warning(f"[A/B-Shadow-집중] {symbol} 실행 생략: {e}")
 
             if decision.action not in ("long", "short", "close"):
                 return None
@@ -2177,7 +2177,7 @@ class AutoTrader:
             }
 
         except Exception as e:
-            logger.debug(f"[집중분석] {symbol} 분석 실패: {e}")
+            logger.warning(f"[집중분석] {symbol} 분석 실패: {e}")
             return None
 
     async def _execute_paper(self, c: dict):
