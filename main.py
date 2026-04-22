@@ -1339,6 +1339,7 @@ class AutoTrader:
             feedback_blacklist=fb_blacklist,
             funding_rate=funding_rate,
             mode=decide_mode,
+            ohlcv_df=df,
         )
 
         # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
@@ -1934,6 +1935,7 @@ class AutoTrader:
                 feedback_blacklist=fb_blacklist,
                 funding_rate=funding_rate,
                 mode=decide_mode,
+                ohlcv_df=df,
             )
 
             # MTF 필터 적용
@@ -2771,6 +2773,7 @@ class AutoTrader:
                 funding_rate=funding_rate,
                 mode="paper",
                 variant_override={"disable_macro_block": True},
+                ohlcv_df=df,
             )
 
             # MTF 필터 — primary와 동일 로직 (양쪽 동일 적용해야 macro 차이만 분리됨)

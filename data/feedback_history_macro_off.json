@@ -1,0 +1,113 @@
+{
+  "pattern_scores": {},
+  "hourly_performance": {
+    "1": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -162.865134578143
+    },
+    "2": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -153.45515070376786
+    },
+    "3": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -273.63018573555325
+    }
+  },
+  "regime_performance": {
+    "strong_uptrend": {
+      "wins": 0,
+      "losses": 3,
+      "total_pnl": -589.9504710174641
+    }
+  },
+  "symbol_performance": {
+    "ETH/USDT:USDT": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -162.865134578143
+    },
+    "SOL/USDT:USDT": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -153.45515070376786
+    },
+    "DOGE/USDT:USDT": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -273.63018573555325
+    }
+  },
+  "direction_performance": {
+    "short": {
+      "wins": 0,
+      "losses": 3,
+      "total_pnl": -589.9504710174641
+    }
+  },
+  "signal_accuracy": {
+    "strong": {
+      "wins": 0,
+      "losses": 1
+    },
+    "weak": {
+      "wins": 0,
+      "losses": 2
+    }
+  },
+  "external_accuracy": {
+    "bearish": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -162.865134578143
+    },
+    "agreed": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -162.865134578143
+    },
+    "ext_moderate": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -162.865134578143
+    }
+  },
+  "entry_path_performance": {
+    "RL": {
+      "wins": 0,
+      "losses": 1,
+      "total_pnl": -162.865134578143,
+      "trades": [
+        {
+          "pnl": -162.8651,
+          "time": "2026-04-22 01:00:09.847778"
+        }
+      ]
+    }
+  },
+  "exit_reason_analysis": {
+    "strategy_close_shadow": {
+      "count": 1,
+      "total_pnl": -162.865134578143,
+      "avg_pnl": -162.865134578143
+    },
+    "SL \ub3c4\ub2ec": {
+      "count": 2,
+      "total_pnl": -427.0853364393211,
+      "avg_pnl": -213.54266821966056
+    }
+  },
+  "entry_blacklist": [],
+  "loss_patterns": {
+    "strong_uptrend_short_asia": {
+      "count": 3,
+      "total_loss": -589.9504710174641
+    }
+  },
+  "lessons": [],
+  "adjustments": {},
+  "total_analyzed": 3
+}

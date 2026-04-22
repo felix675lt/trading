@@ -56,7 +56,8 @@ class AdaptiveOptimizer:
             "strong_uptrend": {
                 "signal_threshold": 0.1,
                 "min_confidence": 0.5,
-                "position_scale": 1.2,
+                # [2026-04-23] 1.2 → 0.5 — 상승 LONG 표본 n=3 소규모, fade 교정 초기단계라 축소
+                "position_scale": 0.5,
                 "stop_loss_mult": 1.5,
                 "prefer_direction": "long",
             },

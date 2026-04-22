@@ -50,6 +50,22 @@ class StrategyManager:
         self.long_only = config.get("long_only", False)
         self.live_long_only = config.get("live_long_only", False)
 
+        # === BREAKOUT vote source config (2026-04-23 옵션 C) ===
+        bv = config.get("breakout_vote", {}) or {}
+        self.breakout_enabled = bool(bv.get("enabled", False))
+        self.breakout_lookback = int(bv.get("lookback_bars", 20))
+        self.breakout_vol_z_min = float(bv.get("volume_z_min", 1.5))
+        self.breakout_atr_ratio_min = float(bv.get("atr_ratio_min", 0.005))
+        self.breakout_regimes_long = set(bv.get("allowed_regimes_long", []) or [])
+        self.breakout_regimes_short = set(bv.get("allowed_regimes_short", []) or [])
+        self.breakout_vote_weight = float(bv.get("vote_weight", 0.55))
+        if self.breakout_enabled:
+            logger.info(
+                f"[Strategy] BREAKOUT vote 활성 — N={self.breakout_lookback} "
+                f"volZ≥{self.breakout_vol_z_min} ATR%≥{self.breakout_atr_ratio_min} "
+                f"L레짐={sorted(self.breakout_regimes_long)} S레짐={sorted(self.breakout_regimes_short)}"
+            )
+
         # === LIVE 공격 롱 모드 (2026-04-18) ===
         # 매크로/지정학 하방 필터 완화 + 롱 확신도 부스트 + 낮은 임계값
         self.live_aggressive_long = config.get("live_aggressive_long", False)
@@ -116,6 +132,74 @@ class StrategyManager:
         """순수 스캘핑 모드 — 항상 scalp 반환"""
         return "scalp"
 
+    def _detect_breakout(self, ohlcv_df, regime: str) -> dict:
+        """Donchian N-bar 돌파 감지 (옵션 C, 2026-04-23)
+
+        Args:
+            ohlcv_df: DataFrame with columns [open, high, low, close, volume] (최신이 마지막)
+            regime: 현재 adaptive regime
+        Returns:
+            {"direction": "long"|"short"|"none", "strength": float 0-1, "reason": str}
+        """
+        if not self.breakout_enabled or ohlcv_df is None:
+            return {"direction": "none", "strength": 0.0, "reason": "disabled"}
+        try:
+            import numpy as _np
+            N = self.breakout_lookback
+            if len(ohlcv_df) < N + 14:  # ATR 14 + 롤링 윈도
+                return {"direction": "none", "strength": 0.0, "reason": "표본부족"}
+
+            close = float(ohlcv_df["close"].iloc[-1])
+            # rolling high/low는 마지막 바 제외 (exclusive)
+            prev_window = ohlcv_df.iloc[-(N + 1):-1]
+            prev_high = float(prev_window["high"].max())
+            prev_low = float(prev_window["low"].min())
+
+            # volume z-score (마지막 바 vs 직전 N봉)
+            vol_window = ohlcv_df["volume"].iloc[-(N + 1):-1]
+            vol_mean = float(vol_window.mean())
+            vol_std = float(vol_window.std()) + 1e-9
+            last_vol = float(ohlcv_df["volume"].iloc[-1])
+            vol_z = (last_vol - vol_mean) / vol_std
+
+            # ATR(14) 간이 계산
+            high = ohlcv_df["high"].iloc[-15:].values
+            low = ohlcv_df["low"].iloc[-15:].values
+            prev_close = ohlcv_df["close"].iloc[-16:-1].values
+            tr = _np.maximum.reduce([
+                high[-14:] - low[-14:],
+                _np.abs(high[-14:] - prev_close[-14:]),
+                _np.abs(low[-14:] - prev_close[-14:]),
+            ])
+            atr = float(_np.mean(tr))
+            atr_ratio = atr / max(close, 1e-9)
+
+            # 필터
+            if atr_ratio < self.breakout_atr_ratio_min:
+                return {"direction": "none", "strength": 0.0,
+                        "reason": f"죽은시장 ATR%={atr_ratio:.4f}"}
+            if vol_z < self.breakout_vol_z_min:
+                return {"direction": "none", "strength": 0.0,
+                        "reason": f"거래량부족 z={vol_z:.2f}"}
+
+            # 방향 판정
+            if close > prev_high and regime in self.breakout_regimes_long:
+                # 돌파 강도 = max(1.0, (close-prev_high)/ATR) / 2 + volZ 가산
+                excess = (close - prev_high) / max(atr, 1e-9)
+                strength = min(self.breakout_vote_weight + min(excess, 1.0) * 0.15, 1.0)
+                return {"direction": "long", "strength": strength,
+                        "reason": f"상승돌파 close={close:.4f}>PH={prev_high:.4f} volZ={vol_z:.2f} ATR%={atr_ratio:.3f}"}
+            if close < prev_low and regime in self.breakout_regimes_short:
+                excess = (prev_low - close) / max(atr, 1e-9)
+                strength = min(self.breakout_vote_weight + min(excess, 1.0) * 0.15, 1.0)
+                return {"direction": "short", "strength": strength,
+                        "reason": f"하락돌파 close={close:.4f}<PL={prev_low:.4f} volZ={vol_z:.2f} ATR%={atr_ratio:.3f}"}
+            return {"direction": "none", "strength": 0.0,
+                    "reason": f"돌파없음 close={close:.4f} PH={prev_high:.4f} PL={prev_low:.4f} regime={regime}"}
+        except Exception as e:
+            logger.warning(f"[BREAKOUT] 감지 실패: {e}")
+            return {"direction": "none", "strength": 0.0, "reason": f"error:{e}"}
+
     def _count_signal_votes(
         self,
         ml_direction: str, ml_confidence: float, ml_signal_val: float,
@@ -181,6 +265,7 @@ class StrategyManager:
         funding_rate: float = 0.0,
         mode: str = "paper",
         variant_override: dict | None = None,
+        ohlcv_df=None,
     ) -> TradeDecision:
         """최종 트레이딩 결정 (v5 - A/B variant 지원)
 
@@ -189,6 +274,7 @@ class StrategyManager:
             - "disable_macro_block": bool — True면 2.7/2.8 매크로 차단 스킵
             - "min_confidence_override": float | None — 최소 신뢰도 대체
             ※ variant_override는 순수 함수 오버라이드 (self 상태 변경 금지)
+        ohlcv_df: OHLCV 최근 N봉 (BREAKOUT vote source용, 2026-04-23 옵션 C)
         """
         vo = variant_override or {}
         # variant 오버라이드: 매크로 차단 정책
@@ -230,6 +316,20 @@ class StrategyManager:
             mom_direction, mom_strength, mom_rsi,
             ext_direction, ext_confidence,
         )
+
+        # 5번째 vote source: BREAKOUT (2026-04-23 옵션 C)
+        # Donchian N봉 돌파 + 거래량 확인 + 레짐 gate
+        breakout_info = {"direction": "none", "strength": 0.0, "reason": "skip"}
+        if self.breakout_enabled and ohlcv_df is not None:
+            breakout_info = self._detect_breakout(ohlcv_df, market_regime)
+            bd = breakout_info["direction"]
+            bs = breakout_info["strength"]
+            if bd == "long":
+                votes["long"].append(("BREAKOUT", bs))
+                logger.info(f"[BREAKOUT] LONG vote 추가: {breakout_info['reason']}")
+            elif bd == "short":
+                votes["short"].append(("BREAKOUT", bs))
+                logger.info(f"[BREAKOUT] SHORT vote 추가: {breakout_info['reason']}")
 
         long_votes = votes["long"]
         short_votes = votes["short"]
@@ -450,6 +550,11 @@ class StrategyManager:
                 "votes": {
                     "long": [(s, round(w, 3)) for s, w in long_votes],
                     "short": [(s, round(w, 3)) for s, w in short_votes],
+                },
+                "breakout": {
+                    "direction": breakout_info["direction"],
+                    "strength": round(breakout_info["strength"], 3),
+                    "reason": breakout_info["reason"],
                 },
                 "regime_bias": {
                     "funding_rate": round(funding_rate, 3),

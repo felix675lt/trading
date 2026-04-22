@@ -11,22 +11,26 @@ from core.models.xgboost_model import XGBoostPredictor
 class EnsembleSignalGenerator:
     """XGBoost + LSTM 앙상블 시그널 생성기"""
 
-    # === Regime-Conditional Signal Multiplier (2026-04-20 추가) ===
-    # PAPER 118건 실측 기반 가중치:
-    # - strong_uptrend: WR 13.8% (29건) → 역-선호. 일반 시장이 아닌 "추세 말단 과열" 패턴.
-    #   완전 반전(-1.0) 대신 보수적 -0.5로 설정 → 추종 매수 막고 약한 역추세 허용
-    # - strong_downtrend: WR 53.8% (13건) → 정상 (1.0)
-    # - unknown: WR 29.4% (17건) → 분류 실패 = 신호 신뢰 불가, 거래 중단 (0.0)
-    # - high_volume_breakout: WR 42.9% (7건) → 약한 edge, 50% 가중
-    # - normal/ranging: WR 36~50% → 그대로 사용
+    # === Regime-Conditional Signal Multiplier (2026-04-23 재조정) ===
+    # 이전 "WR 13.8%(29건)"은 방향 미분해 집계였음 → 재분해 결과:
+    # - strong_uptrend × LONG : n=3  WR 66.7% sum=+$13.90   (방향 긍정, 소표본)
+    # - strong_uptrend × SHORT: n=23 WR  0.0% sum=-$634.62  (fade 참사 — 원인)
+    # 즉, 이전 -0.5(fade) 가중치가 SHORT 진입을 유도 → 23건 전패.
+    # 교정: 상승추세 원신호 그대로 존중(1.0), 숏 차단은 long_only=true로 분리 enforce.
+    #
+    # - strong_downtrend × SHORT: n=3 WR 66.7% → 유지 (1.0)
+    # - high_volume_breakout × LONG: n=2 WR 50.0% +$21.91 → 돌파 edge 완전 반영 (1.0)
+    # - unknown: 분류 실패 = 신뢰 불가, 계속 0.0
+    # - extreme_volatility: Kelly f*→0, 계속 0.0
+    # - ranging: 양방향 음수 기댓값 (LONG -$10, SHORT -$237) → 보수 0.6로 강화
     REGIME_SIGNAL_WEIGHT = {
-        "strong_uptrend": -0.5,           # 부분 fade — 추세 말단 반전 포착
-        "strong_downtrend": 1.0,          # 정상 (WR 53.8% 검증)
+        "strong_uptrend": 1.0,            # [2026-04-23] -0.5 → 1.0 (fade 제거, 추세순응)
+        "strong_downtrend": 1.0,          # 정상 유지
         "unknown": 0.0,                   # 거래 중단
-        "high_volume_breakout": 0.5,      # 약한 edge
+        "high_volume_breakout": 1.0,      # [2026-04-23] 0.5 → 1.0 (돌파 edge 완전 반영)
         "extreme_volatility": 0.0,        # 고변동성 → 거래 중단 (Kelly f*→0)
         "normal": 1.0,
-        "ranging": 0.8,                   # 약간 보수
+        "ranging": 0.6,                   # [2026-04-23] 0.8 → 0.6 (양방향 음기댓값 확인)
     }
 
     def __init__(self, model_dir: str = "models_saved"):

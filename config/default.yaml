@@ -47,12 +47,36 @@ trading:
   max_concurrent_live: 1   # LIVE: 한 번에 1포지션만 (풀시드 올인)
   max_concurrent_paper: 4  # PAPER: 학습용으로 다중 가능
 
-  # === 방향 필터 (사용자 지시, 2026-04-17) ===
-  # PAPER: 롱숏 모두 허용 (학습 데이터 수집) — 현재 횡보장 판단
-  # LIVE : 롱만 진입 (숏 승률 24%, 롱 승률 93% — 실거래는 롱으로 고정)
-  # long_only: true 는 PAPER까지 숏 차단 (강력 모드, 비권장)
-  long_only: false
+  # === 방향 필터 (사용자 지시, 2026-04-23 재확정) ===
+  # 2026-04-17 해석: PAPER 양방향 허용 → 2026-04-22 사용자 재지시로 전역 숏 차단.
+  # 근거 데이터 (PAPER 실측 2026-04-23 기준):
+  #   - strong_uptrend SHORT n=23 WR 0.0% sum=-$634.62 (압도적 fade 참사)
+  #   - ranging       SHORT n=10 WR 30.0% sum=-$237.84
+  #   - 상승/횡보 SHORT 합계 n=33 WR 9% sum=-$871 — 통계적으로 거부.
+  # long_only=true: 전 모드(PAPER+LIVE) 숏 차단. strategy/manager.py:380에서 enforce.
+  long_only: true
   live_long_only: true
+
+  # === 돌파매매 vote source (2026-04-23 신설, 옵션 C) ===
+  # 학계 근거: Turtle(1983), Moskowitz-Ooi-Pedersen TS-MOM(2012), AQR Century(2017),
+  #           Liu-Tsyvinski crypto momentum(2021)
+  # 실측 근거 (위 long_only 블록 참조):
+  #   - strong_uptrend LONG  n=3 WR 66.7% sum=+$13.90 (소표본, 방향 긍정)
+  #   - high_volume_breakout LONG n=2 WR 50.0% sum=+$21.91
+  breakout_vote:
+    enabled: true
+    lookback_bars: 20              # N봉 최고가 경신 (Donchian N=20, Turtle 표준)
+    volume_z_min: 1.5              # 거래량 z-score ≥1.5σ (가짜 돌파 필터)
+    atr_ratio_min: 0.005           # ATR/price ≥0.5% (죽은 시장 배제)
+    allowed_regimes_long:
+      - strong_uptrend
+      - high_volume_breakout
+      - normal
+    # SHORT(breakdown) 허용 레짐 — long_only=true 동안은 무력
+    allowed_regimes_short:
+      - strong_downtrend
+      - high_volume_breakout
+    vote_weight: 0.55              # 단일 vote 가중치 (ML 수준)
 
   # === LIVE 수학적 최적화 모드 (2026-04-20 재조정) ===
   # 최근 empirical: WR 34%, avg_win $1.3, avg_loss $2.3 → BE_WR 64%, EV -$0.96/trade

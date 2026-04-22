@@ -63,8 +63,8 @@
     },
     "2": {
       "wins": 87,
-      "losses": 6,
-      "total_pnl": 350.46043922276647
+      "losses": 7,
+      "total_pnl": 313.9080306594341
     },
     "6": {
       "wins": 70,
@@ -155,8 +155,8 @@
     },
     "high_volume_breakout": {
       "wins": 4,
-      "losses": 14,
-      "total_pnl": -1.678044099471566
+      "losses": 15,
+      "total_pnl": -38.230452662803955
     }
   },
   "symbol_performance": {
@@ -177,8 +177,8 @@
     },
     "ETH/USDT:USDT": {
       "wins": 16,
-      "losses": 34,
-      "total_pnl": -165.9702800911785
+      "losses": 35,
+      "total_pnl": -202.5226886545109
     },
     "ON/USDT:USDT": {
       "wins": 0,
@@ -304,8 +304,8 @@
     },
     "short": {
       "wins": 42,
-      "losses": 129,
-      "total_pnl": -383.596157907111
+      "losses": 130,
+      "total_pnl": -420.14856647044337
     },
     "long": {
       "wins": 888,
@@ -316,7 +316,7 @@
   "signal_accuracy": {
     "weak": {
       "wins": 930,
-      "losses": 200
+      "losses": 201
     }
   },
   "external_accuracy": {},
@@ -393,13 +393,13 @@
     "avoid_hour_9": true,
     "avoid_hour_10": true
   },
-  "total_analyzed": 1130,
+  "total_analyzed": 1131,
   "entry_path_performance": {},
   "exit_reason_analysis": {
     "SL \ub3c4\ub2ec": {
-      "count": 79,
-      "total_pnl": -396.5548703608143,
-      "avg_pnl": -5.019681903301446
+      "count": 80,
+      "total_pnl": -433.10727892414667,
+      "avg_pnl": -5.4138409865518335
     },
     "tp": {
       "count": 2,
@@ -444,8 +444,8 @@
       "total_loss": -23.83085700293546
     },
     "high_volume_breakout_short_asia": {
-      "count": 2,
-      "total_loss": -10.847863505814798
+      "count": 3,
+      "total_loss": -47.40027206914719
     },
     "strong_uptrend_short_europe": {
       "count": 15,
