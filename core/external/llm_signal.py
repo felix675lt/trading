@@ -97,19 +97,27 @@ class LLMSignalEngine:
     """다중 백엔드 LLM 시그널 엔진.
 
     Backends (우선순위):
-      1) claude_native — Claude 3.5 Sonnet + DeepSeek 방법론(CoT+SC+Critique+EV)
-                         → DeepSeek API 없이 동등 이상 시그널 품질. ANTHROPIC_API_KEY만 필요.
+      1) claude_native — Claude Opus 4.x + Extended Thinking + Prompt Caching
+                         + DeepSeek 방법론(CoT, Self-Consistency, Critique, EV, Severity).
+                         → DeepSeek API 없이 동등/상회 품질. ANTHROPIC_API_KEY만 있으면 됨.
       2) deepseek  — DeepSeek-V3/R1 API (cost-effective)
-      3) anthropic — Claude 3.5 Sonnet (기본 단발 프롬프트)
+      3) anthropic — Claude Opus 4.5 기본 단발 (thinking/caching 없음, 저비용)
       4) openai    — GPT-4 (호환성↑)
       5) vader     — 로컬 폴백 (네트워크/API 없이 동작)
 
-    환경변수:
-      DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY
-      LLM_BACKEND=claude_native|deepseek|anthropic|openai|vader  (override)
-      LLM_CLAUDE_MODEL=claude-3-5-sonnet-latest  (선택)
-      LLM_CLAUDE_N_SAMPLES=3                     (self-consistency N)
-      LLM_CLAUDE_CRITIQUE=1                      (0=disable critic)
+    환경변수 (claude_native):
+      LLM_BACKEND=claude_native|deepseek|anthropic|openai|vader
+      LLM_CLAUDE_MODEL=claude-opus-4-5    # 사용자가 Opus 4.7 쓰면 공식 ID로 변경
+      LLM_CLAUDE_N_SAMPLES=3              # self-consistency 샘플 수
+      LLM_CLAUDE_CRITIQUE=1               # 0=critic/arbiter 비활성
+      LLM_CLAUDE_THINKING=1               # 0=Extended Thinking 비활성 (레거시 모드)
+      LLM_CLAUDE_THINKING_BUDGET_SAMPLE=6000
+      LLM_CLAUDE_THINKING_BUDGET_CRITIC=4000
+      LLM_CLAUDE_THINKING_BUDGET_ARBITER=5000
+      LLM_CLAUDE_CACHE=1                  # 0=prompt caching 비활성
+      LLM_CLAUDE_CALL_TIMEOUT=90.0        # thinking 포함 호출 상한
+
+      기타: DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY
     """
 
     PROMPT_SYSTEM = (
@@ -144,13 +152,31 @@ class LLMSignalEngine:
         self._claude_analyzer: Any = None
         if self.backend == "claude_native" and self.api_key:
             try:
-                from core.external.claude_quant_analyzer import ClaudeQuantAnalyzer
+                from core.external.claude_quant_analyzer import (
+                    DEFAULT_MODEL,
+                    DEFAULT_THINKING_BUDGET_ARBITER,
+                    DEFAULT_THINKING_BUDGET_CRITIC,
+                    DEFAULT_THINKING_BUDGET_SAMPLE,
+                    ClaudeQuantAnalyzer,
+                )
                 self._claude_analyzer = ClaudeQuantAnalyzer(
                     api_key=self.api_key,
-                    model=os.getenv("LLM_CLAUDE_MODEL", "claude-3-5-sonnet-latest"),
+                    model=os.getenv("LLM_CLAUDE_MODEL", DEFAULT_MODEL),
                     n_samples=int(os.getenv("LLM_CLAUDE_N_SAMPLES", "3")),
                     enable_critique=os.getenv("LLM_CLAUDE_CRITIQUE", "1") != "0",
-                    timeout_per_call=timeout_sec,
+                    enable_thinking=os.getenv("LLM_CLAUDE_THINKING", "1") != "0",
+                    thinking_budget_sample=int(
+                        os.getenv("LLM_CLAUDE_THINKING_BUDGET_SAMPLE",
+                                  str(DEFAULT_THINKING_BUDGET_SAMPLE))),
+                    thinking_budget_critic=int(
+                        os.getenv("LLM_CLAUDE_THINKING_BUDGET_CRITIC",
+                                  str(DEFAULT_THINKING_BUDGET_CRITIC))),
+                    thinking_budget_arbiter=int(
+                        os.getenv("LLM_CLAUDE_THINKING_BUDGET_ARBITER",
+                                  str(DEFAULT_THINKING_BUDGET_ARBITER))),
+                    enable_prompt_cache=os.getenv("LLM_CLAUDE_CACHE", "1") != "0",
+                    # thinking 포함 시 호출당 레이턴시 증가 — 상위 timeout보다 여유
+                    timeout_per_call=float(os.getenv("LLM_CLAUDE_CALL_TIMEOUT", "90.0")),
                 )
             except Exception as e:
                 logger.warning(f"[LLMSignal] claude_native 초기화 실패 → vader 폴백: {e}")
@@ -276,11 +302,17 @@ class LLMSignalEngine:
         return self._parse_llm_json(content, backend="deepseek")
 
     async def _call_anthropic(self, texts: list[str], symbol: str, regime: str) -> LLMSignal:
+        """기본 anthropic 단발 호출 — 기본값 Opus 4.5로 상향.
+
+        고급 기능(thinking, caching, self-consistency)은 `backend=claude_native`에서 사용.
+        """
         import aiohttp
         user = self._build_user_prompt(texts, symbol, regime)
+        model = os.getenv("LLM_CLAUDE_MODEL", "claude-opus-4-5")
         payload = {
-            "model": "claude-3-5-sonnet-latest",
-            "max_tokens": 400,
+            "model": model,
+            "max_tokens": 800,
+            "temperature": 0.2,
             "system": self.PROMPT_SYSTEM,
             "messages": [{"role": "user", "content": user}],
         }
@@ -295,7 +327,14 @@ class LLMSignalEngine:
                 json=payload, headers=headers, timeout=self.timeout,
             ) as r:
                 data = await r.json()
-        content = data["content"][0]["text"]
+        if "content" not in data:
+            raise RuntimeError(f"Anthropic API error: {data.get('error', data)}")
+        # text 블록만 결합 (thinking 블록 있으면 제외)
+        texts_out = [
+            blk.get("text", "")
+            for blk in data["content"] if blk.get("type") == "text"
+        ]
+        content = "".join(texts_out)
         return self._parse_llm_json(content, backend="anthropic")
 
     async def _call_openai(self, texts: list[str], symbol: str, regime: str) -> LLMSignal:
