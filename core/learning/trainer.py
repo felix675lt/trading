@@ -103,6 +103,37 @@ class SelfLearningTrainer:
         except Exception as e:
             logger.warning(f"[Derivatives] 역사 스냅샷 조인 실패: {e} — 기존 상수값 유지")
 
+        # === LLM Signal 스냅샷 조인 (2026-04-24, Claude-Native) ===
+        # ExternalDataManager가 매 update마다 누적한 LLM 분석 결과를 학습 DF에 시간 조인.
+        # 충분한 누적(최소 50행) 있을 때만 활성 — 모델이 실 신호로 인식하게.
+        try:
+            if hasattr(self.storage, "load_llm_snapshots"):
+                llm_df = self.storage.load_llm_snapshots(symbol, days=lookback)
+                if llm_df is not None and not llm_df.empty and len(llm_df) >= 50:
+                    # prefix로 피처 컬럼 네이밍 통일 — XGBoost가 자동 인식
+                    llm_df = llm_df.add_prefix("ext_llm_")
+                    # 누락 시각은 ffill (last-known LLM 분석이 다음 캔들까지 유효)
+                    llm_aligned = llm_df.reindex(df.index, method="ffill")
+                    overlap_llm = [c for c in llm_aligned.columns if c in df.columns]
+                    new_llm = [c for c in llm_aligned.columns if c not in df.columns]
+                    if overlap_llm:
+                        df[overlap_llm] = llm_aligned[overlap_llm]
+                    if new_llm:
+                        df = pd.concat([df, llm_aligned[new_llm]], axis=1)
+                    logger.info(
+                        f"[LLM] Claude 스냅샷 {len(llm_df)}개 조인 완료 — "
+                        f"overwrite={len(overlap_llm)}, new={len(new_llm)} "
+                        f"→ XGBoost가 LLM reasoning을 피처로 학습"
+                    )
+                else:
+                    snap_count = len(llm_df) if llm_df is not None else 0
+                    logger.debug(
+                        f"[LLM] {symbol} 스냅샷 누적 부족({snap_count}개 < 50) — "
+                        f"상수값 유지. LIVE 돌면서 자동 누적 중."
+                    )
+        except Exception as e:
+            logger.warning(f"[LLM] 스냅샷 조인 실패: {e} — 기존 상수값 유지")
+
         return df
 
     async def _prepare_btc_reference(self, exchange_name: str, timeframe: str):

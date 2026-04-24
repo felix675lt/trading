@@ -101,6 +101,28 @@ class Storage:
             );
             CREATE INDEX IF NOT EXISTS idx_deriv_symbol_ts
                 ON derivatives_snapshots(symbol, timestamp);
+
+            -- === LLM Signal Snapshots (2026-04-24 추가, Claude-Native) ===
+            -- 학습 시 역사적 LLM 분석 결과를 피처로 쓰기 위한 시계열.
+            -- ExternalDataManager.update()에서 LLMSignalEngine 호출 후 여기에 INSERT.
+            -- trainer.collect_training_data에서 derivatives와 동일 패턴으로 ffill 조인.
+            CREATE TABLE IF NOT EXISTS llm_signal_snapshots (
+                timestamp TEXT,
+                symbol TEXT,
+                backend TEXT,                    -- claude_native | deepseek | anthropic | vader
+                direction TEXT,                  -- bullish | bearish | neutral
+                score REAL,                      -- [-1, 1] EV-weighted
+                conviction REAL,                 -- [0, 1]
+                expected_value REAL,             -- 시나리오 가중 기대수익 (EV)
+                max_risk_severity REAL,          -- 최대 리스크 심각도 [0, 1]
+                samples_raw INTEGER,             -- self-consistency N
+                critique_survived INTEGER,       -- bool (0/1)
+                scenarios_json TEXT,             -- [{label, probability, expected_return_pct}]
+                risk_events_json TEXT,           -- [{event, severity}]
+                PRIMARY KEY (timestamp, symbol)
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_symbol_ts
+                ON llm_signal_snapshots(symbol, timestamp);
         """)
         self.conn.commit()
 
@@ -242,6 +264,71 @@ class Storage:
             return df
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df.set_index("timestamp", inplace=True)
+        return df
+
+    # === LLM Signal Snapshots (2026-04-24, Claude-Native) ===
+    def save_llm_snapshot(self, symbol: str, signal: dict):
+        """LLM 시그널 스냅샷 저장 — ExternalDataManager가 update마다 호출.
+
+        Args:
+            symbol: 심볼 (BTC/USDT:USDT 또는 단축형)
+            signal: LLMSignal.to_external_signal() 결과 dict
+        """
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO llm_signal_snapshots "
+                "(timestamp, symbol, backend, direction, score, conviction, "
+                " expected_value, max_risk_severity, samples_raw, critique_survived, "
+                " scenarios_json, risk_events_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(datetime.utcnow()), symbol,
+                    str(signal.get("backend", "") or ""),
+                    str(signal.get("direction", "neutral")),
+                    float(signal.get("score", 0.0) or 0.0),
+                    float(signal.get("confidence", 0.0) or 0.0),
+                    float(signal.get("expected_value", 0.0) or 0.0),
+                    float(signal.get("max_risk_severity", 0.0) or 0.0),
+                    int(signal.get("samples_raw", 0) or 0),
+                    int(bool(signal.get("critique_survived", True))),
+                    json.dumps(signal.get("scenarios", []), ensure_ascii=False),
+                    json.dumps(signal.get("risk_events_scored", []), ensure_ascii=False),
+                ),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.debug(f"[Storage] LLM snapshot 저장 실패 ({symbol}): {e}")
+
+    def load_llm_snapshots(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """특정 심볼의 최근 N일 LLM 스냅샷 로드 (학습 피처용).
+
+        Returns:
+            DataFrame indexed by timestamp. 비어있으면 empty DF.
+            컬럼: score, conviction, expected_value, max_risk_severity,
+                  is_bullish(0/1), is_bearish(0/1)
+        """
+        query = """
+            SELECT timestamp, direction, score, conviction, expected_value,
+                   max_risk_severity
+            FROM llm_signal_snapshots
+            WHERE symbol=? AND timestamp > datetime('now', ?)
+            ORDER BY timestamp ASC
+        """
+        try:
+            df = pd.read_sql_query(
+                query, self.conn, params=(symbol, f"-{days} days")
+            )
+        except Exception as e:
+            logger.debug(f"[Storage] LLM snapshot 로드 실패 ({symbol}): {e}")
+            return pd.DataFrame()
+        if df.empty:
+            return df
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+        # direction → one-hot (ML 피처 호환)
+        df["is_bullish"] = (df["direction"] == "bullish").astype(float)
+        df["is_bearish"] = (df["direction"] == "bearish").astype(float)
+        df = df.drop(columns=["direction"])
         return df
 
     def save_model_performance(self, model_name: str, accuracy: float, sharpe: float, win_rate: float):

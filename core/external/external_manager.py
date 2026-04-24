@@ -11,17 +11,20 @@ from datetime import datetime
 
 from loguru import logger
 
+import os
+
+from .crypto_twitter import CryptoTwitterCollector
+from .derivatives_data import DerivativesDataCollector
+from .llm_signal import LLMSignalEngine
 from .macro_collector import MacroCollector
+from .multi_timeframe import MultiTimeframeAnalyzer
 from .news_collector import NewsCollector
 from .onchain_collector import OnchainCollector
-from .sentiment_analyzer import SentimentAnalyzer
-from .social_collector import SocialCollector
-from .seasonal_cycle import SeasonalCycleAnalyzer
-from .derivatives_data import DerivativesDataCollector
-from .multi_timeframe import MultiTimeframeAnalyzer
-from .crypto_twitter import CryptoTwitterCollector
 from .polymarket import PolymarketCollector
 from .real_macro_collector import RealMacroCollector
+from .seasonal_cycle import SeasonalCycleAnalyzer
+from .sentiment_analyzer import SentimentAnalyzer
+from .social_collector import SocialCollector
 
 
 class ExternalDataManager:
@@ -60,6 +63,23 @@ class ExternalDataManager:
 
         # 실제 매크로 (Yahoo Finance: 유가/금/DXY/VIX/국채/S&P500)
         self.real_macro = RealMacroCollector()
+
+        # === LLM 시그널 엔진 (Claude Opus 4.x + Extended Thinking + Prompt Caching) ===
+        # env 미설정 시 vader로 자동 폴백 — 추가 비용 없이 무해.
+        # 활성: export LLM_BACKEND=claude_native ANTHROPIC_API_KEY=...
+        llm_cfg = config.get("llm_signal", {}) or {}
+        llm_backend = llm_cfg.get("backend") or os.getenv("LLM_BACKEND", "vader")
+        self.llm_engine = LLMSignalEngine(
+            backend=llm_backend,
+            cache_ttl_sec=int(llm_cfg.get("cache_ttl_sec", 900)),
+            default_weight=float(llm_cfg.get("default_weight", 0.25)),
+            timeout_sec=float(llm_cfg.get("timeout_sec", 120.0)),  # thinking 포함
+        )
+        # composite_signal에 LLM 시그널이 기여할 가중치 (0~1).
+        # 초기엔 0.10 (낮게) 권장 — IC > 0.05 확인 후 0.20~0.30 상향.
+        self.llm_weight = float(llm_cfg.get("composite_weight", 0.10))
+        # 최근 LLM 분석 결과 저장 (composite 계산 + storage 누적에 사용)
+        self._last_llm_signal: dict = {}
 
         self.enabled = config.get("enabled", True)
         self.weight = config.get("weight", 0.3)
@@ -106,6 +126,59 @@ class ExternalDataManager:
             texts.extend(self.social.get_titles())
             sentiment_features = self.sentiment.analyze_batch(texts, symbol)
 
+            # === LLM 시그널 분석 (Claude Opus 4.x) ==========================
+            # 백엔드가 vader가 아닌 경우에만 실제 LLM 호출. vader는 무료/즉시 반환.
+            # 결과는 15분 캐시 + regime 파라미터로 context 주입.
+            try:
+                # regime hint — 기존 composite 방향(없으면 normal)
+                prev_regime = "normal"
+                if self.composite_signal:
+                    prev_score = float(self.composite_signal.get("score", 0) or 0)
+                    if prev_score > 0.5:
+                        prev_regime = "strong_uptrend"
+                    elif prev_score > 0.15:
+                        prev_regime = "uptrend"
+                    elif prev_score < -0.5:
+                        prev_regime = "strong_downtrend"
+                    elif prev_score < -0.15:
+                        prev_regime = "downtrend"
+                # Twitter 대표 텍스트도 포함 (샘플 최대 10개)
+                twitter_posts = []
+                try:
+                    for v in self.crypto_twitter._cache.values():
+                        if isinstance(v, dict) and v.get("recent_posts"):
+                            twitter_posts.extend(v["recent_posts"][:10])
+                            break
+                except Exception:
+                    pass
+                combined_texts = (texts or [])[:20] + twitter_posts[:10]
+                llm_sig = await self.llm_engine.analyze_texts(
+                    texts=combined_texts,
+                    symbol=short_symbol,
+                    regime=prev_regime,
+                )
+                self._last_llm_signal = llm_sig.to_external_signal()
+                # 학습 피처용 평탄화 (ML 피처는 숫자만 허용)
+                llm_features = {
+                    "ext_llm_score":      float(self._last_llm_signal.get("score", 0.0)),
+                    "ext_llm_confidence": float(self._last_llm_signal.get("confidence", 0.0)),
+                    "ext_llm_ev":         float(self._last_llm_signal.get("expected_value", 0.0)),
+                    "ext_llm_max_severity": float(self._last_llm_signal.get("max_risk_severity", 0.0)),
+                    "ext_llm_is_bullish": 1.0 if self._last_llm_signal.get("direction") == "bullish" else 0.0,
+                    "ext_llm_is_bearish": 1.0 if self._last_llm_signal.get("direction") == "bearish" else 0.0,
+                }
+            except Exception as e:
+                logger.debug(f"[LLM] 시그널 수집 실패 → 0 값으로 폴백: {e}")
+                self._last_llm_signal = {}
+                llm_features = {
+                    "ext_llm_score":      0.0,
+                    "ext_llm_confidence": 0.0,
+                    "ext_llm_ev":         0.0,
+                    "ext_llm_max_severity": 0.0,
+                    "ext_llm_is_bullish": 0.0,
+                    "ext_llm_is_bearish": 0.0,
+                }
+
             # 각 모듈의 피처 수집 (공포탐욕 완전 제거)
             onchain_features = self.onchain.get_features()
             macro_features = self.macro.get_features()
@@ -145,15 +218,38 @@ class ExternalDataManager:
                 **twitter_features,
                 **polymarket_features,
                 **real_macro_features,
+                **llm_features,   # Claude-native LLM 시그널 피처 (6개)
             }
 
-            # 종합 외부 신호 계산 (공포탐욕 제거됨)
+            # 종합 외부 신호 계산 (공포탐욕 제거됨, LLM 가중치 포함)
             self.composite_signal = self._compute_composite_signal(
                 onchain_features, macro_features,
                 sentiment_features, news_features, social_features,
                 seasonal_features, derivatives_features, twitter_features,
                 polymarket_features, real_macro_features,
             )
+
+            # === LLM 시그널을 composite_signal에 가중평균 주입 ============
+            # 기본 10% 가중 (IC 검증 후 0.20~0.30 상향 권장).
+            # high_severity 리스크 감지 시 composite의 long score를 자동 할인.
+            if self._last_llm_signal and self.llm_weight > 0:
+                llm_score = float(self._last_llm_signal.get("score", 0.0))
+                base_score = float(self.composite_signal.get("score", 0.0))
+                # (1-w)*base + w*llm — 기존 11개 소스의 93% 보존 + LLM 7% 혼합 (if w=0.10)
+                blended = (1.0 - self.llm_weight) * base_score + self.llm_weight * llm_score
+                # max_risk_severity 0.7 이상이면 LONG score에 30% 페널티 (방어적)
+                sev = float(self._last_llm_signal.get("max_risk_severity", 0.0))
+                if sev > 0.7 and blended > 0:
+                    blended *= (1.0 - 0.3 * min(sev, 1.0))
+                self.composite_signal["score"] = round(blended, 4)
+                self.composite_signal["llm_score"] = round(llm_score, 4)
+                self.composite_signal["llm_weight"] = self.llm_weight
+                self.composite_signal["llm_max_severity"] = round(sev, 3)
+                # 시나리오·critic 메타는 그대로 전달 (소비자가 선택적으로 참조)
+                if "scenarios" in self._last_llm_signal:
+                    self.composite_signal["llm_scenarios"] = self._last_llm_signal["scenarios"]
+                if "critique_survived" in self._last_llm_signal:
+                    self.composite_signal["llm_critique_survived"] = self._last_llm_signal["critique_survived"]
 
             self.last_update = datetime.utcnow()
 
@@ -164,6 +260,16 @@ class ExternalDataManager:
                     self._storage.save_derivatives_snapshot(symbol, derivatives_features)
                 except Exception as e:
                     logger.debug(f"[External] derivatives snapshot 저장 실패: {e}")
+
+            # === LLM 시그널 스냅샷 DB 저장 (2026-04-24, Claude-Native) ===
+            # 학습 파이프라인이 역사적 LLM 분석을 피처로 쓸 수 있도록 시계열 누적.
+            # trainer가 derivatives 스냅샷과 동일한 ffill 패턴으로 조인.
+            if self._storage is not None and self._last_llm_signal:
+                try:
+                    if hasattr(self._storage, "save_llm_snapshot"):
+                        self._storage.save_llm_snapshot(symbol, self._last_llm_signal)
+                except Exception as e:
+                    logger.debug(f"[External] LLM snapshot 저장 실패: {e}")
 
             # 파생상품 리포트
             deriv = self.derivatives.get_signal_for_strategy()
@@ -185,6 +291,18 @@ class ExternalDataManager:
                 f"PM: {poly_sc:.2f}({poly_markets}건) | "
                 f"매크로: WTI${rm_sig.get('oil', 0):.0f} DXY{rm_sig.get('dxy', 0):.1f} VIX{rm_sig.get('vix', 0):.1f} 점수{rm_sig.get('score', 0):.2f}"
             )
+            # LLM 분석 결과 별도 로그 (claude_native만 의미 있음)
+            if self._last_llm_signal:
+                logger.info(
+                    f"[LLM/{self._last_llm_signal.get('backend', '')}] "
+                    f"dir={self._last_llm_signal.get('direction', '?')} "
+                    f"score={self._last_llm_signal.get('score', 0):.2f} "
+                    f"conv={self._last_llm_signal.get('confidence', 0):.2f} "
+                    f"EV={self._last_llm_signal.get('expected_value', 0):+.4f} "
+                    f"severity={self._last_llm_signal.get('max_risk_severity', 0):.2f} "
+                    f"samples={self._last_llm_signal.get('samples_raw', 0)} "
+                    f"crit_ok={self._last_llm_signal.get('critique_survived', True)}"
+                )
 
             return self.composite_signal
 
