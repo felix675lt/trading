@@ -65,10 +65,15 @@ class ExternalDataManager:
         self.real_macro = RealMacroCollector()
 
         # === LLM 시그널 엔진 (Claude Opus 4.x + Extended Thinking + Prompt Caching) ===
-        # env 미설정 시 vader로 자동 폴백 — 추가 비용 없이 무해.
-        # 활성: export LLM_BACKEND=claude_native ANTHROPIC_API_KEY=...
+        # 기본 backend="auto" — 재기동만으로 다음이 자동 적용됨:
+        #   · ANTHROPIC_API_KEY 있음 → claude_native (Opus 최신 모델, thinking, caching)
+        #   · DEEPSEEK_API_KEY 있음 → deepseek
+        #   · OPENAI_API_KEY 있음   → openai
+        #   · 아무것도 없음         → vader (로컬 폴백, 비용 0)
+        # 추가로 model="auto"면 Anthropic /v1/models API에서 최신 Opus를 찾아
+        # 자동 채택 — 새 Opus 릴리즈 시 코드 변경 없이 재기동만으로 채택됨.
         llm_cfg = config.get("llm_signal", {}) or {}
-        llm_backend = llm_cfg.get("backend") or os.getenv("LLM_BACKEND", "vader")
+        llm_backend = llm_cfg.get("backend") or os.getenv("LLM_BACKEND") or "auto"
         self.llm_engine = LLMSignalEngine(
             backend=llm_backend,
             cache_ttl_sec=int(llm_cfg.get("cache_ttl_sec", 900)),

@@ -131,6 +131,10 @@ class LLMSignalEngine:
         "Reflect the asymmetric costs of false positives in a leveraged trading system."
     )
 
+    # 백엔드 자동 선택 우선순위 — API 키가 있는 첫 번째 항목 선택.
+    # 실전 품질 순서: claude_native > deepseek > openai > vader(폴백).
+    _AUTO_BACKEND_PRIORITY = ["claude_native", "deepseek", "openai"]
+
     def __init__(
         self,
         backend: str | None = None,
@@ -139,7 +143,16 @@ class LLMSignalEngine:
         default_weight: float = 0.25,
         timeout_sec: float = 20.0,
     ):
-        self.backend = (backend or os.getenv("LLM_BACKEND", "vader")).lower()
+        # backend 결정 순서:
+        #   1) 명시 전달된 backend 파라미터
+        #   2) env LLM_BACKEND
+        #   3) "auto" — 사용 가능한 API 키 감지해서 최상위 품질 백엔드 선택
+        requested = (backend or os.getenv("LLM_BACKEND", "auto")).lower()
+        if requested == "auto":
+            self.backend = self._autodetect_backend()
+            logger.info(f"[LLMSignal] backend=auto → 자동 선택 = {self.backend}")
+        else:
+            self.backend = requested
         self.api_key = api_key or self._resolve_api_key(self.backend)
         self.cache_ttl = cache_ttl_sec
         self.default_weight = default_weight
@@ -159,6 +172,9 @@ class LLMSignalEngine:
                     DEFAULT_THINKING_BUDGET_SAMPLE,
                     ClaudeQuantAnalyzer,
                 )
+                # model="auto" (DEFAULT_MODEL)이면 ClaudeQuantAnalyzer가
+                # 첫 analyze() 호출 시 Anthropic /v1/models 프로브로 최신 Opus 선정.
+                # 사용자가 특정 모델 고정 원하면 LLM_CLAUDE_MODEL=claude-opus-4-7 로 override.
                 self._claude_analyzer = ClaudeQuantAnalyzer(
                     api_key=self.api_key,
                     model=os.getenv("LLM_CLAUDE_MODEL", DEFAULT_MODEL),
@@ -197,6 +213,18 @@ class LLMSignalEngine:
             "claude_native": os.getenv("ANTHROPIC_API_KEY"),
             "openai":        os.getenv("OPENAI_API_KEY"),
         }.get(backend)
+
+    @classmethod
+    def _autodetect_backend(cls) -> str:
+        """사용 가능한 API 키 기반 최적 백엔드 자동 선택.
+
+        우선순위: claude_native > deepseek > openai > vader
+        (claude_native는 ANTHROPIC_API_KEY 하나로 모든 고급 기능 활성)
+        """
+        for backend in cls._AUTO_BACKEND_PRIORITY:
+            if cls._resolve_api_key(backend):
+                return backend
+        return "vader"
 
     @staticmethod
     def _cache_key(symbol: str, regime: str, texts: list[str]) -> str:

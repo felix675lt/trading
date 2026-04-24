@@ -264,6 +264,19 @@ external:
     strong_bearish: -0.4    # 0.3 → 0.4
     event_override: false   # 고임팩트 오버라이드 해제 — 매크로가 진입 방해하지 않게
 
+  # === LLM Signal (Claude-Native + DeepSeek 방법론, 2026-04-24) ===
+  # backend="auto" → ANTHROPIC_API_KEY 있으면 claude_native 자동 활성,
+  #                  없으면 deepseek → openai → vader 순으로 폴백.
+  # model="auto"  → Anthropic /v1/models API 프로브로 최신 Opus 자동 선정.
+  #                 새 Opus 출시 시 재기동만으로 자동 채택됨.
+  # composite_weight — 기존 11개 소스 가중치 대비 LLM 기여도. IC 검증 전 낮게 유지.
+  #                    IC > 0.05 확인 후 0.20~0.30 상향 권장.
+  llm_signal:
+    backend: "auto"
+    composite_weight: 0.10     # 0.05~0.15 권장 (초기), IC 검증 후 상향
+    cache_ttl_sec: 900          # 15분 — LLM 호출 비용 관리
+    timeout_sec: 120.0          # thinking 포함 호출이면 60s 이상 권장
+
 # =============================================================================
 # Capital Tier System — 시드 구간별 기능 자동 활성화
 # =============================================================================

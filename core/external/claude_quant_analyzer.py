@@ -72,6 +72,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import re
+
 from loguru import logger
 
 
@@ -79,9 +81,20 @@ from loguru import logger
 # 모델·기능 기본값 — Opus 4.x 활용 프리셋
 # =============================================================================
 
-# 2026년 기준 최신 Opus 별칭. 사용자가 Opus 4.7이면 env로 override 권장:
-#   export LLM_CLAUDE_MODEL=claude-opus-4-7  (또는 Anthropic이 공식 알리는 ID)
-DEFAULT_MODEL = "claude-opus-4-5"
+# "auto" — 런타임에 Anthropic /v1/models API를 프로브해 가장 최신 Opus 선택.
+# 실패 시 CLAUDE_MODEL_FALLBACK 체인으로 순차 fallback.
+# 이렇게 하면 Anthropic이 새 Opus를 출시해도 재기동만으로 자동 채택된다.
+DEFAULT_MODEL = "auto"
+
+# 자동 해석 실패 시 순차 시도할 폴백 체인 (새 것 → 오래된 것 순).
+# Anthropic이 Opus 4.7 같은 상위 버전을 출시하면 probe에서 자동 발견.
+# 이 체인은 네트워크 프로브가 실패해도 동작하게 하는 안전망.
+CLAUDE_MODEL_FALLBACK = [
+    "claude-opus-4-5",                # 2025-09 GA (확정)
+    "claude-opus-4",                  # 2025-05 GA
+    "claude-3-7-sonnet-latest",       # 백업
+    "claude-3-5-sonnet-latest",       # 최종 안전망
+]
 
 # Extended Thinking 기본 예산 — budget_tokens.
 #   - 샘플(탐색적 reasoning): 6000 → 시나리오/트랩 분석 깊이 충분
@@ -301,6 +314,7 @@ class ClaudeQuantAnalyzer:
         """텍스트 리스트 → DeepSeek 수준 Claude 분석.
 
         파이프라인:
+            ⓪ (첫 호출만) model="auto"면 Anthropic API로 최신 Opus 자동 선택
             ① N=3 병렬 CoT 샘플링
             ② 샘플간 집계(방향 투표, conviction 평균, scenario 통합)
             ③ Critic 반박 (선택)
@@ -311,6 +325,11 @@ class ClaudeQuantAnalyzer:
             raise RuntimeError("ANTHROPIC_API_KEY 필요 — ClaudeQuantAnalyzer 호출 불가")
         if not texts:
             return ClaudeAnalysis(reasoning="empty input")
+
+        # ⓪ 모델 auto-resolve (첫 호출에서만 실행 — 결과는 self.model에 고정)
+        if self.model in ("auto", "", None):
+            self.model = await self._resolve_best_model()
+            logger.info(f"[ClaudeQuant] auto-resolved model = {self.model}")
 
         user_prompt = self._build_user_prompt(texts, symbol, regime)
 
@@ -757,6 +776,80 @@ class ClaudeQuantAnalyzer:
             for blk in data["content"] if blk.get("type") == "text"
         ]
         return "".join(texts)
+
+    # -------------------------------------------------------------------------
+    # 모델 auto-resolve — Anthropic /v1/models 프로브 → 최신 Opus 자동 선택
+    # -------------------------------------------------------------------------
+
+    async def _resolve_best_model(self) -> str:
+        """Anthropic API에서 사용 가능한 모델 목록을 받아 최신 Opus 선정.
+
+        우선순위:
+          1) opus 계열 중 가장 높은 (major, minor, patch) 버전
+          2) 실패 시 CLAUDE_MODEL_FALLBACK 체인 첫 번째
+
+        이 함수는 **최초 1회만** 호출된다 (self.model에 결과를 고정).
+        """
+        try:
+            import aiohttp
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            }
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers=headers, timeout=10,
+                ) as r:
+                    if r.status != 200:
+                        raise RuntimeError(f"/v1/models status={r.status}")
+                    data = await r.json()
+            models = data.get("data", []) or []
+            ids = [m.get("id", "") for m in models if m.get("id")]
+            opus_ids = [i for i in ids if "opus" in i.lower()]
+            if opus_ids:
+                best = max(opus_ids, key=self._version_key)
+                logger.info(
+                    f"[ClaudeQuant] /v1/models probe → {len(ids)}개 모델 중 "
+                    f"Opus {len(opus_ids)}개 발견. 최상위={best}"
+                )
+                return best
+            # Opus가 없으면 sonnet 최상위 시도
+            sonnet_ids = [i for i in ids if "sonnet" in i.lower()]
+            if sonnet_ids:
+                best = max(sonnet_ids, key=self._version_key)
+                logger.warning(
+                    f"[ClaudeQuant] Opus 미발견, Sonnet 최상위={best} 사용"
+                )
+                return best
+        except Exception as e:
+            logger.warning(
+                f"[ClaudeQuant] 모델 auto-resolve 실패 "
+                f"({type(e).__name__}: {e}) → 폴백 체인 사용"
+            )
+        # 폴백 체인 첫 번째 사용 (네트워크 실패 시에도 동작 보장)
+        return CLAUDE_MODEL_FALLBACK[0]
+
+    @staticmethod
+    def _version_key(model_id: str) -> tuple[int, ...]:
+        """모델 ID → 비교 가능한 버전 튜플.
+
+        예시:
+          claude-opus-4-5-20250929 → (4, 5, 20250929)
+          claude-opus-4-7          → (4, 7, 0)
+          claude-opus-4            → (4, 0, 0)
+          claude-3-5-sonnet-latest → (3, 5, 0)  (sonnet이지만 비교엔 동작)
+        """
+        # 숫자 그룹 추출 (하이픈 구분) — latest/preview 같은 suffix는 무시
+        nums = re.findall(r"\d+", model_id or "")
+        if not nums:
+            return (0,)
+        # 보통 3자리(major, minor, patch 또는 date)로 맞춤
+        tup = tuple(int(x) for x in nums[:3])
+        # 자리 수 맞추기
+        while len(tup) < 3:
+            tup = tup + (0,)
+        return tup
 
     # -------------------------------------------------------------------------
     # 헬퍼
