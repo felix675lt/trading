@@ -43,10 +43,12 @@ class ICTracker:
         self.lag_analysis = lag_analysis or [1, 3, 6, 12, 24]  # 지연 시각별 IC
         self.persist_path = Path(persist_path) if persist_path else None
 
-        # (timestamp_iso, signal, realized_return, source) — 라운드트립당 1건
+        # (timestamp_iso, signal, realized_return, source, regime) — 라운드트립당 1건
         self._records: deque = deque(maxlen=max_samples)
         # 소스별(xgb/lstm/ensemble/rl) 별도 집계
         self._by_source: dict[str, deque] = {}
+        # 레짐×소스별 집계 (2026-04-24 C): 레짐 가중치 자동화 근거
+        self._by_regime_source: dict[tuple[str, str], deque] = {}
 
         self._load()
 
@@ -60,13 +62,16 @@ class ICTracker:
         realized_return: float,
         source: str = "ensemble",
         timestamp: datetime | None = None,
+        regime: str | None = None,
     ):
         """시그널 관측 기록.
 
         Args:
             signal: 예측 시그널 값 ([-1, 1] 권장 또는 확률 차이)
             realized_return: 실제 청산 시점 수익률
-            source: 시그널 출처 (ensemble/xgb/lstm/rl 등)
+            source: 시그널 출처 (ensemble/xgb/lstm/rl/mom/ext 등)
+            regime: 진입 당시 시장 레짐 (trending/ranging/volatile 등).
+                    None이면 "all" 버킷에만 집계됨.
         """
         ts = (timestamp or datetime.utcnow()).isoformat()
         record = {
@@ -74,6 +79,7 @@ class ICTracker:
             "signal": float(signal),
             "ret": float(realized_return),
             "source": source,
+            "regime": regime or "all",
         }
         self._records.append(record)
 
@@ -81,7 +87,56 @@ class ICTracker:
             self._by_source[source] = deque(maxlen=self.max_samples)
         self._by_source[source].append(record)
 
+        # 레짐×소스 집계 (C: 레짐별 가중치 자동화용)
+        if regime:
+            key = (regime, source)
+            if key not in self._by_regime_source:
+                self._by_regime_source[key] = deque(maxlen=self.max_samples)
+            self._by_regime_source[key].append(record)
+
         self._save()
+
+    # ------------------------------------------------------------------
+    # 레짐×소스 IC (C: 시그널 가중치 자동화용)
+    # ------------------------------------------------------------------
+
+    def ic_by_regime(self, regime: str, source: str, min_samples: int = 10) -> dict:
+        """특정 레짐×소스의 IC + 샘플수 반환.
+
+        Returns:
+            {ic, n_samples, hit_rate}
+            샘플 부족 시 ic=0.0 (가중치 optimizer가 "신뢰 안 함"으로 처리).
+        """
+        key = (regime, source)
+        recs = list(self._by_regime_source.get(key, []))
+        n = len(recs)
+        if n < min_samples:
+            return {"ic": 0.0, "n_samples": n, "hit_rate": 0.0, "sufficient": False}
+        signals = np.array([r["signal"] for r in recs])
+        rets = np.array([r["ret"] for r in recs])
+        ic_val = _spearman(signals, rets)
+        hits = sum(
+            1 for r in recs
+            if np.sign(r["signal"]) == np.sign(r["ret"]) and r["signal"] != 0
+        )
+        nonzero = sum(1 for r in recs if r["signal"] != 0)
+        return {
+            "ic": float(ic_val),
+            "n_samples": n,
+            "hit_rate": hits / max(nonzero, 1),
+            "sufficient": True,
+        }
+
+    def regime_source_matrix(self, min_samples: int = 10) -> dict:
+        """모든 (regime, source) 조합의 IC 매트릭스 — 대시보드/옵티마이저용."""
+        out: dict = {}
+        for (regime, source), recs in self._by_regime_source.items():
+            if len(recs) < min_samples:
+                continue
+            if regime not in out:
+                out[regime] = {}
+            out[regime][source] = self.ic_by_regime(regime, source, min_samples)
+        return out
 
     # ------------------------------------------------------------------
     # IC 계산
@@ -269,9 +324,110 @@ class ICTracker:
                 if src not in self._by_source:
                     self._by_source[src] = deque(maxlen=self.max_samples)
                 self._by_source[src].append(rec)
+                # regime×source 재구축 (C)
+                reg = rec.get("regime")
+                if reg and reg != "all":
+                    key = (reg, src)
+                    if key not in self._by_regime_source:
+                        self._by_regime_source[key] = deque(maxlen=self.max_samples)
+                    self._by_regime_source[key].append(rec)
             logger.info(f"[IC] 이력 로드: {len(self._records)}건")
         except Exception as e:
             logger.debug(f"[IC] 로드 실패: {e}")
+
+
+class SignalWeightOptimizer:
+    """레짐×소스 IC에 기반한 vote weight multiplier 공급자 (2026-04-24 C).
+
+    목적: `strategy/manager._count_signal_votes()`가 생성한 각 소스(ML/RL/MOM/
+    RSI_extreme/EXT/BREAKOUT)의 vote weight에, 해당 레짐에서 그 소스가
+    실제로 얼마나 잘 맞혀왔는지(IC)를 곱해 가중치를 재조정한다.
+
+    - IC ≤ -0.03: counter-productive → 0.3×  (더 가중치 깎기보단 방향 뒤집는
+                                               건 위험하므로 줄이기만)
+    - -0.03 < IC ≤ 0: 노이즈 → 0.5×
+    - 0 < IC ≤ 0.03: 약신호 → 0.8×
+    - 0.03 < IC ≤ 0.05: 보통 → 1.0× (중립)
+    - 0.05 < IC ≤ 0.10: 강신호 → 1.3×
+    - IC > 0.10: 최강 → 1.5× (상한)
+
+    변경량 제한: 지수평활 smoothing=0.25 (4~5회 업데이트로 수렴).
+    샘플 부족(min_samples<20): 1.0× 유지 (안전).
+    """
+
+    # (source, regime)가 매번 바뀌면 비용이 커서, 캐시는 { (regime, source): multiplier }
+    def __init__(
+        self,
+        min_samples: int = 20,
+        smoothing: float = 0.25,
+        mult_min: float = 0.3,
+        mult_max: float = 1.5,
+    ):
+        self.min_samples = int(min_samples)
+        self.smoothing = float(smoothing)
+        self.mult_min = float(mult_min)
+        self.mult_max = float(mult_max)
+        self._cache: dict[tuple[str, str], float] = {}
+        self._last_update: datetime | None = None
+
+    @staticmethod
+    def _target_from_ic(ic: float) -> float:
+        if ic <= -0.03:
+            return 0.3
+        if ic <= 0.0:
+            return 0.5
+        if ic <= 0.03:
+            return 0.8
+        if ic <= 0.05:
+            return 1.0
+        if ic <= 0.10:
+            return 1.3
+        return 1.5
+
+    def update_from_tracker(self, tracker: "ICTracker") -> dict:
+        """ICTracker의 regime×source 매트릭스에서 multiplier를 재계산.
+
+        Returns:
+            업데이트 요약 { (regime, source): {ic, n, mult_before, mult_after} }
+        """
+        matrix = tracker.regime_source_matrix(min_samples=self.min_samples)
+        s = max(0.0, min(1.0, self.smoothing))
+        summary: dict = {}
+        for regime, srcs in matrix.items():
+            for source, stats in srcs.items():
+                ic = float(stats.get("ic", 0.0))
+                n = int(stats.get("n_samples", 0))
+                target = self._target_from_ic(ic)
+                # 범위 클리핑
+                target = max(self.mult_min, min(self.mult_max, target))
+                key = (regime, source)
+                prev = self._cache.get(key, 1.0)
+                new = (1 - s) * prev + s * target
+                # 최종 클리핑
+                new = max(self.mult_min, min(self.mult_max, new))
+                self._cache[key] = new
+                if abs(new - prev) > 0.02:
+                    summary[f"{regime}:{source}"] = {
+                        "ic": round(ic, 4),
+                        "n": n,
+                        "mult_before": round(prev, 3),
+                        "mult_after": round(new, 3),
+                    }
+        self._last_update = datetime.utcnow()
+        if summary:
+            logger.info(f"[SignalWeight] 갱신: {summary}")
+        return summary
+
+    def get(self, regime: str, source: str) -> float:
+        """vote weight에 곱할 multiplier. 미등록이면 1.0 (영향 없음)."""
+        return float(self._cache.get((regime, source), 1.0))
+
+    def snapshot(self) -> dict:
+        """대시보드용 현재 가중치 상태."""
+        return {
+            f"{r}:{s}": round(v, 3)
+            for (r, s), v in sorted(self._cache.items())
+        }
 
 
 def _spearman(x: np.ndarray, y: np.ndarray) -> float:

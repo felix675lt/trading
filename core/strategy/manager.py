@@ -219,49 +219,64 @@ class StrategyManager:
         rl_direction: str, rl_confidence: float,
         mom_direction: str, mom_strength: float, mom_rsi: float,
         ext_direction: str, ext_confidence: float,
+        regime: str = "normal",
     ) -> dict:
         """각 독립 소스의 방향 투표 수집
+
+        레짐별 IC 기반 가중치 자동화 (2026-04-24 C):
+        self.signal_weight_optimizer (optional) — (regime, source) → multiplier.
+        미설정 시 1.0 고정 (기존 동작 유지).
 
         Returns: {"long": [(source, weight), ...], "short": [(source, weight), ...]}
         """
         votes = {"long": [], "short": []}
 
+        # 레짐별 가중치 multiplier 제공자 (optional)
+        opt = getattr(self, "signal_weight_optimizer", None)
+        def wmult(source: str) -> float:
+            if opt is None:
+                return 1.0
+            try:
+                return float(opt.get(regime, source))
+            except Exception:
+                return 1.0
+
         # 1. ML 모델 투표 (confidence > 0.3 + 방향 명확)
         if ml_direction == "long" and ml_confidence > 0.3:
-            votes["long"].append(("ML", ml_confidence))
+            votes["long"].append(("ML", ml_confidence * wmult("ml")))
         elif ml_direction == "short" and ml_confidence > 0.3:
-            votes["short"].append(("ML", ml_confidence))
+            votes["short"].append(("ML", ml_confidence * wmult("ml")))
         # ML signal 값이 방향과 일치하면 추가 투표 (같은 소스이므로 0.5 가중)
         elif abs(ml_signal_val) > self.signal_threshold:
             if ml_signal_val > self.signal_threshold:
-                votes["long"].append(("ML_val", min(abs(ml_signal_val) * 2, 0.6)))
+                votes["long"].append(("ML_val", min(abs(ml_signal_val) * 2, 0.6) * wmult("ml")))
             else:
-                votes["short"].append(("ML_val", min(abs(ml_signal_val) * 2, 0.6)))
+                votes["short"].append(("ML_val", min(abs(ml_signal_val) * 2, 0.6) * wmult("ml")))
 
         # 2. RL 에이전트 투표 (confidence > 0.4)
         if rl_direction == "long" and rl_confidence > 0.4:
-            votes["long"].append(("RL", rl_confidence))
+            votes["long"].append(("RL", rl_confidence * wmult("rl")))
         elif rl_direction == "short" and rl_confidence > 0.4:
-            votes["short"].append(("RL", rl_confidence))
+            votes["short"].append(("RL", rl_confidence * wmult("rl")))
 
         # 3. 모멘텀 투표 (strength > 0.2 또는 RSI 극값)
         if mom_direction == "long" and abs(mom_strength) > 0.2:
-            votes["long"].append(("MOM", abs(mom_strength)))
+            votes["long"].append(("MOM", abs(mom_strength) * wmult("mom")))
         elif mom_direction == "short" and abs(mom_strength) > 0.2:
-            votes["short"].append(("MOM", abs(mom_strength)))
+            votes["short"].append(("MOM", abs(mom_strength) * wmult("mom")))
         # RSI 극값 (25 이하 = 과매도 반전, 75 이상 = 과매수 반전)
         if mom_rsi < 25:
             rsi_weight = (25 - mom_rsi) / 25 * 0.5
-            votes["long"].append(("RSI_extreme", rsi_weight))
+            votes["long"].append(("RSI_extreme", rsi_weight * wmult("rsi_extreme")))
         elif mom_rsi > 75:
             rsi_weight = (mom_rsi - 75) / 25 * 0.5
-            votes["short"].append(("RSI_extreme", rsi_weight))
+            votes["short"].append(("RSI_extreme", rsi_weight * wmult("rsi_extreme")))
 
         # 4. 외부 요인 투표 (confidence > 0.15)
         if ext_direction == "bullish" and ext_confidence > 0.15:
-            votes["long"].append(("EXT", ext_confidence))
+            votes["long"].append(("EXT", ext_confidence * wmult("ext")))
         elif ext_direction == "bearish" and ext_confidence > 0.15:
-            votes["short"].append(("EXT", ext_confidence))
+            votes["short"].append(("EXT", ext_confidence * wmult("ext")))
 
         return votes
 
@@ -328,6 +343,7 @@ class StrategyManager:
             rl_direction, rl_confidence,
             mom_direction, mom_strength, mom_rsi,
             ext_direction, ext_confidence,
+            regime=market_regime,
         )
 
         # 5번째 vote source: BREAKOUT (2026-04-23 옵션 C)
@@ -337,11 +353,19 @@ class StrategyManager:
             breakout_info = self._detect_breakout(ohlcv_df, market_regime)
             bd = breakout_info["direction"]
             bs = breakout_info["strength"]
+            # 레짐별 가중치 적용 (C)
+            _opt = getattr(self, "signal_weight_optimizer", None)
+            bmult = 1.0
+            if _opt is not None:
+                try:
+                    bmult = float(_opt.get(market_regime, "breakout"))
+                except Exception:
+                    bmult = 1.0
             if bd == "long":
-                votes["long"].append(("BREAKOUT", bs))
+                votes["long"].append(("BREAKOUT", bs * bmult))
                 logger.info(f"[BREAKOUT] LONG vote 추가: {breakout_info['reason']}")
             elif bd == "short":
-                votes["short"].append(("BREAKOUT", bs))
+                votes["short"].append(("BREAKOUT", bs * bmult))
                 logger.info(f"[BREAKOUT] SHORT vote 추가: {breakout_info['reason']}")
 
         long_votes = votes["long"]

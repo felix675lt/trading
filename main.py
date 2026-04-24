@@ -32,7 +32,7 @@ from core.strategy.manager import StrategyManager
 from core.quant_signals import QuantSignals
 from core.capital_tiers import CapitalTierManager
 from core.treasury.btc_reserve import BTCReserve
-from core.learning.ic_tracker import ICTracker
+from core.learning.ic_tracker import ICTracker, SignalWeightOptimizer
 from core.learning.meta_labeler import MetaLabeler
 from core.strategy.regime_hmm import HMMRegimeClassifier
 from core.strategy.cointegration import CointegrationTester
@@ -173,6 +173,17 @@ class AutoTrader:
         # === 고급 퀀트 모듈 (tier 기반 활성화) ===
         # IC Tracker — 시그널 품질 추적 (always-on, 저비용)
         self.ic_tracker = ICTracker()
+        # 레짐별 시그널 가중치 자동화 (2026-04-24 C)
+        # ML/RL/MOM/RSI_extreme/EXT/BREAKOUT 각 소스의 (regime, source) IC를
+        # 기반으로 vote weight multiplier를 동적 조정. 1h 주기 갱신.
+        self.signal_weight_opt = SignalWeightOptimizer(
+            min_samples=20, smoothing=0.25, mult_min=0.3, mult_max=1.5,
+        )
+        # StrategyManager에 주입 — _count_signal_votes()가 getattr로 꺼내 씀
+        try:
+            self.strategy_manager.signal_weight_optimizer = self.signal_weight_opt
+        except Exception:
+            pass
         # HMM Regime Classifier — tier=large+ 활성 (학습/추론은 별도 트리거)
         self.hmm_regime = HMMRegimeClassifier(n_states=3)
         self.hmm_regime.load()  # 있으면 로드
@@ -1114,6 +1125,16 @@ class AutoTrader:
                                 self.strategy_optimizer_live.validate_configs_dsr()
                         except Exception as ee:
                             logger.debug(f"[DSR] 주기 검증 실패: {ee}")
+                        # 레짐별 시그널 가중치 자동 갱신 (C) — 매 1h IC 매트릭스 → multiplier
+                        try:
+                            if hasattr(self, "signal_weight_opt"):
+                                summary = self.signal_weight_opt.update_from_tracker(self.ic_tracker)
+                                if summary:
+                                    logger.info(
+                                        f"[SignalWeight] {len(summary)}개 (regime,source) 조합 갱신"
+                                    )
+                        except Exception as ee:
+                            logger.debug(f"[SignalWeight] 주기 실행 실패: {ee}")
                         # Paper↔Live 체결 모델 동기화 — LIVE 실측 슬리피지/메이커율 피드백
                         # 백테스트·페이퍼가 실거래와 다른 체결비용으로 돌아가면 전략 신호가
                         # 왜곡되므로, OrderManager가 누적한 중앙값 통계를 PaperTrader로
@@ -1760,10 +1781,25 @@ class AutoTrader:
                     try:
                         entry_signal = trade_context.get("signal", 0.0)
                         realized = result["pnl"] / max(result.get("notional", 1.0), 1.0)
+                        _regime = trade_context.get("regime", "normal")
                         self.ic_tracker.record(
                             signal=entry_signal,
                             realized_return=realized,
                             source="ensemble",
+                            regime=_regime,
+                        )
+                        # 소스별 per-regime 기록 (C: SignalWeightOptimizer 재료)
+                        self.ic_tracker.record(
+                            signal=float(ml_signal.get("signal", 0) or 0),
+                            realized_return=realized,
+                            source="ml",
+                            regime=_regime,
+                        )
+                        self.ic_tracker.record(
+                            signal=float(trade_context.get("external_score", 0) or 0),
+                            realized_return=realized,
+                            source="ext",
+                            regime=_regime,
                         )
                         # Claude-native LLM 단독 IC (llm_weight auto-tune 재료)
                         llm_entry = float(trade_context.get("llm_score", 0) or 0)
@@ -1772,6 +1808,7 @@ class AutoTrader:
                                 signal=llm_entry,
                                 realized_return=realized,
                                 source="llm",
+                                regime=_regime,
                             )
                     except Exception as e:
                         logger.debug(f"[IC] 기록 실패: {e}")
@@ -1832,11 +1869,27 @@ class AutoTrader:
                             entry_signal = ml_signal.get("signal", 0.0) if isinstance(ml_signal, dict) else float(ml_signal or 0.0)
                             notional = live_result.get("notional") or (live_result.get("size", 0) * max(live_result.get("entry_price", 0), 1e-9))
                             realized = live_pnl / max(notional, 1.0)
+                            _regime_live = adaptive_params.get("regime", "normal")
                             self.ic_tracker.record(
                                 signal=entry_signal,
                                 realized_return=realized,
                                 source="ensemble_live",
+                                regime=_regime_live,
                             )
+                            # 소스별 per-regime — LIVE에서도 SignalWeightOpt 재료 수집
+                            self.ic_tracker.record(
+                                signal=entry_signal,
+                                realized_return=realized,
+                                source="ml",
+                                regime=_regime_live,
+                            )
+                            if isinstance(ext_signal, dict):
+                                self.ic_tracker.record(
+                                    signal=float(ext_signal.get("score", 0) or 0),
+                                    realized_return=realized,
+                                    source="ext",
+                                    regime=_regime_live,
+                                )
                             # LLM 단독 IC (LIVE도 "llm" 소스로 통합 — auto-tune에 합산)
                             llm_entry = float(ext_signal.get("llm_score", 0) or 0) if isinstance(ext_signal, dict) else 0.0
                             if abs(llm_entry) > 1e-6:
@@ -1844,6 +1897,7 @@ class AutoTrader:
                                     signal=llm_entry,
                                     realized_return=realized,
                                     source="llm",
+                                    regime=_regime_live,
                                 )
                         except Exception as e:
                             logger.debug(f"[IC-LIVE] 기록 실패: {e}")
