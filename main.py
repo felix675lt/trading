@@ -1642,6 +1642,8 @@ class AutoTrader:
                 kelly_enabled=kelly_enabled,
                 kelly_fraction=float(kelly_fraction),
                 kelly_stats=kelly_stats,
+                atr_pct=atr_pct,
+                leverage=dynamic_lev,
             )
 
             # 7.4. 최소 주문 notional 보장 (Binance 최소 $100 + 여유분)
@@ -2133,6 +2135,8 @@ class AutoTrader:
                 kelly_enabled=kelly_enabled,
                 kelly_fraction=float(kelly_fraction),
                 kelly_stats=kelly_stats,
+                atr_pct=atr_pct,
+                leverage=dynamic_lev,
             )
 
             # 최소 notional 보장
@@ -2932,6 +2936,8 @@ class AutoTrader:
                 kelly_enabled=kelly_enabled,
                 kelly_fraction=float(kelly_fraction),
                 kelly_stats=kelly_stats,
+                atr_pct=atr_pct,
+                leverage=dynamic_lev,
             )
             notional = size * dynamic_lev
             min_notional = self.min_order_notional * 1.05

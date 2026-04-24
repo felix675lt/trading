@@ -56,6 +56,17 @@ class RiskManager:
         self._last_kelly: dict = {"used": False, "fraction": 0.0, "size": 0.0}
         self._last_cvar: dict = {"checked": False, "cvar_pct": 0.0, "threshold_pct": 0.0, "passed": True}
 
+        # === ATR-target sizing (2026-04-24 B) ===
+        # 트레이드당 "목표 리스크 = target_risk_pct × equity" 를 고정하고,
+        # 시장 변동성(ATR)에 반비례해 포지션 크기를 자동 조정.
+        # 저변동성기엔 더 크게, 고변동성기엔 더 작게 — 같은 expected loss.
+        atr_cfg = config.get("atr_sizing", {})
+        self.atr_sizing_enabled: bool = bool(atr_cfg.get("enabled", True))
+        self.atr_target_risk_pct: float = float(atr_cfg.get("target_risk_pct", 0.01))  # 1%/trade
+        self.atr_sl_mult: float = float(atr_cfg.get("sl_atr_mult", 1.5))  # SL = 1.5×ATR 가정
+        self.atr_min_pct: float = float(atr_cfg.get("atr_min_pct", 0.003))  # 0.3% 미만이면 사이즈 폭주 방지
+        self._last_atr_size: dict = {"used": False, "notional": 0.0, "size": 0.0}
+
     def initialize(self, equity: float):
         self.initial_equity = equity
         self.peak_equity = equity
@@ -264,25 +275,75 @@ class RiskManager:
         kelly_enabled: bool = False,
         kelly_fraction: float = 0.25,
         kelly_stats: dict | None = None,
+        atr_pct: float | None = None,      # NEW (B): 현재 ATR / price
+        leverage: float | None = None,     # NEW (B): notional 계산용
     ) -> float:
-        """포지션 크기 계산 — confidence/volatility 기반, tier에 따라 Kelly 혼합
+        """포지션 크기 계산 — ATR-target + Kelly 혼합 (2026-04-24 B)
 
         Args:
+            atr_pct: 현재 ATR을 가격의 % 단위로 (e.g. 0.015 = 1.5%).
+                     None이면 기존 volatility 휴리스틱으로 fallback.
+            leverage: ATR-sizing 시 notional → margin 변환에 필요.
+                     None이면 1배로 가정.
             kelly_enabled: Capital Tier가 kelly_enabled=True인 경우 활성화
             kelly_fraction: Fractional Kelly 비율 (0.25 = 1/4 Kelly, 안전)
             kelly_stats: TradeFeedbackAnalyzer.get_kelly_stats() 반환값
-                         {win_rate, avg_win, avg_loss, sample_size, kelly_fraction_raw}
+
+        ATR-target 전략:
+        - 목표 리스크 = target_risk_pct × equity (기본 1%)
+        - SL = sl_atr_mult × ATR 가정 (기본 1.5 ATR)
+        - notional × sl_atr_mult × atr_pct ≤ target_risk × equity
+        - → notional = (target_risk × equity) / (sl_atr_mult × atr_pct)
+        - → margin = notional / leverage
+        - 결과: 저변동성(저ATR)기엔 size↑, 고변동성기엔 size↓
+          모든 트레이드가 동일 expected loss로 수렴 (vol-target).
 
         Kelly 전략:
         - 샘플 ≥ 10이고 kelly_fraction_raw > 0일 때만 Kelly 적용
-        - Kelly 원시 비율에 fractional 계수 곱해서 안전성 확보
-        - Kelly와 기존 confidence 기반 크기를 min() 처리 — 더 보수적인 쪽 채택
-        - 샘플 부족 시 기존 confidence 기반 크기로 fallback
+        - ATR-sized vs Kelly-sized min() — 더 보수적 채택
+        - 샘플 부족 시 ATR-sized (또는 legacy conf-sized) 유지
         """
-        # === 기존 confidence + volatility 기반 사이즈 ===
-        base_size = equity * self.max_position_pct
-
+        min_size = equity * 0.01
+        max_size = equity * self.max_position_pct
         confidence_factor = max(0.3, min(1.0, confidence))
+
+        # === (A) ATR-target sizing — 가능하면 우선 채택 ===
+        sized_atr: float | None = None
+        if (
+            self.atr_sizing_enabled
+            and atr_pct is not None
+            and atr_pct > 0
+            and leverage is not None
+            and leverage > 0
+        ):
+            # outlier 방어 — 극단적 저ATR이면 사이즈 폭주 → 하한 적용
+            effective_atr = max(float(atr_pct), self.atr_min_pct)
+            target_risk = self.atr_target_risk_pct * equity
+            stop_distance_pct = self.atr_sl_mult * effective_atr
+            try:
+                atr_notional = target_risk / max(stop_distance_pct, 1e-6)
+                atr_margin = atr_notional / float(leverage)
+                # Confidence 모듈레이션 (낮은 신뢰도는 사이즈 축소)
+                atr_margin *= confidence_factor
+                # adaptive scale (레짐/피드백/HRP 등)
+                atr_margin *= adaptive_scale
+                sized_atr = max(min_size, min(max_size, atr_margin))
+                self._last_atr_size = {
+                    "used": True,
+                    "atr_pct": round(float(atr_pct), 5),
+                    "atr_effective": round(effective_atr, 5),
+                    "target_risk_pct": self.atr_target_risk_pct,
+                    "sl_atr_mult": self.atr_sl_mult,
+                    "notional": round(atr_notional, 2),
+                    "size": round(sized_atr, 2),
+                    "leverage": float(leverage),
+                }
+            except Exception as e:
+                logger.debug(f"[ATR-Size] 계산 실패, legacy로 fallback: {e}")
+                sized_atr = None
+
+        # === (B) Legacy confidence + volatility 휴리스틱 (fallback) ===
+        base_size = equity * self.max_position_pct
         sized = base_size * confidence_factor
 
         if volatility > 0:
@@ -290,10 +351,14 @@ class RiskManager:
             sized *= vol_factor
 
         sized *= adaptive_scale
-
-        min_size = equity * 0.01
-        max_size = equity * self.max_position_pct
         sized = max(min_size, min(max_size, sized))
+
+        # ATR-sized가 산출되면 그것을 primary로 채택 (legacy는 upper bound만 제공)
+        if sized_atr is not None:
+            sized = min(sized_atr, sized * 1.5)  # legacy의 150%까지만 허용 (안전장치)
+            sized = max(min_size, min(max_size, sized))
+        else:
+            self._last_atr_size = {"used": False, "reason": "atr_pct or leverage missing"}
 
         # === Kelly 혼합 (tier=mid+ 활성화) ===
         if kelly_enabled and kelly_stats:

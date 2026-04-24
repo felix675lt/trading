@@ -168,6 +168,16 @@ risk:
     min: 2
     max: 3                      # 상한 3x (Kelly 분수 계산과 매칭)
 
+  # === ATR-target 포지션 사이징 (2026-04-24 B) ===
+  # 트레이드당 목표 리스크를 equity%로 고정하고, ATR에 반비례해 size 자동조정.
+  # 저변동성기엔 size↑ / 고변동성기엔 size↓ — 모든 트레이드 동일 expected loss.
+  # notional = (target_risk × equity) / (sl_atr_mult × atr_pct)
+  atr_sizing:
+    enabled: true
+    target_risk_pct: 0.010      # 1% 손실/트레이드 (MaxDD 15% 대비 15회 연패 버퍼)
+    sl_atr_mult: 1.5            # SL = 1.5×ATR 기본 가정 (실제 sl_pct와 독립)
+    atr_min_pct: 0.003          # 0.3% 미만 atr이면 사이즈 폭주 방지 floor
+
   # === 종목별 스캘핑 프로파일 (수학적 재조정 2026-04-20) ===
   # 모든 프로파일 RR ≥ 2.5:1 강제 (EV 양수 조건: WR > 28.6%)
   # SL은 각 심볼 15m ATR × 2.5~3.0 기준 (노이즈 밖)
