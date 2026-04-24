@@ -50,6 +50,14 @@ class StrategyManager:
         self.long_only = config.get("long_only", False)
         self.live_long_only = config.get("live_long_only", False)
 
+        # === Smart Regime-Conditional SHORT Filter (2026-04-24) ===
+        # 특정 레짐에서만 숏 차단 — 실측 WR < 30%인 레짐 자동 거부.
+        # PAPER 학습 데이터에서 통계적으로 유의하게 실패한 레짐(예: strong_uptrend×SHORT n=23 WR 0%)만
+        # 차단하고, 나머지는 학습 기회를 유지한다.
+        self.smart_short_blocked_regimes = set(
+            config.get("smart_short_blocked_regimes", []) or []
+        )
+
         # === BREAKOUT vote source config (2026-04-23 옵션 C) ===
         bv = config.get("breakout_vote", {}) or {}
         self.breakout_enabled = bool(bv.get("enabled", False))
@@ -77,6 +85,11 @@ class StrategyManager:
             logger.warning("[Strategy] LONG_ONLY (global) 모드 활성화 — 전 모드 숏 진입 차단")
         elif self.live_long_only:
             logger.warning("[Strategy] LIVE_LONG_ONLY 모드 활성화 — LIVE만 숏 차단, PAPER 양방향")
+        if self.smart_short_blocked_regimes:
+            logger.warning(
+                f"[Strategy] SMART_SHORT_FILTER 활성 — {sorted(self.smart_short_blocked_regimes)} "
+                f"레짐에서는 PAPER/LIVE 모두 숏 차단 (실측 WR < 30%)"
+            )
         if self.live_aggressive_long:
             logger.warning(
                 f"[Strategy] LIVE 공격 롱 모드 ON — min_conf={self.live_min_confidence:.2f} "
@@ -474,13 +487,25 @@ class StrategyManager:
                     reason = direction_block
                     confidence = 0.0
 
-        # 2.85. LONG_ONLY 필터 (사용자 지시) — 숏 진입 완전 차단
+        # 2.85. 방향 필터 (사용자 지시) — 숏 진입 차단
         # 주: live_long_only는 여기서 차단하지 않는다 (PAPER는 양방향 학습 필요).
         #     LIVE 전용 차단은 main.py의 주문 실행 게이트에서 수행.
+        # (1) LONG_ONLY 전역 차단 (backward compat)
         if self.long_only and final_action == "short":
             logger.info(f"[LONG_ONLY] 숏 차단 → hold (원래 사유: {reason})")
             final_action = "hold"
             reason = f"LONG_ONLY 모드 — 숏 차단 (원신호: {reason})"
+            confidence = 0.0
+        # (2) 스마트 레짐-조건부 숏필터 — 특정 레짐에서만 숏 거부 (2026-04-24)
+        elif (final_action == "short"
+              and self.smart_short_blocked_regimes
+              and market_regime in self.smart_short_blocked_regimes):
+            logger.warning(
+                f"[SMART_SHORT] 레짐={market_regime} 숏 자동차단 (실측 WR<30% 통계 거부) "
+                f"→ hold (원 사유: {reason})"
+            )
+            final_action = "hold"
+            reason = f"SMART_SHORT 차단: {market_regime} 레짐 숏 금지 (원신호: {reason})"
             confidence = 0.0
 
         # 2.9. 피드백 블랙리스트 필터 [재활성화] — 반복 실패 패턴 진입 차단

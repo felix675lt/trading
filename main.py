@@ -1261,6 +1261,11 @@ class AutoTrader:
         if len(df) < 60:
             return
 
+        # 1.1 HRP용 OHLCV 캐시 주입 (다자산 전환 시 HRPAllocator가 읽음)
+        if not hasattr(self, "_last_ohlcv_cache"):
+            self._last_ohlcv_cache = {}
+        self._last_ohlcv_cache[symbol] = df
+
         # 1.5. 퀀트 ML 피처 확인 (최초 1회 로깅)
         quant_cols = [c for c in df.columns if "quant" in c]
         if quant_cols and not getattr(self, '_quant_feat_logged', False):
@@ -1578,9 +1583,11 @@ class AutoTrader:
                 )
                 if kelly_enabled else None
             )
+            # === HRP 다자산 가중치 (2026-04-24) — max_positions>1 & concentration_off일 때만 ===
+            hrp_scale = self._hrp_weight_for_symbol(symbol, mode="paper")
             size = self.risk_manager.calculate_position_size(
                 self.equity, decision.confidence, volatility,
-                adaptive_params["position_scale"] * fb_scale * corr_mult * quant_risk_scale,
+                adaptive_params["position_scale"] * fb_scale * corr_mult * quant_risk_scale * hrp_scale,
                 kelly_enabled=kelly_enabled,
                 kelly_fraction=float(kelly_fraction),
                 kelly_stats=kelly_stats,
@@ -3740,6 +3747,72 @@ class AutoTrader:
         except Exception as e:
             logger.debug(f"[Kelly] 계산 오류: {e}")
             return 0.0
+
+    def _hrp_weight_for_symbol(self, symbol: str, mode: str = "paper") -> float:
+        """HRP 가중치 적용 (2026-04-24, 다자산 전환 시만 활성).
+
+        활성 조건:
+          - tier.features['max_positions'] >= 2  (단일 집중 모드면 의미 없음)
+          - concentration_mode == False
+          - tier.name in ('mid','large','pro')    (소시드 집중 모드는 스킵)
+
+        로직:
+          - 티어의 전체 심볼 유니버스를 구하고 최근 N봉 수익률 DataFrame 구성
+          - HRPAllocator.allocate(returns) → {symbol: weight}
+          - 해당 symbol의 weight (미포함이면 1/N)를 반환
+          - 반환값을 position_scale에 곱해 사이즈를 HRP-aware로 축소
+
+        Returns: 0.1~1.0 (equal-weight 대비 비율 — 1.0 = 동일 가중)
+        """
+        try:
+            max_pos = self.tier_manager.get_feature("max_positions", mode=mode, default=1) or 1
+            if max_pos < 2:
+                return 1.0
+            concentrate = self.tier_manager.get_feature("concentration_mode", mode=mode, default=True)
+            if concentrate:
+                return 1.0
+            tier = self.tier_manager.get_tier(mode)
+            if tier.name not in ("mid", "large", "pro"):
+                return 1.0
+
+            universe = list(self.tier_manager.get_symbols(mode) or [])
+            if len(universe) < 2 or symbol not in universe:
+                return 1.0
+
+            # 최근 수익률 수집 — paper_trader/live_trader 중 어디든 caching된 df 활용
+            # self.last_signals 안에 {symbol: {"df": ohlcv}} 같은 캐시가 있을 수 있으므로
+            # 일단 있는 심볼만 가져와 공통 최소 길이로 정렬
+            import pandas as pd
+            cached = getattr(self, "_last_ohlcv_cache", None) or {}
+            returns = {}
+            for s in universe:
+                df = cached.get(s)
+                if df is None or len(df) < 50:
+                    continue
+                returns[s] = df["close"].pct_change().dropna().tail(100).reset_index(drop=True)
+            if len(returns) < 2 or symbol not in returns:
+                # 공평한 equal-weight fallback → 단일 심볼 비중 1/N
+                n = max(max_pos, len(universe))
+                return round(1.0 / n, 4)
+
+            df_r = pd.DataFrame(returns).dropna()
+            if len(df_r) < 20:
+                return round(1.0 / max(len(returns), 1), 4)
+            weights = self.hrp.allocate(df_r)
+            w = float(weights.get(symbol, 1.0 / max(len(returns), 1)))
+            # Equal-weight 기준(=1/N) 대비 비율 계산해 반환 (equal=1.0, 과비중=1.x, 저비중=0.x)
+            eq = 1.0 / max(len(returns), 1)
+            ratio = w / max(eq, 1e-9)
+            # 0.3~2.0 범위로 clip
+            ratio = max(0.3, min(ratio, 2.0))
+            logger.debug(
+                f"[HRP-{mode.upper()}] {symbol} weight={w:.3f} eq={eq:.3f} ratio={ratio:.2f} "
+                f"(universe={list(returns.keys())})"
+            )
+            return ratio
+        except Exception as e:
+            logger.debug(f"[HRP] {symbol} 가중치 계산 실패 → 1.0: {e}")
+            return 1.0
 
     async def _strategic_self_review(self):
         """4시간마다 실행 — 자체 거래 패턴 분석 + 전략 자동 조정

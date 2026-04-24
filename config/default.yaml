@@ -47,15 +47,21 @@ trading:
   max_concurrent_live: 1   # LIVE: 한 번에 1포지션만 (풀시드 올인)
   max_concurrent_paper: 4  # PAPER: 학습용으로 다중 가능
 
-  # === 방향 필터 (사용자 지시, 2026-04-23 재확정) ===
-  # 2026-04-17 해석: PAPER 양방향 허용 → 2026-04-22 사용자 재지시로 전역 숏 차단.
+  # === 방향 필터 (사용자 지시, 2026-04-24 재재확정) ===
+  # 2026-04-17 PAPER 양방향 → 2026-04-22 전역 숏차단 → 2026-04-24 "숏 풀고 학습기회 확대".
   # 근거 데이터 (PAPER 실측 2026-04-23 기준):
-  #   - strong_uptrend SHORT n=23 WR 0.0% sum=-$634.62 (압도적 fade 참사)
-  #   - ranging       SHORT n=10 WR 30.0% sum=-$237.84
-  #   - 상승/횡보 SHORT 합계 n=33 WR 9% sum=-$871 — 통계적으로 거부.
-  # long_only=true: 전 모드(PAPER+LIVE) 숏 차단. strategy/manager.py:380에서 enforce.
-  long_only: true
+  #   - strong_uptrend SHORT n=23 WR 0.0% sum=-$634.62 (fade 참사) → 이것만 차단
+  #   - ranging        SHORT n=10 WR 30.0% sum=-$237.84 → 학습 유지 (표본↑ 필요)
+  #   - strong_downtrend SHORT n=3 WR 66.7% sum=+$ → 허용
+  # 새 정책 (smart_short_filter):
+  #   long_only=false: 전역 숏차단 해제 (학습 기회 최대화)
+  #   live_long_only=true: 실자본 LIVE에서만 숏차단 유지 (실손실 방지)
+  #   smart_short_blocked_regimes: PAPER에서도 이 레짐에서는 숏 자동차단 (통계 거부)
+  long_only: false
   live_long_only: true
+  # 스마트 숏필터 — 특정 레짐에서만 숏 차단 (실측 WR < 30%)
+  smart_short_blocked_regimes:
+    - strong_uptrend     # n=23 WR 0% — 압도적 fade 참사 (통계 거부)
 
   # === 돌파매매 vote source (2026-04-23 신설, 옵션 C) ===
   # 학계 근거: Turtle(1983), Moskowitz-Ooi-Pedersen TS-MOM(2012), AQR Century(2017),
@@ -317,7 +323,7 @@ capital_tiers:
     - name: mid
       min: 2000
       max: 10000
-      description: "중형 시드 ($2K~$10K) — Kelly + BTC 재진입 + CVaR"
+      description: "중형 시드 ($2K~$10K) — Kelly + BTC + CVaR + Meta-Labeling"
       features:
         symbols: ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
         max_positions: 3
@@ -328,7 +334,7 @@ capital_tiers:
         kelly_fraction: 0.25
         limit_order_pref: true
         hmm_regime: false
-        meta_labeling: false
+        meta_labeling: true        # [2026-04-24] false→true — PAPER $5K 가상 시드부터 2차 분류기 학습 활성
         walk_forward_cv: true
         cvar_risk: true
         stat_arb_pairs: false
