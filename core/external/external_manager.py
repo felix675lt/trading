@@ -81,8 +81,15 @@ class ExternalDataManager:
             timeout_sec=float(llm_cfg.get("timeout_sec", 120.0)),  # thinking 포함
         )
         # composite_signal에 LLM 시그널이 기여할 가중치 (0~1).
-        # 초기엔 0.10 (낮게) 권장 — IC > 0.05 확인 후 0.20~0.30 상향.
+        # 초기값 — IC 검증 결과에 따라 auto_tune_llm_weight()가 자동 조정.
         self.llm_weight = float(llm_cfg.get("composite_weight", 0.10))
+        # IC 기반 자동 튜닝 파라미터 (config로 덮어쓰기 가능)
+        self._llm_weight_min = float(llm_cfg.get("weight_min", 0.03))
+        self._llm_weight_max = float(llm_cfg.get("weight_max", 0.35))
+        self._llm_weight_smooth = float(llm_cfg.get("weight_smoothing", 0.30))
+        self._llm_ic_min_samples = int(llm_cfg.get("ic_min_samples", 30))
+        # 지수이동평균 방식 자동 튜닝을 위한 내부 상태
+        self._llm_weight_last_tuned_ic: float | None = None
         # 최근 LLM 분석 결과 저장 (composite 계산 + storage 누적에 사용)
         self._last_llm_signal: dict = {}
 
@@ -100,6 +107,95 @@ class ExternalDataManager:
     def set_storage(self, storage):
         """Storage 인스턴스 주입 — 파생 스냅샷 시계열 누적용 (통찰 #3)"""
         self._storage = storage
+
+    # ------------------------------------------------------------------
+    # LLM 가중치 자동 튜닝 — IC 기반 (2026-04-24)
+    # ------------------------------------------------------------------
+    def auto_tune_llm_weight(self, ic_tracker) -> dict:
+        """IC Tracker를 읽어 llm_weight를 동적 조정.
+
+        철학: Claude 시그널의 실전 예측력(Spearman IC)이 검증되면 비중을
+        늘리고, 음수로 나오면 축소한다. 수동 튜닝 없이 시스템이 자기
+        알파를 평가해서 가중치를 재배치한다.
+
+        매핑 (목표 가중치):
+            IC < -0.03   → min (0.03) — 역베팅 대신 축소만, 불확실성 크면 더 축소
+            -0.03~0.00   → 0.05       — 유의미한 알파 없음, 방어적
+            0.00~0.03    → 0.08       — 보수적 유지
+            0.03~0.05    → 0.12       — 기본
+            0.05~0.08    → 0.18       — 약한 알파 확인
+            0.08~0.10    → 0.25       — 중간 알파
+            >= 0.10      → 0.30~0.35  — 강한 알파 (weight_max까지)
+
+        n_samples < ic_min_samples(30)이면 변경 없음 (통계 신뢰도 확보).
+
+        Smoothing: `new = (1-s)*current + s*target` — 기본 s=0.30으로
+        단번에 튀지 않게 완만하게 수렴.
+
+        Args:
+            ic_tracker: core.learning.ic_tracker.ICTracker 인스턴스
+
+        Returns:
+            {n_samples, ic, target, prev, new, changed(bool), reason}
+        """
+        try:
+            # LLM 전용 IC 추출 (source="llm")
+            llm_records = ic_tracker._by_source.get("llm")  # deque
+            n = len(llm_records) if llm_records else 0
+            if n < self._llm_ic_min_samples:
+                return {
+                    "n_samples": n, "ic": None,
+                    "target": None, "prev": self.llm_weight, "new": self.llm_weight,
+                    "changed": False, "reason": f"samples<{self._llm_ic_min_samples}",
+                }
+            ic_llm = float(ic_tracker.ic(source="llm"))
+            target = self._target_weight_from_ic(ic_llm)
+            # Clip into config bounds
+            target = max(self._llm_weight_min, min(self._llm_weight_max, target))
+            # Exponential smoothing
+            s = self._llm_weight_smooth
+            prev = float(self.llm_weight)
+            new = (1.0 - s) * prev + s * target
+            new = round(new, 4)
+            changed = abs(new - prev) > 1e-4
+            if changed:
+                self.llm_weight = new
+                logger.info(
+                    f"[LLM-AutoTune] IC={ic_llm:+.3f} n={n} "
+                    f"target={target:.3f} → weight {prev:.3f}→{new:.3f} "
+                    f"(smooth={s:.2f})"
+                )
+            self._llm_weight_last_tuned_ic = ic_llm
+            return {
+                "n_samples": n, "ic": round(ic_llm, 4),
+                "target": round(target, 4), "prev": prev, "new": new,
+                "changed": changed,
+                "reason": "ok" if changed else "converged",
+            }
+        except Exception as e:
+            logger.warning(f"[LLM-AutoTune] 실패: {e}")
+            return {
+                "n_samples": 0, "ic": None, "target": None,
+                "prev": self.llm_weight, "new": self.llm_weight,
+                "changed": False, "reason": f"error:{type(e).__name__}",
+            }
+
+    @staticmethod
+    def _target_weight_from_ic(ic: float) -> float:
+        """IC 값 → 목표 llm_weight 단조매핑."""
+        if ic < -0.03:
+            return 0.03
+        if ic < 0.00:
+            return 0.05
+        if ic < 0.03:
+            return 0.08
+        if ic < 0.05:
+            return 0.12
+        if ic < 0.08:
+            return 0.18
+        if ic < 0.10:
+            return 0.25
+        return 0.30
 
     async def update(self, symbol: str = "BTC/USDT:USDT") -> dict:
         """모든 외부 데이터 수집 및 분석"""

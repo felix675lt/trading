@@ -269,13 +269,21 @@ external:
   #                  없으면 deepseek → openai → vader 순으로 폴백.
   # model="auto"  → Anthropic /v1/models API 프로브로 최신 Opus 자동 선정.
   #                 새 Opus 출시 시 재기동만으로 자동 채택됨.
-  # composite_weight — 기존 11개 소스 가중치 대비 LLM 기여도. IC 검증 전 낮게 유지.
-  #                    IC > 0.05 확인 후 0.20~0.30 상향 권장.
+  # composite_weight — 초기값만. auto_tune_llm_weight()가 IC 기반 동적 재배치.
   llm_signal:
     backend: "auto"
-    composite_weight: 0.10     # 0.05~0.15 권장 (초기), IC 검증 후 상향
+    composite_weight: 0.10     # 초기값 — IC 검증 후 auto-tune이 [0.03,0.35] 범위 조정
     cache_ttl_sec: 900          # 15분 — LLM 호출 비용 관리
     timeout_sec: 120.0          # thinking 포함 호출이면 60s 이상 권장
+    # --- IC 기반 자동 튜닝 (2026-04-24 신규) ---
+    # 1h마다 ICTracker의 "llm" 소스를 읽어 llm_weight를 단조 매핑 + 스무딩.
+    #   n_samples < ic_min_samples면 변경 없음 (통계 신뢰도 확보).
+    #   IC<-0.03 → 0.03, <0→0.05, <0.03→0.08, <0.05→0.12, <0.08→0.18,
+    #   <0.10→0.25, ≥0.10 → 0.30 (단, weight_max로 클리핑).
+    weight_min: 0.03             # IC가 음수일 때 최소 비중 (완전차단 방지)
+    weight_max: 0.35             # 강한 알파 확인 시 최대 비중
+    weight_smoothing: 0.30       # 0.0=고정, 1.0=즉시 전환. 0.3=3~5주기에 수렴
+    ic_min_samples: 30           # Spearman 신뢰 확보 최소 표본
 
 # =============================================================================
 # Capital Tier System — 시드 구간별 기능 자동 활성화

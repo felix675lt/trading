@@ -1099,6 +1099,21 @@ class AutoTrader:
                         or (now_utc - self._last_ic_log).total_seconds() > 3600
                     ):
                         self.ic_tracker.log_summary()
+                        # LLM 가중치 자동 튜닝 — Claude 시그널 IC 기반으로
+                        # external_manager.llm_weight를 동적 조정. 수동 설정 불필요.
+                        try:
+                            if hasattr(self, "external_manager") and self.external_manager is not None:
+                                self.external_manager.auto_tune_llm_weight(self.ic_tracker)
+                        except Exception as ee:
+                            logger.debug(f"[LLM-AutoTune] 주기 실행 실패: {ee}")
+                        # CPCV/DSR 오버핏 자동 검증 — 하루 1회 강제
+                        try:
+                            if hasattr(self, "strategy_optimizer_paper"):
+                                self.strategy_optimizer_paper.validate_configs_dsr()
+                            if hasattr(self, "strategy_optimizer_live"):
+                                self.strategy_optimizer_live.validate_configs_dsr()
+                        except Exception as ee:
+                            logger.debug(f"[DSR] 주기 검증 실패: {ee}")
                         self._last_ic_log = now_utc
                 except Exception as e:
                     logger.debug(f"[IC] 주기 summary 실패: {e}")
@@ -1684,6 +1699,8 @@ class AutoTrader:
                 "volatility": volatility,
                 "external_score": ext_signal.get("score", 0),
                 "external_direction": ext_signal.get("direction", "neutral"),
+                # Claude-native LLM 전용 IC 평가용 엔트리 시그널 (auto-tune 재료)
+                "llm_score": float(ext_signal.get("llm_score", 0) or 0),
             }
 
             # === PAPER 청산 ===
@@ -1710,6 +1727,14 @@ class AutoTrader:
                             realized_return=realized,
                             source="ensemble",
                         )
+                        # Claude-native LLM 단독 IC (llm_weight auto-tune 재료)
+                        llm_entry = float(trade_context.get("llm_score", 0) or 0)
+                        if abs(llm_entry) > 1e-6:
+                            self.ic_tracker.record(
+                                signal=llm_entry,
+                                realized_return=realized,
+                                source="llm",
+                            )
                     except Exception as e:
                         logger.debug(f"[IC] 기록 실패: {e}")
                     if result["pnl"] < 0:
@@ -1774,6 +1799,14 @@ class AutoTrader:
                                 realized_return=realized,
                                 source="ensemble_live",
                             )
+                            # LLM 단독 IC (LIVE도 "llm" 소스로 통합 — auto-tune에 합산)
+                            llm_entry = float(ext_signal.get("llm_score", 0) or 0) if isinstance(ext_signal, dict) else 0.0
+                            if abs(llm_entry) > 1e-6:
+                                self.ic_tracker.record(
+                                    signal=llm_entry,
+                                    realized_return=realized,
+                                    source="llm",
+                                )
                         except Exception as e:
                             logger.debug(f"[IC-LIVE] 기록 실패: {e}")
                         if live_pnl < 0:
@@ -2607,6 +2640,15 @@ class AutoTrader:
                         realized_return=realized,
                         source="ensemble_live",
                     )
+                    # LLM 단독 IC — ext_signal(dict)에서 llm_score 추출
+                    ext_c = c.get("ext_signal") if isinstance(c, dict) else None
+                    llm_entry = float(ext_c.get("llm_score", 0) or 0) if isinstance(ext_c, dict) else 0.0
+                    if abs(llm_entry) > 1e-6:
+                        self.ic_tracker.record(
+                            signal=llm_entry,
+                            realized_return=realized,
+                            source="llm",
+                        )
                 except Exception as e:
                     logger.debug(f"[IC-LIVE] 기록 실패: {e}")
                 if live_pnl < 0:
