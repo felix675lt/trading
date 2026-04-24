@@ -1114,6 +1114,42 @@ class AutoTrader:
                                 self.strategy_optimizer_live.validate_configs_dsr()
                         except Exception as ee:
                             logger.debug(f"[DSR] 주기 검증 실패: {ee}")
+                        # Paper↔Live 체결 모델 동기화 — LIVE 실측 슬리피지/메이커율 피드백
+                        # 백테스트·페이퍼가 실거래와 다른 체결비용으로 돌아가면 전략 신호가
+                        # 왜곡되므로, OrderManager가 누적한 중앙값 통계를 PaperTrader로
+                        # 지수평활 주입해 괴리를 0으로 수렴시킨다.
+                        try:
+                            if self.mode in ("paper", "dual") and self.order_managers:
+                                merged_stats: dict = {}
+                                total_n = 0
+                                for _om in self.order_managers.values():
+                                    try:
+                                        _s = _om.get_execution_stats()
+                                    except Exception:
+                                        continue
+                                    _n = int(_s.get("n_samples", 0) or 0)
+                                    if _n <= 0:
+                                        continue
+                                    # 가중합 (샘플 수 비례) — 복수 거래소 가중 중앙값 근사
+                                    for _k in ("entry_slip_bps_med", "exit_slip_bps_med",
+                                               "sl_slip_bps_med", "maker_fill_rate"):
+                                        _v = _s.get(_k)
+                                        if _v is None:
+                                            continue
+                                        merged_stats[_k] = merged_stats.get(_k, 0.0) + float(_v) * _n
+                                    total_n += _n
+                                if total_n > 0:
+                                    for _k in list(merged_stats.keys()):
+                                        merged_stats[_k] = merged_stats[_k] / total_n
+                                    merged_stats["n_samples"] = total_n
+                                    delta = self.paper_trader.sync_from_live_execution(merged_stats)
+                                    # delta.entry_before/after, sl_extra_before/after 등은
+                                    # PaperTrader 내부에서 이미 info 레벨로 로깅됨.
+                                    # 여기서는 skip 사유만 debug로 남긴다.
+                                    if delta and "skipped" in delta:
+                                        logger.debug(f"[Paper-LiveSync] skipped: {delta['skipped']}")
+                        except Exception as ee:
+                            logger.debug(f"[Paper-LiveSync] 주기 실행 실패: {ee}")
                         self._last_ic_log = now_utc
                 except Exception as e:
                     logger.debug(f"[IC] 주기 summary 실패: {e}")

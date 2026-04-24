@@ -93,6 +93,17 @@ class PaperTrader:
         # LIVE 피드백으로 덮어쓰기 가능한 maker fill rate
         self.maker_fill_rate = self.DEFAULT_MAKER_FILL_RATE
 
+        # === 인스턴스-레벨 슬리피지 파라미터 (2026-04-24 A: LIVE 피드백 가능) ===
+        # 클래스 상수 DEFAULT_*는 초기값만 제공. 이하 4개는 sync_from_live_execution()
+        # 으로 LIVE 실측값에 맞춰 동적 갱신됨 — 이렇게 해야 Paper의 슬리피지가
+        # 실전과 괴리되지 않음.
+        self._slip_entry_bps = float(self.DEFAULT_SLIPPAGE_BPS)
+        self._slip_sl_extra_bps = float(self.SL_SLIPPAGE_EXTRA_BPS)
+        self._slip_market_fallback_bps = float(self.MARKET_FALLBACK_EXTRA_BPS)
+        self._slip_latency_bps = float(self.LATENCY_SLIPPAGE_BPS)
+        # 슬리피지 동기화 이력 (대시보드/디버깅용)
+        self._slip_sync_history: list[dict] = []
+
         # 심볼별 funding rate 캐시 (외부에서 주입)
         # { "BTC/USDT:USDT": 0.0001 }  — 8h당 rate (롱이 숏에게 지불하면 +)
         self._funding_rates: dict[str, float] = {}
@@ -150,21 +161,122 @@ class PaperTrader:
     def _slippage_bps(self, symbol: str, is_sl: bool = False, is_market_fallback: bool = False) -> float:
         """방향 불리한 슬리피지를 bps로 반환.
 
-        - 기본: 5bp
-        - ATR × 0.15 추가 (변동성 가변)
-        - SL 히트면 +8bp
-        - market fallback이면 +3bp
-        - 레이턴시 +2bp
+        인스턴스-레벨 파라미터 사용 — `sync_from_live_execution()`이 LIVE 실측
+        중앙값으로 이들을 동적 갱신. 따라서 PAPER 슬리피지가 실전과 자동으로 수렴.
+
+        - 기본 entry: self._slip_entry_bps (기본 5bp, LIVE 실측으로 덮어씀)
+        - ATR × 0.15 추가 (변동성 가변, symbol별)
+        - SL 히트면 +self._slip_sl_extra_bps (기본 8bp)
+        - market fallback이면 +self._slip_market_fallback_bps (기본 3bp)
+        - 레이턴시 +self._slip_latency_bps (기본 2bp)
         """
-        bps = self.DEFAULT_SLIPPAGE_BPS
+        bps = self._slip_entry_bps
         atr_pct = self._atr_cache.get(symbol, 0.0)
         bps += atr_pct * 10000 * self.SLIPPAGE_ATR_COEF  # atr_pct 0.01 → +15bp
         if is_sl:
-            bps += self.SL_SLIPPAGE_EXTRA_BPS
+            bps += self._slip_sl_extra_bps
         if is_market_fallback:
-            bps += self.MARKET_FALLBACK_EXTRA_BPS
-        bps += self.LATENCY_SLIPPAGE_BPS
+            bps += self._slip_market_fallback_bps
+        bps += self._slip_latency_bps
         return bps
+
+    # ------------------------------------------------------------------
+    # LIVE 실측 체결 통계로부터 슬리피지 / 체결률 자동 동기화 (2026-04-24)
+    # ------------------------------------------------------------------
+    def sync_from_live_execution(self, live_stats: dict, smoothing: float = 0.30) -> dict:
+        """LIVE OrderManager.get_execution_stats() 결과를 Paper에 반영.
+
+        핵심 철학: PAPER가 LIVE와 괴리되면 학습된 모델이 실전에서 기대 대비
+        수익률이 꺾인다. 따라서 LIVE의 실측 체결 모델(슬리피지, maker rate)을
+        주기적으로 Paper에 지수스무딩으로 주입 → 두 환경이 통계적으로 수렴.
+
+        Args:
+            live_stats: OrderManager.get_execution_stats() 반환 dict.
+                       기대 키: entry_slip_bps_med, exit_slip_bps_med,
+                                sl_slip_bps_med, maker_fill_rate, n_samples
+            smoothing: (1-s)*current + s*observed. 기본 0.30 (3~5회 관측으로 수렴).
+
+        Returns:
+            적용 전/후 delta 요약 — 대시보드/로그용.
+        """
+        if not live_stats or not isinstance(live_stats, dict):
+            return {"skipped": "no_stats"}
+        n = int(live_stats.get("n_samples", 0) or 0)
+        if n < 5:
+            return {"skipped": f"n={n}<5"}
+
+        s = max(0.0, min(1.0, float(smoothing)))
+        before = {
+            "entry": self._slip_entry_bps,
+            "sl_extra": self._slip_sl_extra_bps,
+            "maker_fill": self.maker_fill_rate,
+        }
+
+        # 엔트리 슬리피지 — LIVE 실측 중앙값으로 수렴
+        obs_entry = live_stats.get("entry_slip_bps_med")
+        if obs_entry is not None and obs_entry >= 0:
+            self._slip_entry_bps = (1 - s) * self._slip_entry_bps + s * float(obs_entry)
+            # 클리핑 (outlier 방어): [1bp, 50bp]
+            self._slip_entry_bps = max(1.0, min(50.0, self._slip_entry_bps))
+
+        # SL 추가 슬리피지 — (exit_sl - exit_normal) 로 분해
+        obs_exit = live_stats.get("exit_slip_bps_med")
+        obs_sl = live_stats.get("sl_slip_bps_med")
+        if obs_sl is not None and obs_exit is not None and obs_sl > obs_exit:
+            extra = float(obs_sl - obs_exit)
+            self._slip_sl_extra_bps = (1 - s) * self._slip_sl_extra_bps + s * extra
+            # 클리핑: [0bp, 40bp]
+            self._slip_sl_extra_bps = max(0.0, min(40.0, self._slip_sl_extra_bps))
+
+        # Maker 체결률
+        obs_maker = live_stats.get("maker_fill_rate")
+        if obs_maker is not None and 0.0 <= obs_maker <= 1.0:
+            self.maker_fill_rate = (1 - s) * self.maker_fill_rate + s * float(obs_maker)
+
+        after = {
+            "entry": self._slip_entry_bps,
+            "sl_extra": self._slip_sl_extra_bps,
+            "maker_fill": self.maker_fill_rate,
+        }
+        delta = {
+            "n_samples": n,
+            "entry_before": round(before["entry"], 2),
+            "entry_after": round(after["entry"], 2),
+            "sl_extra_before": round(before["sl_extra"], 2),
+            "sl_extra_after": round(after["sl_extra"], 2),
+            "maker_fill_before": round(before["maker_fill"], 3),
+            "maker_fill_after": round(after["maker_fill"], 3),
+            "smoothing": s,
+        }
+        # 변경이 의미있으면 로그
+        if (
+            abs(after["entry"] - before["entry"]) > 0.3
+            or abs(after["sl_extra"] - before["sl_extra"]) > 0.3
+            or abs(after["maker_fill"] - before["maker_fill"]) > 0.01
+        ):
+            logger.info(
+                f"[Paper-LiveSync] n={n} | entry {before['entry']:.1f}→{after['entry']:.1f}bp | "
+                f"SL+ {before['sl_extra']:.1f}→{after['sl_extra']:.1f}bp | "
+                f"maker {before['maker_fill']:.2f}→{after['maker_fill']:.2f}"
+            )
+        # 이력 기록 (최근 20개)
+        self._slip_sync_history.append({
+            "ts": str(datetime.utcnow()), **delta,
+        })
+        if len(self._slip_sync_history) > 20:
+            self._slip_sync_history = self._slip_sync_history[-20:]
+        return delta
+
+    def get_execution_profile(self) -> dict:
+        """현재 Paper 체결 모델 상태 — 대시보드/디버깅용."""
+        return {
+            "entry_slip_bps": round(self._slip_entry_bps, 2),
+            "sl_extra_bps": round(self._slip_sl_extra_bps, 2),
+            "market_fallback_bps": round(self._slip_market_fallback_bps, 2),
+            "latency_bps": round(self._slip_latency_bps, 2),
+            "maker_fill_rate": round(self.maker_fill_rate, 3),
+            "sync_events": len(self._slip_sync_history),
+        }
 
     def _apply_slippage(self, side: str, price: float, bps: float, is_entry: bool) -> float:
         """슬리피지 적용 — 항상 방향 불리하게.

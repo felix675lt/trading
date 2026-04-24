@@ -93,6 +93,15 @@ class OrderManager:
         # 지정가 체결 통계 — Paper 피드백용 (maker fill rate 실측)
         self.limit_fill_stats = {"attempts": 0, "filled": 0, "fallback_market": 0}
 
+        # === 슬리피지 실측 (2026-04-24 A: Paper-Live 괴리 제거) ===
+        # 각 체결마다 (requested_price vs fill_price)를 bps로 기록.
+        # sync_from_live_execution()이 이걸 중앙값으로 집계해서 Paper에 주입.
+        # rolling 50건만 유지 — 시장 레짐 변화에 따라잡기 좋은 윈도우.
+        from collections import deque
+        self._slip_entry: deque = deque(maxlen=50)
+        self._slip_exit: deque = deque(maxlen=50)
+        self._slip_exit_sl: deque = deque(maxlen=50)
+
     def get_maker_fill_rate(self) -> float | None:
         """Limit-first 시도 대비 maker 체결 성공률 (부분체결 수용 포함).
         샘플 수가 너무 적으면 None 반환 → 호출부가 기본값 유지.
@@ -101,6 +110,47 @@ class OrderManager:
         if attempts < 5:
             return None
         return self.limit_fill_stats.get("filled", 0) / attempts
+
+    def get_execution_stats(self) -> dict:
+        """LIVE 실측 체결 통계 — Paper 피드백 동기화용 (2026-04-24).
+
+        PAPER와 LIVE의 체결 모델 괴리를 제거하기 위해, 실전 LIVE 체결 결과를
+        집계해 Paper의 슬리피지/maker 체결률을 갱신하는 데 쓴다.
+
+        반환 필드:
+            entry_slip_bps_med: 진입 슬리피지 중앙값 (bps, 방향불리=+)
+            exit_slip_bps_med:  일반 청산 슬리피지 중앙값
+            sl_slip_bps_med:    SL/liquidation 청산 슬리피지 중앙값
+            maker_fill_rate:    limit-first 체결률 (None이면 샘플부족)
+            n_samples:          집계에 쓰인 총 관측 수
+
+        호출부가 n_samples<5면 무시해야 (초기 노이즈 방어).
+        """
+        import statistics as _st
+        def _median_safe(arr) -> float | None:
+            vals = [float(x) for x in arr if isinstance(x, (int, float))]
+            if not vals:
+                return None
+            try:
+                return float(_st.median(vals))
+            except Exception:
+                return None
+
+        entry_med = _median_safe(self._slip_entry)
+        exit_med = _median_safe(self._slip_exit)
+        sl_med = _median_safe(self._slip_exit_sl)
+        maker_rate = self.get_maker_fill_rate()
+        n = len(self._slip_entry) + len(self._slip_exit) + len(self._slip_exit_sl)
+        return {
+            "entry_slip_bps_med": round(entry_med, 2) if entry_med is not None else None,
+            "exit_slip_bps_med": round(exit_med, 2) if exit_med is not None else None,
+            "sl_slip_bps_med": round(sl_med, 2) if sl_med is not None else None,
+            "maker_fill_rate": round(maker_rate, 3) if maker_rate is not None else None,
+            "n_samples": int(n),
+            "n_entry": len(self._slip_entry),
+            "n_exit": len(self._slip_exit),
+            "n_exit_sl": len(self._slip_exit_sl),
+        }
 
     def set_routing(
         self,
@@ -397,6 +447,22 @@ class OrderManager:
 
             fill_price = float(order.get("average", price) or price)
 
+            # === 진입 슬리피지 실측 기록 (Paper-Live 피드백용) ===
+            # long buy면 체결가가 요청가보다 높을수록 불리(+bps),
+            # short sell이면 체결가가 요청가보다 낮을수록 불리(+bps).
+            # price는 주문 직전 ticker_price이므로 비교 기준으로 적합.
+            try:
+                if price > 0 and fill_price > 0:
+                    if side == "long":
+                        slip_bps = (fill_price - price) / price * 10000.0
+                    else:
+                        slip_bps = (price - fill_price) / price * 10000.0
+                    # 비정상 outlier 방어 — ±200bp 초과면 기록 제외
+                    if -200.0 <= slip_bps <= 200.0:
+                        self._slip_entry.append(float(slip_bps))
+            except Exception:
+                pass
+
             # 실제 체결 수량 확인 — 부분 체결 대응
             filled = float(order.get("filled", 0))
             if filled > 0:
@@ -538,6 +604,26 @@ class OrderManager:
                 return {}
 
             fill_price = float(order.get("average", 0))
+
+            # === 청산 슬리피지 실측 기록 (Paper-Live 피드백용) ===
+            # 청산은 반대 방향: long close = sell, short close = buy.
+            # ticker_price (주문 직전 시장가)와 fill_price 차이를 방향불리로 계산.
+            try:
+                ref_price = float(ticker_price) if ticker_price else 0.0
+                if ref_price > 0 and fill_price > 0:
+                    if pos.side == "long":  # 청산=매도, 체결가가 낮을수록 불리(+bps)
+                        slip_bps = (ref_price - fill_price) / ref_price * 10000.0
+                    else:  # 청산=매수, 체결가가 높을수록 불리(+bps)
+                        slip_bps = (fill_price - ref_price) / ref_price * 10000.0
+                    if -200.0 <= slip_bps <= 200.0:
+                        # SL/liquidation 여부로 분리 저장 (Paper의 SL_SLIPPAGE_EXTRA 재보정용)
+                        is_sl_hit = ("SL" in reason.upper()) or ("liq" in reason.lower())
+                        if is_sl_hit:
+                            self._slip_exit_sl.append(float(slip_bps))
+                        else:
+                            self._slip_exit.append(float(slip_bps))
+            except Exception:
+                pass
 
             pnl = 0.0
             if fill_price > 0:
