@@ -54,10 +54,21 @@ class LLMSignal:
     ts: float = field(default_factory=time.time)
     cached: bool = False
 
+    # --- claude_native 전용 확장 필드 (다른 백엔드에서는 기본값 유지) ---------
+    expected_value: float = 0.0                         # scenario 가중 기대수익
+    scenarios: list[dict] = field(default_factory=list) # [{label, probability, expected_return_pct, rationale}]
+    risk_events_scored: list[dict] = field(default_factory=list)  # [{event, severity}]
+    samples_raw: int = 0                                # self-consistency 샘플 수
+    critique_survived: bool = True                      # critic 통과 여부
+
     def to_external_signal(self) -> dict:
-        """기존 external_signal 포맷(dict)로 변환 — StrategyManager와 호환."""
+        """기존 external_signal 포맷(dict)로 변환 — StrategyManager와 호환.
+
+        claude_native 백엔드는 추가 필드(expected_value, scenarios, severity)를
+        메타데이터로 실어 보낸다. 기존 소비자는 무시해도 동작에 영향 없음.
+        """
         strength = "strong" if abs(self.score) > 0.6 else ("moderate" if abs(self.score) > 0.3 else "weak")
-        return {
+        out = {
             "score": self.score,
             "direction": self.direction if self.direction in ("bullish", "bearish") else "neutral",
             "strength": strength,
@@ -66,20 +77,39 @@ class LLMSignal:
             "reasoning": self.reasoning,
             "backend": self.backend,
         }
+        # claude_native 추가 메타
+        if self.scenarios:
+            out["expected_value"] = self.expected_value
+            out["scenarios"] = self.scenarios
+            out["samples_raw"] = self.samples_raw
+            out["critique_survived"] = self.critique_survived
+        if self.risk_events_scored:
+            out["risk_events_scored"] = self.risk_events_scored
+            # 최대 severity도 평탄화 — risk gate에서 즉시 활용 가능
+            out["max_risk_severity"] = max(
+                (float(r.get("severity", 0.0)) for r in self.risk_events_scored),
+                default=0.0,
+            )
+        return out
 
 
 class LLMSignalEngine:
     """다중 백엔드 LLM 시그널 엔진.
 
     Backends (우선순위):
-      1) deepseek  — DeepSeek-V3/R1 API (cost-effective, 추천)
-      2) anthropic — Claude 3.5 Sonnet (해석력 최상, 비용↑)
-      3) openai    — GPT-4 (호환성↑)
-      4) vader     — 로컬 폴백 (네트워크/API 없이 동작)
+      1) claude_native — Claude 3.5 Sonnet + DeepSeek 방법론(CoT+SC+Critique+EV)
+                         → DeepSeek API 없이 동등 이상 시그널 품질. ANTHROPIC_API_KEY만 필요.
+      2) deepseek  — DeepSeek-V3/R1 API (cost-effective)
+      3) anthropic — Claude 3.5 Sonnet (기본 단발 프롬프트)
+      4) openai    — GPT-4 (호환성↑)
+      5) vader     — 로컬 폴백 (네트워크/API 없이 동작)
 
     환경변수:
       DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY
-      LLM_BACKEND=deepseek|anthropic|openai|vader  (override)
+      LLM_BACKEND=claude_native|deepseek|anthropic|openai|vader  (override)
+      LLM_CLAUDE_MODEL=claude-3-5-sonnet-latest  (선택)
+      LLM_CLAUDE_N_SAMPLES=3                     (self-consistency N)
+      LLM_CLAUDE_CRITIQUE=1                      (0=disable critic)
     """
 
     PROMPT_SYSTEM = (
@@ -109,6 +139,24 @@ class LLMSignalEngine:
         self._cache: dict[str, tuple[float, LLMSignal]] = {}
         self._call_count = 0
         self._fail_count = 0
+
+        # claude_native 분석기는 lazy init — 백엔드 선택 시에만 구성
+        self._claude_analyzer: Any = None
+        if self.backend == "claude_native" and self.api_key:
+            try:
+                from core.external.claude_quant_analyzer import ClaudeQuantAnalyzer
+                self._claude_analyzer = ClaudeQuantAnalyzer(
+                    api_key=self.api_key,
+                    model=os.getenv("LLM_CLAUDE_MODEL", "claude-3-5-sonnet-latest"),
+                    n_samples=int(os.getenv("LLM_CLAUDE_N_SAMPLES", "3")),
+                    enable_critique=os.getenv("LLM_CLAUDE_CRITIQUE", "1") != "0",
+                    timeout_per_call=timeout_sec,
+                )
+            except Exception as e:
+                logger.warning(f"[LLMSignal] claude_native 초기화 실패 → vader 폴백: {e}")
+                self.backend = "vader"
+                self.api_key = None
+
         logger.info(
             f"[LLMSignal] 초기화 — backend={self.backend} "
             f"key={'OK' if self.api_key else 'NONE'} ttl={cache_ttl_sec}s weight={default_weight}"
@@ -116,10 +164,12 @@ class LLMSignalEngine:
 
     @staticmethod
     def _resolve_api_key(backend: str) -> str | None:
+        # claude_native도 ANTHROPIC_API_KEY 사용
         return {
-            "deepseek":  os.getenv("DEEPSEEK_API_KEY"),
-            "anthropic": os.getenv("ANTHROPIC_API_KEY"),
-            "openai":    os.getenv("OPENAI_API_KEY"),
+            "deepseek":      os.getenv("DEEPSEEK_API_KEY"),
+            "anthropic":     os.getenv("ANTHROPIC_API_KEY"),
+            "claude_native": os.getenv("ANTHROPIC_API_KEY"),
+            "openai":        os.getenv("OPENAI_API_KEY"),
         }.get(backend)
 
     @staticmethod
@@ -147,7 +197,9 @@ class LLMSignalEngine:
                 return sig
 
         try:
-            if self.backend == "deepseek" and self.api_key:
+            if self.backend == "claude_native" and self._claude_analyzer:
+                out = await self._call_claude_native(texts, symbol, regime)
+            elif self.backend == "deepseek" and self.api_key:
                 out = await self._call_deepseek(texts, symbol, regime)
             elif self.backend == "anthropic" and self.api_key:
                 out = await self._call_anthropic(texts, symbol, regime)
@@ -165,6 +217,41 @@ class LLMSignalEngine:
         return out
 
     # --- backend impls -----------------------------------------------------
+    async def _call_claude_native(
+        self, texts: list[str], symbol: str, regime: str
+    ) -> LLMSignal:
+        """Claude-Native 고급 파이프라인 — DeepSeek 방법론 완전 재현.
+
+        ClaudeQuantAnalyzer → ClaudeAnalysis 반환 → LLMSignal로 래핑.
+        확장 필드(scenarios, severity, EV)는 to_external_signal()에서 메타로 노출.
+        """
+        ca = await self._claude_analyzer.analyze(texts, symbol=symbol, regime=regime)
+        return LLMSignal(
+            direction=ca.direction,
+            conviction=ca.conviction,
+            horizon=ca.horizon,
+            score=ca.score,
+            reasoning=ca.reasoning,
+            risk_events=[re.event for re in ca.risk_events],
+            backend="claude_native",
+            expected_value=ca.expected_value,
+            scenarios=[
+                {
+                    "label": s.label,
+                    "probability": s.probability,
+                    "expected_return_pct": s.expected_return_pct,
+                    "rationale": s.rationale,
+                }
+                for s in ca.scenarios
+            ],
+            risk_events_scored=[
+                {"event": re.event, "severity": re.severity}
+                for re in ca.risk_events
+            ],
+            samples_raw=ca.samples_raw,
+            critique_survived=ca.critique_survived,
+        )
+
     async def _call_deepseek(self, texts: list[str], symbol: str, regime: str) -> LLMSignal:
         import aiohttp
         user = self._build_user_prompt(texts, symbol, regime)
@@ -307,10 +394,13 @@ class LLMSignalEngine:
             return LLMSignal(backend=backend, reasoning=f"parse_error:{e}")
 
     def diagnostics(self) -> dict:
-        return {
+        d = {
             "backend": self.backend,
             "has_key": bool(self.api_key),
             "cache_size": len(self._cache),
             "calls": self._call_count,
             "fails": self._fail_count,
         }
+        if self._claude_analyzer is not None:
+            d["claude_native"] = self._claude_analyzer.diagnostics()
+        return d
