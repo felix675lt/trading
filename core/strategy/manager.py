@@ -64,6 +64,31 @@ class StrategyManager:
             config.get("smart_short_blocked_regimes", []) or []
         )
 
+        # === BOCPD 변환점 게이트 (2026-04-25) ===
+        # Adams & MacKay (2007) Bayesian Online Changepoint Detection.
+        # 레짐 전환 직후 잘못된 방향 진입 방지 — changepoint_prob >= block_threshold면 차단.
+        # 외부에서 set_bocpd_detector(detector)로 주입 — 미설정 시 비활성.
+        self.bocpd_detector = None
+        bocpd_cfg = config.get("bocpd", {}) or {}
+        self.bocpd_enabled = bool(bocpd_cfg.get("enabled", True))
+        self.bocpd_block_threshold = float(bocpd_cfg.get("block_threshold", 0.6))
+        if self.bocpd_enabled:
+            try:
+                from core.strategy.bocpd import BOCPDRegimeDetector
+                self.bocpd_detector = BOCPDRegimeDetector(
+                    hazard_rate=float(bocpd_cfg.get("hazard_rate", 1 / 250)),
+                    volatility_window=int(bocpd_cfg.get("volatility_window", 20)),
+                    trend_window=int(bocpd_cfg.get("trend_window", 50)),
+                    changepoint_threshold=float(bocpd_cfg.get("changepoint_threshold", 0.3)),
+                    block_threshold=self.bocpd_block_threshold,
+                )
+                logger.info(
+                    f"[Strategy] BOCPD 변환점 게이트 활성 — block≥{self.bocpd_block_threshold:.2f}"
+                )
+            except Exception as e:
+                logger.warning(f"[Strategy] BOCPD 초기화 실패({e}) — 게이트 비활성화")
+                self.bocpd_detector = None
+
         # === BREAKOUT vote source config (2026-04-23 옵션 C) ===
         bv = config.get("breakout_vote", {}) or {}
         self.breakout_enabled = bool(bv.get("enabled", False))
@@ -357,6 +382,18 @@ class StrategyManager:
             regime=market_regime,
         )
 
+        # === BOCPD 변환점 게이트 (stage-1, 2026-04-25) ===
+        # ohlcv_df의 마지막 close로 BOCPD 업데이트 → 변환점 직후 차단 권고면 hold 강제
+        bocpd_info = {"enabled": False}
+        if self.bocpd_detector is not None and ohlcv_df is not None and len(ohlcv_df) > 0:
+            try:
+                last_close = float(ohlcv_df["close"].iloc[-1])
+                state = self.bocpd_detector.update(last_close)
+                bocpd_info = self.bocpd_detector.get_regime_info()
+                bocpd_info["enabled"] = True
+            except Exception as e:
+                logger.debug(f"[BOCPD] 업데이트 실패: {e}")
+
         # 5번째 vote source: BREAKOUT (2026-04-23 옵션 C)
         # Donchian N봉 돌파 + 거래량 확인 + 레짐 gate
         breakout_info = {"direction": "none", "strength": 0.0, "reason": "skip"}
@@ -562,6 +599,33 @@ class StrategyManager:
                 reason = f"블랙리스트 차단: {combo_key} (반복 실패 패턴)"
                 confidence = 0.0
 
+        # 2.95. BOCPD 변환점 차단 (stage-1 final gate, 2026-04-25)
+        # 레짐 전환점 직후에는 long/short 모두 차단 — 잘못된 방향 진입 방지.
+        # variant_disable_macro 와 무관 — 통계적 가드 (Adams & MacKay 2007).
+        if final_action in ["long", "short"] and bocpd_info.get("enabled"):
+            cp_prob = float(bocpd_info.get("changepoint_prob", 0.0))
+            if cp_prob >= self.bocpd_block_threshold:
+                logger.warning(
+                    f"[BOCPD] 변환점 차단: cp_prob={cp_prob:.2f}≥{self.bocpd_block_threshold:.2f} "
+                    f"(regime={bocpd_info.get('regime')}, vol={bocpd_info.get('volatility_regime')}) "
+                    f"→ {final_action} 차단"
+                )
+                final_action = "hold"
+                reason = (
+                    f"BOCPD 변환점 차단(cp={cp_prob:.2f}, "
+                    f"regime={bocpd_info.get('regime')})"
+                )
+                confidence = 0.0
+            else:
+                # 변환점 근처면 포지션 사이즈 축소 (size에 곱해질 multiplier 저장)
+                try:
+                    size_mult = self.bocpd_detector.get_position_size_multiplier()
+                    if size_mult < 1.0:
+                        confidence *= max(size_mult, 0.3)
+                        reason += f" *bocpd_size×{size_mult:.2f}"
+                except Exception:
+                    pass
+
         # 3. 최소 확신도 필터 (강화)
         # LIVE 공격 롱 모드에서 롱은 live_min_confidence 사용 (기본보다 낮음)
         effective_min_conf = self.min_confidence
@@ -623,6 +687,7 @@ class StrategyManager:
                     "strength": round(breakout_info["strength"], 3),
                     "reason": breakout_info["reason"],
                 },
+                "bocpd": bocpd_info,
                 "regime_bias": {
                     "funding_rate": round(funding_rate, 3),
                 },
