@@ -42,6 +42,12 @@ class StrategyManager:
         self.min_confidence = self.base_min_confidence
         self.signal_threshold = config.get("signal_threshold", 0.10)
         self.min_confirming = config.get("min_confirming_signals", 2)
+        # [2026-04-25] PAPER 전용 min_confirming — 데이터 수집 우선
+        # decide(mode="paper")일 때 self.min_confirming 대신 사용.
+        # config에 paper_min_confirming 없으면 self.min_confirming와 동일 (backward compat).
+        self.paper_min_confirming = config.get(
+            "paper_min_confirming", self.min_confirming
+        )
         # 방향 필터 (mode-aware):
         # - live_long_only=True: LIVE 실행에서만 숏 차단 (PAPER는 학습 위해 양방향 허용)
         # - long_only=True     : 모든 모드에서 숏 차단 (강력 차단 — backward compat)
@@ -241,10 +247,15 @@ class StrategyManager:
             except Exception:
                 return 1.0
 
-        # 1. ML 모델 투표 (confidence > 0.3 + 방향 명확)
-        if ml_direction == "long" and ml_confidence > 0.3:
+        # === [2026-04-25] 데이터 수집 극대화 — 투표 임계 일괄 완화 ===
+        # 직전 1주일간 LONG 0건, 4/22 이후 SHORT 0건. 모든 vote source가
+        # 임계 직전에서 컷오프됨. 임계를 한 단계 낮춰 학습 데이터 흐름 복구.
+        # 위험: noisy entries↑. 완화: confidence 평균 가중 + min_confidence 게이트.
+
+        # 1. ML 모델 투표 (confidence > 0.2 — was 0.3)
+        if ml_direction == "long" and ml_confidence > 0.2:
             votes["long"].append(("ML", ml_confidence * wmult("ml")))
-        elif ml_direction == "short" and ml_confidence > 0.3:
+        elif ml_direction == "short" and ml_confidence > 0.2:
             votes["short"].append(("ML", ml_confidence * wmult("ml")))
         # ML signal 값이 방향과 일치하면 추가 투표 (같은 소스이므로 0.5 가중)
         elif abs(ml_signal_val) > self.signal_threshold:
@@ -253,29 +264,29 @@ class StrategyManager:
             else:
                 votes["short"].append(("ML_val", min(abs(ml_signal_val) * 2, 0.6) * wmult("ml")))
 
-        # 2. RL 에이전트 투표 (confidence > 0.4)
-        if rl_direction == "long" and rl_confidence > 0.4:
+        # 2. RL 에이전트 투표 (confidence > 0.3 — was 0.4)
+        if rl_direction == "long" and rl_confidence > 0.3:
             votes["long"].append(("RL", rl_confidence * wmult("rl")))
-        elif rl_direction == "short" and rl_confidence > 0.4:
+        elif rl_direction == "short" and rl_confidence > 0.3:
             votes["short"].append(("RL", rl_confidence * wmult("rl")))
 
-        # 3. 모멘텀 투표 (strength > 0.2 또는 RSI 극값)
-        if mom_direction == "long" and abs(mom_strength) > 0.2:
+        # 3. 모멘텀 투표 (strength > 0.15 — was 0.2)
+        if mom_direction == "long" and abs(mom_strength) > 0.15:
             votes["long"].append(("MOM", abs(mom_strength) * wmult("mom")))
-        elif mom_direction == "short" and abs(mom_strength) > 0.2:
+        elif mom_direction == "short" and abs(mom_strength) > 0.15:
             votes["short"].append(("MOM", abs(mom_strength) * wmult("mom")))
-        # RSI 극값 (25 이하 = 과매도 반전, 75 이상 = 과매수 반전)
-        if mom_rsi < 25:
-            rsi_weight = (25 - mom_rsi) / 25 * 0.5
+        # RSI 극값 (30 이하 = 과매도 반전, 70 이상 = 과매수 반전 — was 25/75)
+        if mom_rsi < 30:
+            rsi_weight = (30 - mom_rsi) / 30 * 0.5
             votes["long"].append(("RSI_extreme", rsi_weight * wmult("rsi_extreme")))
-        elif mom_rsi > 75:
-            rsi_weight = (mom_rsi - 75) / 25 * 0.5
+        elif mom_rsi > 70:
+            rsi_weight = (mom_rsi - 70) / 30 * 0.5
             votes["short"].append(("RSI_extreme", rsi_weight * wmult("rsi_extreme")))
 
-        # 4. 외부 요인 투표 (confidence > 0.15)
-        if ext_direction == "bullish" and ext_confidence > 0.15:
+        # 4. 외부 요인 투표 (confidence > 0.10 — was 0.15)
+        if ext_direction == "bullish" and ext_confidence > 0.10:
             votes["long"].append(("EXT", ext_confidence * wmult("ext")))
-        elif ext_direction == "bearish" and ext_confidence > 0.15:
+        elif ext_direction == "bearish" and ext_confidence > 0.10:
             votes["short"].append(("EXT", ext_confidence * wmult("ext")))
 
         return votes
@@ -373,6 +384,13 @@ class StrategyManager:
         long_count = len(long_votes)
         short_count = len(short_votes)
 
+        # === [2026-04-25] mode-aware min_confirming ===
+        # PAPER: 데이터 수집 우선 → 단일 소스도 진입 허용 (paper_min_confirming, 보통 1)
+        # LIVE : 안전 우선 → 글로벌 min_confirming 유지 (보통 2)
+        effective_min_confirming = (
+            self.paper_min_confirming if mode == "paper" else self.min_confirming
+        )
+
         # 2. 최종 결정 로직
         final_action = "hold"
         confidence = 0.0
@@ -389,8 +407,8 @@ class StrategyManager:
                 confirming = ["RL_close"]
 
         # === PATH B: 다중확인 진입 (핵심 변경) ===
-        # 더 많은 투표를 받은 방향으로, 최소 min_confirming 개 합의 필요
-        elif long_count >= self.min_confirming and long_count > short_count:
+        # 더 많은 투표를 받은 방향으로, 최소 effective_min_confirming 개 합의 필요
+        elif long_count >= effective_min_confirming and long_count > short_count:
             final_action = "long"
             confirming = [v[0] for v in long_votes]
             # 확신도 = 투표 가중치 평균 + 합의 보너스
@@ -403,7 +421,7 @@ class StrategyManager:
             signal_str = "strong" if long_count >= 3 else "moderate"
             reason = f"다중확인 LONG ({long_count}표: {','.join(confirming)})"
 
-        elif short_count >= self.min_confirming and short_count > long_count:
+        elif short_count >= effective_min_confirming and short_count > long_count:
             final_action = "short"
             confirming = [v[0] for v in short_votes]
             avg_weight = np.mean([v[1] for v in short_votes])

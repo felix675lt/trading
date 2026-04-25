@@ -18,10 +18,13 @@ trading:
     - "DOGE/USDT:USDT"
 
   # === Mode별 심볼 오버라이드 (2026-04-18) ===
-  # PAPER: BTC/ETH 위주 (안정성 우선, LIVE와 동일 체결 조건으로 현실 검증)
+  # PAPER: 4종목 풀 활성화 (2026-04-25) — 데이터 수집 극대화 모드.
+  # 이전: BTC/ETH 2종목으로 신호 ½ 손실. 이제 LIVE와 동일 4종목으로 운영.
   paper_symbols_override:
     - "BTC/USDT:USDT"
     - "ETH/USDT:USDT"
+    - "SOL/USDT:USDT"
+    - "DOGE/USDT:USDT"
   # LIVE: 엣지 검증된 메이저만 (수학적 최적화 2026-04-20)
   #   알트 투기 제거 — whitelist와 동일
   live_symbols_override:
@@ -37,9 +40,14 @@ trading:
     - "4h"
   leverage: 3
   mode: "dual"  # backtest / paper / live / dual (Paper+Live 동시)
-  min_confidence: 0.40     # 최소 확신도 (PAPER 기준, 적응형: 장기 hold 시 0.25까지 하향)
-  signal_threshold: 0.10   # ML 시그널 방향 결정 임계값
-  min_confirming_signals: 2  # 최소 2개 시그널 합의 필요 (다중확인)
+  # === [2026-04-25] 데이터 수집 극대화 모드 ===
+  # 직전 1주일간 LONG 0건, 4/22 이후 SHORT 0건 → trade outcome 학습 80h+ 정지.
+  # 임계 일괄 완화로 PAPER 데이터 흐름 복구. LIVE는 별도 안전장치(live_min_confidence
+  # 0.62, live_long_only true, live_quant_score_min 0.25)로 그대로 보호.
+  min_confidence: 0.30     # 0.40 → 0.30 (PAPER 기준; 4/22 hold reason 0.385~0.398 통과 가능)
+  signal_threshold: 0.05   # 0.10 → 0.05 (ML_val vote 발생 빈도↑)
+  min_confirming_signals: 2  # 글로벌 기본값(LIVE 적용)
+  paper_min_confirming: 1    # [신규] PAPER 전용 — 단일 소스도 진입(데이터 우선)
 
   # === 집중 매매 모드 ===
   # 소시드($188)에서는 분산 X → 가장 강한 신호 1개에 풀시드 집중
@@ -60,8 +68,10 @@ trading:
   long_only: false
   live_long_only: true
   # 스마트 숏필터 — 특정 레짐에서만 숏 차단 (실측 WR < 30%)
-  smart_short_blocked_regimes:
-    - strong_uptrend     # n=23 WR 0% — 압도적 fade 참사 (통계 거부)
+  # [2026-04-25] 데이터 수집 극대화 — PAPER에서도 strong_uptrend SHORT 학습 재개.
+  # 통계상 WR 0%지만 PAPER는 학습 데이터 수집 목적이므로 negative sample도 가치 있음.
+  # LIVE는 live_long_only=true로 보호되므로 실손실 0.
+  smart_short_blocked_regimes: []   # was [strong_uptrend] — 풀 양방향 학습 복원
 
   # === 돌파매매 vote source (2026-04-23 신설, 옵션 C) ===
   # 학계 근거: Turtle(1983), Moskowitz-Ooi-Pedersen TS-MOM(2012), AQR Century(2017),
@@ -270,8 +280,9 @@ external:
     method: "vader"
     crypto_lexicon: true
   signal_thresholds:
-    strong_bullish: 0.4     # 0.3 → 0.4 (더 강해야 신호로 인정)
-    strong_bearish: -0.4    # 0.3 → 0.4
+    # [2026-04-25] 데이터 수집 극대화 — EXT vote 발생 빈도↑
+    strong_bullish: 0.25    # 0.4 → 0.25 (현재 시장 종합신호 0.05~0.15 범위 통과)
+    strong_bearish: -0.25   # -0.4 → -0.25
     event_override: false   # 고임팩트 오버라이드 해제 — 매크로가 진입 방해하지 않게
 
   # === LLM Signal (Claude-Native + DeepSeek 방법론, 2026-04-24) ===
@@ -306,8 +317,10 @@ external:
 # =============================================================================
 capital_tiers:
   # PAPER가 가정하는 가상 시드 ($). 상위 티어 기능을 실시간 시장에서 검증.
-  # $5K → mid 티어 (Kelly + BTC + CVaR)를 먼저 paper로 증명 후 $15K→large로 상향 권장
-  paper_virtual_seed: 5000
+  # [2026-04-25] $5K(mid) → $15K(large) — 데이터 수집 극대화 모드.
+  #   large 티어 활성 기능: hmm_regime=true (HMM 학습 데이터),
+  #   max_positions 3→5, BNB/XRP 포함 6종목, twap 라우팅.
+  paper_virtual_seed: 15000
   paper_use_virtual: true     # false면 PAPER 실 equity로 티어 결정
 
   tiers:
