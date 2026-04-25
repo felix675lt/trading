@@ -350,6 +350,31 @@ class Storage:
             result[row[0] or "unknown"] = row[1]
         return result
 
+    def get_trade_counts_total(self) -> dict:
+        """누적 모드별 거래 수 (저장 메커니즘 정상성 확인용).
+
+        save_trade 누락 진단은 '24h 윈도우 = 0' 으로 판단하면 안 된다 —
+        단순히 최근 24h 동안 거래가 없었던 것일 수 있음.
+        반드시 누적 카운트 vs feedback 누적 카운트로 비교해야 한다.
+        """
+        cursor = self.conn.execute(
+            "SELECT mode, COUNT(*) FROM trades GROUP BY mode"
+        )
+        result = {}
+        for row in cursor.fetchall():
+            result[row[0] or "unknown"] = row[1]
+        return result
+
+    def get_last_trade_age_hours(self) -> float | None:
+        """마지막 거래로부터 경과 시간(시간 단위). 거래 0건이면 None."""
+        cursor = self.conn.execute(
+            "SELECT (julianday('now') - julianday(MAX(timestamp))) * 24.0 FROM trades"
+        )
+        row = cursor.fetchone()
+        if row and row[0] is not None:
+            return float(row[0])
+        return None
+
     def get_recent_trades(self, mode: str = "", limit: int = 10) -> list[dict]:
         """최근 거래 목록 조회 (최신순)"""
         if mode:

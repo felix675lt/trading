@@ -3353,9 +3353,37 @@ class AutoTrader:
             live_opt_trades = sum(len(v) for v in self.strategy_optimizer_live.performance_history.values())
             paper_opt_trades = sum(len(v) for v in self.strategy_optimizer_paper.performance_history.values())
 
-            total_db = sum(db_counts.values())
-            if fb_total > 0 and total_db == 0:
-                issues.append(f"feedback {fb_total}건, DB 0건 — save_trade 누락 가능")
+            # ──── save_trade 누락 진단 (cumulative vs cumulative) ────
+            # [2026-04-25 수정] 기존: 24h DB == 0 + fb_total > 0 → "save_trade 누락"
+            #   → 단순히 최근 24h에 거래가 없었을 뿐인 케이스도 잘못 트리거됨.
+            # 수정: 누적 fb_total 과 누적 DB 카운트를 비교하여 'save 메커니즘 자체'가
+            # 깨진 것인지 판단. 그리고 '거래 활동 부재'는 별도 시그널로 보고.
+            try:
+                db_total_counts = self.storage.get_trade_counts_total()
+                total_db_cum = sum(db_total_counts.values())
+            except Exception:
+                total_db_cum = sum(db_counts.values())  # fallback
+            total_db_24h = sum(db_counts.values())
+
+            if fb_total > 50 and total_db_cum == 0:
+                # 누적 피드백은 있는데 DB는 텅 비어있다 → save 진짜 깨짐
+                issues.append(f"feedback {fb_total}건, DB 누적 0건 — save_trade 진짜 누락")
+            elif fb_total > 0 and total_db_cum > 0 and fb_total - total_db_cum > 50:
+                # gap 50 이상 → save가 부분적으로 깨졌을 가능성
+                gap = fb_total - total_db_cum
+                issues.append(f"feedback {fb_total} vs DB {total_db_cum} (gap {gap}) — save 일부 누락 의심")
+
+            # ──── 거래 활동 부재 (별도 신호) ────
+            try:
+                last_age_h = self.storage.get_last_trade_age_hours()
+            except Exception:
+                last_age_h = None
+            if total_db_cum > 0 and total_db_24h == 0:
+                if last_age_h is not None and last_age_h >= 12:
+                    issues.append(
+                        f"거래 활동 정지: 마지막 거래 {last_age_h:.1f}시간 전 — "
+                        f"PAPER/LIVE 게이팅 점검 필요"
+                    )
 
             # ──── 퀀트 시그널 + ML 피처 통합 체크 ────
             quant_status = self._check_quant_integration()
@@ -3722,11 +3750,87 @@ class AutoTrader:
 
         [2026-04-21 개정]
         - Pause threshold: 최근 5건 중 전패 → 정지 (기존 동일)
-        - Resume 조건 강화: 최근 5건 중 ≥ 2승 AND 정지 후 최소 30분 경과 (이전: 1승만으로 즉시 해제 → 재연패)
-        - 강경 threshold 추가: 최근 10건 승률 ≤ 10% → 6시간 강제 정지 (수동 해제 유도)
+        - Resume 조건 강화: 최근 5건 중 ≥ 2승 AND 정지 후 최소 30분 경과
+
+        [2026-04-25 핵심 버그픽스: Resume Deadlock]
+        - 문제: LIVE 일시정지 중 → LIVE 거래 0건 → recent_live[:5]는 정지 직전의
+          전패 5건 그대로 → wins5는 영원히 0 → 영구 정지(deadlock).
+        - 해결책 A: Time-based force-resume — 정지 후 6시간 경과 시 PAPER 최근 성과를
+          참고하여 LIVE 자동 재개. PAPER가 회복했다면 LIVE도 재시도할 가치가 있음.
+        - 해결책 B: 12시간 hard-resume — PAPER 성과와 무관하게 무조건 재개 시도
+          (재개 즉시 또 전패하면 다시 자동 정지되므로 안전).
+        - 해결책 C: 'PAPER 최근 5건 ≥ 3승' 충족 시 LIVE 즉시 재개 (정지 30분+ 후).
         """
         try:
             recent_live = self.storage.get_recent_trades(mode="LIVE", limit=10)
+
+            # ──── 정지 중일 때: PAPER 성과 + 시간 기반 재개 검사 (Resume Deadlock 방지) ────
+            if getattr(self, '_live_paused', False):
+                pause_dur = datetime.utcnow() - getattr(self, '_live_pause_time', datetime.utcnow())
+                pause_sec = pause_dur.total_seconds()
+                min_dur_ok = pause_sec >= 1800  # 최소 30분
+
+                # 1) 기존 LIVE-기반 재개 (LIVE 거래가 새로 발생한 경우)
+                if len(recent_live) >= 5:
+                    last5 = recent_live[:5]
+                    wins5 = sum(1 for t in last5 if (t.get("pnl") or 0) > 0)
+                    wr5 = wins5 / len(last5)
+                    if min_dur_ok and wins5 >= 2:
+                        self._live_paused = False
+                        logger.info(f"[자가진단] ✅ LIVE 재개 (LIVE 5건 WR {wr5:.0%}, 정지 {pause_dur})")
+                        tg_notify(
+                            f"✅ <b>LIVE 자동 재개</b> (LIVE 회복)\n"
+                            f"━━━━━━━━━━━━━\n"
+                            f"최근 5건 WR: {wr5:.0%} ({wins5}/5)\n"
+                            f"정지 기간: {pause_dur}"
+                        )
+                        return None
+
+                # 2) PAPER 회복 기반 재개 (LIVE는 정지 중이므로 LIVE는 안 늘어남)
+                #    → PAPER 최근 5건 중 ≥ 3승이면 재개 (정지 30분+ 후)
+                if min_dur_ok:
+                    try:
+                        recent_paper = self.storage.get_recent_trades(mode="PAPER", limit=5)
+                    except Exception:
+                        recent_paper = []
+                    if len(recent_paper) >= 5:
+                        paper_wins = sum(1 for t in recent_paper if (t.get("pnl") or 0) > 0)
+                        if paper_wins >= 3:
+                            self._live_paused = False
+                            logger.info(
+                                f"[자가진단] ✅ LIVE 재개 (PAPER 회복 신호: 5건 중 {paper_wins}승)"
+                            )
+                            tg_notify(
+                                f"✅ <b>LIVE 자동 재개</b> (PAPER 회복)\n"
+                                f"━━━━━━━━━━━━━\n"
+                                f"PAPER 최근 5건: {paper_wins}승/5\n"
+                                f"정지 기간: {pause_dur}"
+                            )
+                            return None
+
+                # 3) Time-based soft-resume — 6시간 경과 시 자동 재개 (재실패하면 또 정지됨)
+                if pause_sec >= 6 * 3600:
+                    self._live_paused = False
+                    logger.warning(
+                        f"[자가진단] ⏰ LIVE 시간 기반 강제 재개 (정지 {pause_dur} 경과)"
+                    )
+                    tg_notify(
+                        f"⏰ <b>LIVE 시간 기반 자동 재개</b>\n"
+                        f"━━━━━━━━━━━━━\n"
+                        f"정지 기간: {pause_dur} (6시간 한계)\n"
+                        f"⚠️ 재진입 후 다시 5연패 시 자동 재정지\n"
+                        f"📝 Resume Deadlock 방지 안전장치"
+                    )
+                    return None
+
+                # 정지 유지 — 진단 메시지 갱신
+                remain_sec = max(0, 6 * 3600 - int(pause_sec))
+                return (
+                    f"LIVE 정지 중 (정지 {int(pause_sec/60)}분, "
+                    f"강제 재개 {remain_sec//60}분 후)"
+                )
+
+            # ──── 정지 상태가 아닐 때: 신규 정지 판단 ────
             if len(recent_live) >= 5:
                 last5 = recent_live[:5]
                 wins5 = sum(1 for t in last5 if (t.get("pnl") or 0) > 0)
@@ -3736,45 +3840,25 @@ class AutoTrader:
 
                 # === Pause ===
                 if wr5 == 0:
-                    if not getattr(self, '_live_paused', False):
-                        self._live_paused = True
-                        self._live_pause_reason = f"최근 5건 전패 (전체 10건 WR {wr10:.0%})"
-                        self._live_pause_time = datetime.utcnow()
-                        logger.warning(f"[자가진단] ⛔ LIVE 자동 일시정지: {self._live_pause_reason}")
-                        tg_notify(
-                            f"⛔ <b>LIVE 자동 일시정지</b>\n"
-                            f"━━━━━━━━━━━━━\n"
-                            f"사유: {self._live_pause_reason}\n"
-                            f"최근 5건 PnL: {[round(t.get('pnl', 0), 2) for t in last5]}\n"
-                            f"📝 PAPER 모드는 계속 학습 중\n"
-                            f"🔄 재개 조건: 최근 5건 중 ≥ 2승 + 30분 경과"
-                        )
+                    self._live_paused = True
+                    self._live_pause_reason = f"최근 5건 전패 (전체 10건 WR {wr10:.0%})"
+                    self._live_pause_time = datetime.utcnow()
+                    logger.warning(f"[자가진단] ⛔ LIVE 자동 일시정지: {self._live_pause_reason}")
+                    tg_notify(
+                        f"⛔ <b>LIVE 자동 일시정지</b>\n"
+                        f"━━━━━━━━━━━━━\n"
+                        f"사유: {self._live_pause_reason}\n"
+                        f"최근 5건 PnL: {[round(t.get('pnl', 0), 2) for t in last5]}\n"
+                        f"📝 PAPER 모드는 계속 학습 중\n"
+                        f"🔄 재개 조건:\n"
+                        f"   • LIVE 최근 5건 ≥ 2승 + 30분 경과, 또는\n"
+                        f"   • PAPER 최근 5건 ≥ 3승 + 30분 경과, 또는\n"
+                        f"   • 6시간 경과 시 강제 재개"
+                    )
                     return f"LIVE 일시정지: 최근 5건 전패"
 
-                # === Resume (강화) ===
-                elif getattr(self, '_live_paused', False):
-                    pause_dur = datetime.utcnow() - getattr(self, '_live_pause_time', datetime.utcnow())
-                    min_dur_ok = pause_dur.total_seconds() >= 1800  # 최소 30분
-                    enough_wins = wins5 >= 2  # 최근 5건 중 2승 이상
-                    if min_dur_ok and enough_wins:
-                        self._live_paused = False
-                        logger.info(f"[자가진단] ✅ LIVE 재개 (최근 5건 WR {wr5:.0%}, 정지 {pause_dur})")
-                        tg_notify(
-                            f"✅ <b>LIVE 자동 재개</b>\n"
-                            f"━━━━━━━━━━━━━\n"
-                            f"최근 5건 WR: {wr5:.0%} ({wins5}/5)\n"
-                            f"정지 기간: {pause_dur}"
-                        )
-                        return None
-                    else:
-                        remain = max(0, 1800 - int(pause_dur.total_seconds()))
-                        return (
-                            f"LIVE 정지 중 (최근 5건 WR {wr5:.0%}, "
-                            f"재개 조건: ≥2승 + {remain}s 남음)"
-                        )
-
                 # === Soft warning ===
-                elif wr10 <= 0.10 and len(recent_live) >= 8:
+                if wr10 <= 0.10 and len(recent_live) >= 8:
                     return f"LIVE 저조: 최근 {len(recent_live)}건 WR {wr10:.0%}"
 
         except Exception as e:
@@ -4219,38 +4303,90 @@ class AutoTrader:
         return result
 
     def _check_code_version(self) -> str | None:
-        """git commit 시간 vs 프로세스 시작 시간 비교"""
+        """git commit 시간 vs 프로세스 시작 시간 비교.
+
+        [2026-04-25 개정]
+        - 동일 커밋 SHA에 대해 텔레그램 알림은 1회만 발송 (중복 스팸 방지)
+        - 알림 본문에 구체적 재시작 명령 포함
+        - 자동 재시작 옵션은 운영 안전을 위해 명시적으로 OFF
+          (config.diagnostics.auto_restart_on_version_mismatch=true 시 활성)
+        """
         try:
             import subprocess
-            result = subprocess.run(
+            sha_res = subprocess.run(
+                ["git", "log", "-1", "--format=%H"],
+                capture_output=True, text=True, timeout=5,
+                cwd=str(Path(__file__).parent)
+            )
+            ts_res = subprocess.run(
                 ["git", "log", "-1", "--format=%ct"],
                 capture_output=True, text=True, timeout=5,
                 cwd=str(Path(__file__).parent)
             )
-            if result.returncode == 0:
-                last_commit_ts = int(result.stdout.strip())
-                last_commit_time = datetime.utcfromtimestamp(last_commit_ts)
-                process_start = self.start_time
+            if sha_res.returncode != 0 or ts_res.returncode != 0:
+                return None
 
-                if last_commit_time > process_start:
-                    diff = last_commit_time - process_start
-                    diff_min = diff.total_seconds() / 60
-                    if diff_min > 5:  # 5분 이상 차이
-                        msg = (
-                            f"코드 버전 불일치! 커밋: {last_commit_time.strftime('%H:%M')} > "
-                            f"프로세스: {process_start.strftime('%H:%M')} "
-                            f"({diff_min:.0f}분 차이) — 재시작 필요"
-                        )
-                        logger.warning(f"[진단] {msg}")
-                        tg_notify(
-                            f"⚠️ <b>코드 버전 불일치</b>\n"
-                            f"━━━━━━━━━━━━━\n"
-                            f"최신 커밋: {last_commit_time.strftime('%Y-%m-%d %H:%M')}\n"
-                            f"프로세스 시작: {process_start.strftime('%Y-%m-%d %H:%M')}\n"
-                            f"⏱ {diff_min:.0f}분 차이\n"
-                            f"🔄 새 코드 적용 위해 재시작 필요"
-                        )
-                        return msg
+            last_commit_sha = sha_res.stdout.strip()
+            last_commit_ts = int(ts_res.stdout.strip())
+            last_commit_time = datetime.utcfromtimestamp(last_commit_ts)
+            process_start = self.start_time
+
+            if last_commit_time <= process_start:
+                # 정상 — 알림 SHA 캐시 리셋 (다음 커밋부터 새로 알림)
+                self._version_alerted_sha = None
+                return None
+
+            diff = last_commit_time - process_start
+            diff_min = diff.total_seconds() / 60
+            if diff_min <= 5:
+                return None
+
+            short_sha = last_commit_sha[:8]
+            msg = (
+                f"코드 버전 불일치! 커밋: {last_commit_time.strftime('%H:%M')} > "
+                f"프로세스: {process_start.strftime('%H:%M')} "
+                f"({diff_min:.0f}분 차이) — 재시작 필요 ({short_sha})"
+            )
+
+            # 동일 커밋에 대해 알림 1회만 (스팸 방지)
+            already_alerted_sha = getattr(self, '_version_alerted_sha', None)
+            if already_alerted_sha != last_commit_sha:
+                logger.warning(f"[진단] {msg}")
+                tg_notify(
+                    f"⚠️ <b>코드 버전 불일치</b>\n"
+                    f"━━━━━━━━━━━━━\n"
+                    f"최신 커밋: <code>{short_sha}</code> "
+                    f"({last_commit_time.strftime('%Y-%m-%d %H:%M')} UTC)\n"
+                    f"프로세스 시작: {process_start.strftime('%Y-%m-%d %H:%M')} UTC\n"
+                    f"⏱ {diff_min:.0f}분 차이\n"
+                    f"━━━━━━━━━━━━━\n"
+                    f"🔄 <b>재시작 명령</b> (서버에서 실행):\n"
+                    f"<code>cd ~/trading && git pull && "
+                    f"pkill -f 'python.*main.py' && "
+                    f"nohup python main.py &gt; logs/run.log 2&gt;&amp;1 &amp;</code>\n"
+                    f"━━━━━━━━━━━━━\n"
+                    f"💡 본 알림은 동일 커밋({short_sha})에 대해 1회만 발송됩니다."
+                )
+                self._version_alerted_sha = last_commit_sha
+
+                # 옵션: 자동 재시작 (config 활성 시)
+                try:
+                    auto_restart = (
+                        self.config.get("diagnostics", {})
+                        .get("auto_restart_on_version_mismatch", False)
+                    )
+                except Exception:
+                    auto_restart = False
+                if auto_restart and diff_min >= 30:
+                    logger.warning("[진단] 🔄 auto_restart_on_version_mismatch=true → 자가 재시작 시도")
+                    tg_notify("🔄 <b>자동 재시작 진행 중...</b>")
+                    try:
+                        import os, sys
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                    except Exception as e:
+                        logger.error(f"[진단] 자동 재시작 실패: {e}")
+
+            return msg
         except Exception:
             pass
         return None
