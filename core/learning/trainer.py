@@ -15,6 +15,13 @@ from core.models.ensemble import EnsembleSignalGenerator
 from core.rl.agent import RLAgent
 from core.rl.environment import TradingEnvironment
 
+try:
+    from core.learning.smart_scheduler import SmartTrainingScheduler
+    _SCHED_AVAILABLE = True
+except Exception as _sched_err:  # pragma: no cover
+    SmartTrainingScheduler = None  # type: ignore
+    _SCHED_AVAILABLE = False
+
 
 class SelfLearningTrainer:
     """자기학습 루프 - 데이터 수집 → 학습 → 평가 → 모델 교체"""
@@ -42,6 +49,30 @@ class SelfLearningTrainer:
         self._train_time_file = Path("models_saved/.last_train_time")
         self.last_train_time = self._load_last_train_time()
 
+        # === SmartTrainingScheduler (2026-04-25) ===
+        # 24h 무조건 재학습 → 조건부 (성능 하락/레짐 전환/최대 간격 초과 시).
+        # 기존 should_retrain()는 24h 게이트 그대로 유지(backward compat),
+        # 신규 should_retrain_smart()로 보완 게이트 OR 결합.
+        ml_cfg = config.get("ml", {})
+        scheduler_cfg = ml_cfg.get("smart_scheduler", {})
+        self.smart_scheduler = None
+        if _SCHED_AVAILABLE and scheduler_cfg.get("enabled", True):
+            try:
+                self.smart_scheduler = SmartTrainingScheduler(
+                    memory_limit_gb=float(scheduler_cfg.get("memory_limit_gb", 6.0)),
+                    cpu_cooldown_minutes=float(scheduler_cfg.get("cpu_cooldown_minutes", 5.0)),
+                    models=scheduler_cfg.get("models", ["ensemble", "rl_agent"]),
+                )
+                # 마지막 학습 시각을 동기화 (트레이너 last_train_time → ensemble 스케줄)
+                if "ensemble" in self.smart_scheduler.schedules:
+                    self.smart_scheduler.schedules["ensemble"].last_train_time = self.last_train_time
+                logger.info(
+                    f"[SmartSched] 활성 — models={list(self.smart_scheduler.schedules)}"
+                )
+            except Exception as e:
+                logger.warning(f"[SmartSched] 초기화 실패: {e} — 기존 24h 게이트만 사용")
+                self.smart_scheduler = None
+
     def _load_last_train_time(self) -> datetime:
         try:
             if self._train_time_file.exists():
@@ -59,8 +90,38 @@ class SelfLearningTrainer:
             pass
 
     def should_retrain(self) -> bool:
+        """기존 24h 게이트 — backward compat 유지"""
         interval = self.config.get("ml", {}).get("retrain_interval_hours", 24)
         return (datetime.utcnow() - self.last_train_time) > timedelta(hours=interval)
+
+    def should_retrain_smart(
+        self,
+        current_accuracy: float = 0.0,
+        regime_changed: bool = False,
+    ) -> tuple[bool, str]:
+        """SmartScheduler 통합 게이트 — 24h 게이트와 OR 결합.
+
+        반환: (재학습필요?, 사유)
+        - 기존 24h 게이트가 True면 즉시 True
+        - SmartScheduler가 perf_decline / regime_changed / max_interval 등에서 True면 True
+        - 둘 다 False면 False
+        """
+        # 1) 기존 24h 게이트
+        if self.should_retrain():
+            return True, "interval(legacy 24h)"
+
+        # 2) SmartScheduler
+        if self.smart_scheduler is not None:
+            try:
+                ok, reason = self.smart_scheduler.should_retrain_any(
+                    accuracies={"ensemble": float(current_accuracy)},
+                    regime_changed=bool(regime_changed),
+                )
+                if ok:
+                    return True, f"smart:{reason}"
+            except Exception as e:
+                logger.debug(f"[SmartSched] 판단 실패: {e}")
+        return False, "no_trigger"
 
     async def collect_training_data(self, exchange_name: str, symbol: str, timeframe: str) -> pd.DataFrame:
         """학습 데이터 수집 및 피처 생성
@@ -352,6 +413,20 @@ class SelfLearningTrainer:
 
         self.last_train_time = datetime.utcnow()
         self._save_last_train_time()
+
+        # === SmartScheduler 동기화 (2026-04-25) ===
+        # 학습 완료 시 ensemble 정확도를 스케줄러에 기록 → 다음 사이클 perf_decline 판단.
+        if self.smart_scheduler is not None:
+            try:
+                ens_acc = float(self.ensemble.xgb.accuracy)
+                self.smart_scheduler.mark_training_complete("ensemble", ens_acc)
+                if "rl_agent" in self.smart_scheduler.schedules:
+                    self.smart_scheduler.mark_training_complete(
+                        "rl_agent", float(rl_metrics.get("sharpe_ratio", 0.0))
+                    )
+            except Exception as e:
+                logger.debug(f"[SmartSched] 완료 기록 실패: {e}")
+
         logger.info(f"=== 자기학습 사이클 완료 ===")
 
     async def run_continuous(self, exchange_name: str, symbols: list[str], timeframe: str = "1h"):

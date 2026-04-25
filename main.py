@@ -835,9 +835,23 @@ class AutoTrader:
                 except Exception as e:
                     logger.debug(f"[BTCReserve] BTC 가격 hint 실패: {e}")
 
-                # 재학습 체크 (일반 + stuck 감지)
+                # 재학습 체크 (일반 + stuck 감지 + SmartScheduler 보완 게이트)
                 diag = self.strategy_manager.get_diagnostics()
-                needs_retrain = trainer.should_retrain()
+                # SmartScheduler 통합: 24h 게이트 + perf_decline + regime_changed 등
+                # current_accuracy: 현재 ensemble XGB 정확도 (있으면)
+                # regime_changed: 직전 사이클 대비 레짐 변화 여부
+                _cur_acc = float(getattr(self.ensemble.xgb, "accuracy", 0.0) or 0.0)
+                _regime_changed = bool(getattr(self, "_last_regime_changed", False))
+                try:
+                    needs_retrain, retrain_reason = trainer.should_retrain_smart(
+                        current_accuracy=_cur_acc,
+                        regime_changed=_regime_changed,
+                    )
+                    if needs_retrain:
+                        logger.info(f"[재학습] 트리거 사유: {retrain_reason}")
+                except Exception:
+                    # 신규 메서드 실패 시 기존 동작으로 폴백
+                    needs_retrain = trainer.should_retrain()
 
                 # 자기진단: 200회 연속 hold (~100분) → 강제 재학습
                 if diag["is_stuck"] and diag["consecutive_holds"] % 200 == 0:
