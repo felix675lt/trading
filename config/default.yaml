@@ -162,6 +162,14 @@ risk:
   cooldown_after_losses: 2      # 3 → 2 (EV<0일 땐 쉬어가기)
   cooldown_minutes: 30          # 20 → 30 (노이즈 구간 회피)
 
+  # === Risk Gate Mode (2026-04-25 — Manus v3 부분 채택) ===
+  # PAPER: 게이트 해제(데이터 수집 우선) — 기존 동작 유지 (DD/일일손실/쿨다운은 로그만)
+  # LIVE : 게이트 활성(실자본 보호) — DD>15%, 일일손실>4%, 2연패 쿨다운 시 진입 차단
+  # _execute_live() 진입 시점에 set_trading_mode("live")로 전환 → check_can_trade enforce
+  risk_gates:
+    mode: smart                 # off | on | smart
+    live_only: true             # smart 모드에서 LIVE만 enforce, PAPER는 해제
+
   # === ATR 기반 동적 SL/TP (수학적 재조정 2026-04-20) ===
   # 최근 empirical: avg_win $1.3 vs avg_loss $2.3 → BE_WR 64% (도달 불가)
   # 수정: SL floor 2% (1σ 노이즈 밖), TP/SL RR 2.5:1 최소 → BE_WR 28.6%

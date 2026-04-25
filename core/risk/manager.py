@@ -67,37 +67,107 @@ class RiskManager:
         self.atr_min_pct: float = float(atr_cfg.get("atr_min_pct", 0.003))  # 0.3% 미만이면 사이즈 폭주 방지
         self._last_atr_size: dict = {"used": False, "notional": 0.0, "size": 0.0}
 
+        # === Risk Gate Mode (2026-04-25 — Manus v3 부분 채택) ===
+        # PAPER: 게이트 해제(데이터 수집 우선) — 기존 동작 유지
+        # LIVE : 게이트 활성(실자본 보호) — DD 15%, 일일손실 5%, 쿨다운 30분
+        # mode 옵션: "off"(전부 해제) | "on"(전부 활성) | "smart"(LIVE만 활성)
+        rgate = config.get("risk_gates", {}) or {}
+        self.risk_gates_mode: str = str(rgate.get("mode", "smart")).lower()
+        self.risk_gates_live_only: bool = bool(rgate.get("live_only", True))
+        self._trading_mode: str = "paper"  # set_trading_mode()로 변경
+
     def initialize(self, equity: float):
         self.initial_equity = equity
         self.peak_equity = equity
 
-    def check_can_trade(self, equity: float, num_positions: int) -> tuple[bool, str]:
-        """거래 가능 여부 확인 (리스크 관리 해제 모드)"""
-        self._check_daily_reset()
+    def set_trading_mode(self, mode: str):
+        """현재 트레이딩 모드 설정 — risk_gates_mode='smart'에서 사용.
 
-        # [해제됨] 쿨다운 체크 — 로그만 남김
+        Args:
+            mode: "paper" 또는 "live"
+        """
+        new_mode = str(mode).lower()
+        if new_mode not in ("paper", "live"):
+            logger.warning(f"[리스크] 알 수 없는 모드: {mode} → 기존 유지")
+            return
+        if new_mode != self._trading_mode:
+            self._trading_mode = new_mode
+            enforce = self._gates_active()
+            logger.info(
+                f"[리스크] 트레이딩 모드 → {new_mode} | "
+                f"게이트 {'활성' if enforce else '해제'} (정책={self.risk_gates_mode})"
+            )
+
+    def _gates_active(self) -> bool:
+        """현재 모드에서 DD/일일손실/쿨다운 게이트가 enforce되는지."""
+        if self.risk_gates_mode == "off":
+            return False
+        if self.risk_gates_mode == "on":
+            return True
+        # smart: LIVE에서만 활성 (실자본 보호)
+        return self._trading_mode == "live" if self.risk_gates_live_only else True
+
+    def check_can_trade(self, equity: float, num_positions: int) -> tuple[bool, str]:
+        """거래 가능 여부 확인 — 모드별 게이트 적용.
+
+        - PAPER: 게이트 해제(데이터 수집 우선) — 로그만 남김 (기존 동작)
+        - LIVE : 게이트 활성(실자본 보호) — DD/일일손실/쿨다운 차단
+        """
+        self._check_daily_reset()
+        gates_on = self._gates_active()
+
+        # 쿨다운 체크
         if self._cooldown_until and datetime.utcnow() < self._cooldown_until:
             remaining = (self._cooldown_until - datetime.utcnow()).seconds // 60
-            logger.info(f"[리스크해제] 쿨다운 무시: {remaining}분 남았으나 통과 (연패 {self.consecutive_losses}회)")
+            if gates_on:
+                self.is_trading_halted = True
+                self.halt_reason = f"쿨다운: {remaining}분 남음 (연패 {self.consecutive_losses}회)"
+                return False, self.halt_reason
+            else:
+                logger.info(
+                    f"[리스크해제-{self._trading_mode}] 쿨다운 무시: "
+                    f"{remaining}분 남았으나 통과 (연패 {self.consecutive_losses}회)"
+                )
 
-        # [해제됨] 드로다운 체크 — 로그만 남김
+        # 드로다운 체크
         self.peak_equity = max(self.peak_equity, equity)
-        drawdown = (self.peak_equity - equity) / self.peak_equity
+        drawdown = (self.peak_equity - equity) / self.peak_equity if self.peak_equity > 0 else 0.0
         if drawdown > self.max_drawdown_pct:
-            logger.info(f"[리스크해제] 드로다운 무시: {drawdown:.2%} > {self.max_drawdown_pct:.2%}")
+            if gates_on:
+                self.is_trading_halted = True
+                self.halt_reason = (
+                    f"드로다운 한도 초과: {drawdown:.2%} > {self.max_drawdown_pct:.2%}"
+                )
+                logger.warning(f"[리스크-LIVE] 거래 차단: {self.halt_reason}")
+                return False, self.halt_reason
+            else:
+                logger.info(
+                    f"[리스크해제-{self._trading_mode}] 드로다운 무시: "
+                    f"{drawdown:.2%} > {self.max_drawdown_pct:.2%}"
+                )
 
-        # [해제됨] 일일 손실 체크 — 로그만 남김
+        # 일일 손실 체크
         daily_loss = -self.daily_pnl / self.initial_equity if self.initial_equity > 0 else 0
         if daily_loss > self.max_daily_loss_pct:
-            logger.info(f"[리스크해제] 일일 손실 무시: {daily_loss:.2%}")
+            if gates_on:
+                self.is_trading_halted = True
+                self.halt_reason = (
+                    f"일일 손실 한도 초과: {daily_loss:.2%} > {self.max_daily_loss_pct:.2%}"
+                )
+                logger.warning(f"[리스크-LIVE] 거래 차단: {self.halt_reason}")
+                return False, self.halt_reason
+            else:
+                logger.info(f"[리스크해제-{self._trading_mode}] 일일 손실 무시: {daily_loss:.2%}")
 
-        # 최대 포지션 수 체크 (이것만 유지 — 과다 포지션 방지)
+        # 최대 포지션 수 체크 (양 모드 모두 유지 — 과다 포지션 방지)
         if num_positions >= self.max_open_positions:
             return False, f"최대 포지션 수 도달: {num_positions}/{self.max_open_positions}"
 
-        # 거래 중지 상태 해제
-        self.is_trading_halted = False
-        self.halt_reason = ""
+        # 게이트 통과 — 거래 가능
+        # 단, halt_reason이 PAPER 모드에서 설정됐었다면 해제
+        if not gates_on:
+            self.is_trading_halted = False
+            self.halt_reason = ""
 
         return True, "OK"
 

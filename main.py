@@ -2340,6 +2340,11 @@ class AutoTrader:
         symbol = c["symbol"]
         if self.mode not in ("paper", "dual"):
             return
+        # PAPER 분기 진입 — 리스크 매니저 mode 복원 (LIVE 분기에서 'live'로 변경됐을 수 있음)
+        try:
+            self.risk_manager.set_trading_mode("paper")
+        except Exception:
+            pass
         # === 티어 심볼 필터 ===
         if not self.tier_manager.allowed_symbol(symbol, mode="paper"):
             logger.debug(
@@ -2543,6 +2548,19 @@ class AutoTrader:
                 f"심볼 아님 (허용: {self.tier_manager.get_symbols('live')})"
             )
             return
+        # === LIVE 리스크 게이트 (2026-04-25 — Manus v3 부분 채택) ===
+        # PAPER는 학습 데이터 수집을 위해 게이트 해제, LIVE만 DD/일일손실/쿨다운 enforce.
+        # risk_gates_mode='smart' & live_only=true 설정 시 활성화.
+        # _execute_paper 진입 시 다시 'paper'로 복원되므로 단방향 set OK.
+        try:
+            self.risk_manager.set_trading_mode("live")
+            num_live_pos = sum(len(om.positions) for om in self.order_managers.values())
+            can_live, live_reason = self.risk_manager.check_can_trade(self.equity, num_live_pos)
+            if not can_live:
+                logger.warning(f"[리스크-LIVE] {symbol} 진입 차단: {live_reason}")
+                return
+        except Exception as _gate_err:
+            logger.debug(f"[리스크-LIVE] 게이트 체크 실패(무시): {_gate_err}")
         # === Quant score 게이트 (엣지 없는 구간 차단, 2026-04-20) ===
         # |quant_alpha_score| < 0.25 면 진입 포기 — 최근 LIVE 손실 대부분 |score|<0.2 구간
         quant_min = self.config.get("trading", {}).get("live_quant_score_min", 0.25)
