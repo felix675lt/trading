@@ -55,6 +55,16 @@ class FeatureEngineer:
 
         result = self._add_price_features(result)
 
+        # 강화 피처 5종 — Manus v3 후보 (KAMA/Hurst/Amihud/GK/Parkinson)
+        # 학술 정통 지표지만 Manus 제시 IC는 in-sample이라 신뢰 불가.
+        # → 후보로만 추가 → LightGBM auto feature selection이 importance로 자동 pruning.
+        # Hurst는 Manus 버전(lag축 손상)이 아닌 정확한 R/S 분석 사용.
+        if "enhanced" in self.feature_list or self.feature_list == [
+            "rsi", "macd", "bbands", "atr", "volume_profile",
+            "ema", "stoch", "adx", "obv", "vwap",
+        ]:
+            result = self._add_enhanced_features(result)
+
         # 외부 요인 피처 추가 (있으면)
         if self.external_features:
             result = self._add_external_features(result)
@@ -123,6 +133,134 @@ class FeatureEngineer:
         df["vol_ratio"] = df["volume"] / df["vol_sma_20"].replace(0, np.nan)
         df["vol_std"] = df["volume"].rolling(20).std()
         return df
+
+    # ================================================================
+    # 강화 피처 5종 (KAMA/Hurst-R/S/Amihud/Garman-Klass/Parkinson)
+    # — Manus v3 후보 검증 후 정통 학술 지표만 채택
+    # — IC 검증은 LightGBM feature_importance가 자동 수행 (auto pruning)
+    # ================================================================
+    def _add_enhanced_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        c = df["close"].astype(float)
+        h = df["high"].astype(float)
+        lo = df["low"].astype(float)
+        o = df["open"].astype(float)
+        v = df["volume"].astype(float)
+
+        # 1) KAMA (Kaufman 1995) — Efficiency Ratio 기반 적응형 이동평균
+        period, fast, slow = 10, 2, 30
+        fast_sc = 2.0 / (fast + 1.0)
+        slow_sc = 2.0 / (slow + 1.0)
+        direction = (c - c.shift(period)).abs()
+        volatility = c.diff().abs().rolling(period).sum()
+        er = direction / (volatility + 1e-10)
+        sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+
+        # KAMA 재귀식 — Numpy로 한 번만 (vectorized 불가하나 O(N) 단일 패스)
+        c_arr = c.values
+        sc_arr = sc.values
+        kama_arr = np.full_like(c_arr, np.nan, dtype=float)
+        if len(c_arr) > period:
+            kama_arr[period] = c_arr[period]
+            for i in range(period + 1, len(c_arr)):
+                prev = kama_arr[i - 1]
+                if np.isnan(prev) or np.isnan(sc_arr[i]):
+                    kama_arr[i] = c_arr[i]
+                else:
+                    kama_arr[i] = prev + sc_arr[i] * (c_arr[i] - prev)
+        df["kama"] = kama_arr
+        df["kama_slope"] = pd.Series(kama_arr, index=df.index).diff(5) / (c + 1e-10)
+        df["kama_cross"] = (c - df["kama"]) / (c + 1e-10)  # 가격이 KAMA 위/아래
+
+        # 2) Hurst Exponent (R/S 분석, Hurst 1951)
+        #   H > 0.5: 추세 지속(persistent), H < 0.5: 평균회귀(anti-persistent), H ≈ 0.5: random walk
+        #   Manus 구현은 lag축이 손상되어 있어 R/S 정확 구현으로 교체
+        df["hurst"] = self._rolling_hurst_rs(c, window=64)
+
+        # 3) Amihud Illiquidity (Amihud 2002, Journal of Financial Markets)
+        #   ILLIQ_t = |return_t| / dollar_volume_t  → 유동성 약할수록 큼
+        ret_abs = c.pct_change().abs()
+        dollar_vol = c * v
+        df["amihud"] = (ret_abs / (dollar_vol + 1e-10)).rolling(20).mean()
+        # log scale로 압축 (분포가 매우 right-skewed)
+        df["amihud_log"] = np.log1p(df["amihud"] * 1e9)  # 스케일 조정
+
+        # 4) Garman-Klass Volatility (Garman-Klass 1980)
+        #   σ²_GK = 0.5 × (ln(H/L))² − (2ln2 − 1) × (ln(C/O))²
+        #   close-only 변동성보다 5~10배 효율적
+        log_hl_sq = (np.log((h / lo).replace([np.inf, -np.inf], np.nan))) ** 2
+        log_co_sq = (np.log((c / o).replace([np.inf, -np.inf], np.nan))) ** 2
+        gk_var = 0.5 * log_hl_sq - (2.0 * np.log(2.0) - 1.0) * log_co_sq
+        # 음수 방지 (drift effect로 발생 가능) — clip 후 root
+        gk_var = gk_var.clip(lower=0.0)
+        df["gk_vol"] = np.sqrt(gk_var.rolling(20).mean())
+
+        # 5) Parkinson Volatility (Parkinson 1980)
+        #   σ²_P = (1 / (4 ln 2)) × (ln(H/L))²
+        park_var = log_hl_sq / (4.0 * np.log(2.0))
+        df["parkinson_vol"] = np.sqrt(park_var.rolling(20).mean())
+
+        return df
+
+    @staticmethod
+    def _rolling_hurst_rs(series: pd.Series, window: int = 64) -> pd.Series:
+        """Rolling Hurst exponent via R/S analysis (rescaled range).
+
+        For each window:
+          1) compute mean-adjusted series Y_t = X_t - mean(X)
+          2) cumulative deviation Z_t = sum(Y_1..t)
+          3) Range R = max(Z) - min(Z)
+          4) Std S = std(X)
+          5) R/S ratio
+        Fit log(R/S) vs log(n) over multiple sub-window sizes → slope = H
+
+        Args:
+            series: log-returns 또는 가격 변화량 (정상성 가정)
+            window: 윈도우 크기 (기본 64 → 분할 가능 [8,16,32])
+        """
+        # log-returns 사용 (정상성)
+        x = np.log((series / series.shift(1)).replace([np.inf, -np.inf], np.nan))
+        x = x.fillna(0.0).values
+        n = len(x)
+        out = np.full(n, np.nan, dtype=float)
+        # 분할 길이 (window의 약수들)
+        chunk_sizes = [8, 16, 32]
+        if window < 32:
+            return pd.Series(out, index=series.index)
+        log_chunks = np.log(chunk_sizes)
+        for i in range(window, n):
+            seg = x[i - window:i]
+            if np.std(seg) < 1e-10:
+                out[i] = 0.5
+                continue
+            rs_values = []
+            for cs in chunk_sizes:
+                if cs > len(seg):
+                    continue
+                rs_per_chunk = []
+                num_chunks = len(seg) // cs
+                for k in range(num_chunks):
+                    chunk = seg[k * cs:(k + 1) * cs]
+                    if len(chunk) < 2:
+                        continue
+                    mu = chunk.mean()
+                    y = chunk - mu
+                    z = np.cumsum(y)
+                    R = z.max() - z.min()
+                    S = chunk.std()
+                    if S > 1e-10 and R > 0:
+                        rs_per_chunk.append(R / S)
+                if rs_per_chunk:
+                    rs_values.append(float(np.mean(rs_per_chunk)))
+                else:
+                    rs_values.append(np.nan)
+            valid = ~np.isnan(rs_values)
+            if valid.sum() < 2:
+                out[i] = 0.5
+                continue
+            log_rs = np.log(np.array(rs_values)[valid])
+            slope, _ = np.polyfit(log_chunks[valid], log_rs, 1)
+            out[i] = float(np.clip(slope, 0.0, 1.0))
+        return pd.Series(out, index=series.index)
 
     def _add_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df["returns_1"] = df["close"].pct_change(1)
