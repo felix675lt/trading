@@ -103,7 +103,10 @@ class CapitalTierManager:
                     "limit_order_pref": False,
                     "hmm_regime": False,
                     "meta_labeling": False,
-                    "walk_forward_cv": False,
+                    # [Phase I, 2026-04-25] micro tier에서도 TimeSeriesSplit 강제 — 단일 split의
+                    # 검증 비대표성 문제를 차단. PurgedKFold는 meta_labeling 플래그(=large+)에서만
+                    # 활성화되므로 여기서 True로 켜도 비용은 ~3-5분 추가 학습뿐.
+                    "walk_forward_cv": True,
                     "cvar_risk": False,
                     "max_leverage": 5,
                 },
