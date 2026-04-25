@@ -75,6 +75,14 @@ class EnsembleSignalGenerator:
         self.weights = {name: w for name in active}
         self._performance_history: list[dict] = []
 
+        # [Phase K, 2026-04-25] IC 기반 가중치 — predict() 시점의 per-model signal을
+        # 보관하여, 거래 청산 시점에 (signal, realized_return) 쌍을 ICTracker에
+        # source="model_xgb"/"model_lstm"/"model_lgb"/"model_cnn"으로 기록하기 위한 버퍼.
+        # apply_ic_weights() 가 IC를 읽어 가중치를 정확도→IC로 교체.
+        self.last_per_model_signals: dict[str, float] = {}
+        # IC 가중 모드 ON/OFF — apply_ic_weights() 호출 시 True로 전환. False면 정확도 가중 유지.
+        self._ic_weighting_active: bool = False
+
     # ------------------------------------------------------------------
     def train_all(
         self,
@@ -169,6 +177,9 @@ class EnsembleSignalGenerator:
             n = len(preds)
             w = {k: 1.0 / n for k in preds}
 
+        # [Phase K] per-model signal 버퍼 갱신 — 청산 시점에 IC 기록 재료
+        self.last_per_model_signals = {k: float(preds[k]["signal"]) for k in preds}
+
         combined_signal = sum(preds[k]["signal"] * w[k] for k in preds)
         combined_confidence = sum(preds[k]["confidence"] * w[k] for k in preds)
 
@@ -206,6 +217,131 @@ class EnsembleSignalGenerator:
             "agreement": float(agreement),
             "models": preds,
             "weights_used": {k: float(v) for k, v in w.items()},
+        }
+
+    def apply_ic_weights(
+        self,
+        ic_tracker,
+        min_samples: int = 20,
+        smoothing: float = 0.5,
+    ) -> dict:
+        """[Phase K, 2026-04-25] 모델별 IC 기반 가중치 갱신.
+
+        Manus v3 (2026-04-25) 지적: 기존 self.weights는 *정확도* 비례.
+        정확도와 IC는 다름 — 60% 정확도라도 맞을 때 5bp / 틀릴 때 50bp이면 IC<0.
+        IC는 시그널 강도까지 반영하는 rank correlation이므로, 손익에 더 직결.
+
+        ICTracker가 source="model_xgb"/"model_lstm"/"model_lgb"/"model_cnn"으로
+        축적한 (signal, realized_return) 페어에서 IC를 읽어 가중치를 재계산한다.
+        샘플 부족(min_samples<20) 모델은 정확도 가중치를 유지(혼합).
+
+        Args:
+            ic_tracker: ICTracker 인스턴스
+            min_samples: IC 신뢰 임계 샘플 수
+            smoothing: 신·구 가중치 지수평활 (0=교체 안함, 1=즉시 교체)
+
+        Returns:
+            {"before": {...}, "after": {...}, "ic": {model: ic_value}, "n": {model: n_samples}}
+        """
+        # 활성 모델 결정
+        active = ["xgboost", "lstm"]
+        if self.has_lgb:
+            active.append("lightgbm")
+        if self.has_cnn:
+            active.append("cnn_attention")
+
+        # 모델별 IC 조회
+        source_map = {
+            "xgboost": "model_xgb",
+            "lstm": "model_lstm",
+            "lightgbm": "model_lgb",
+            "cnn_attention": "model_cnn",
+        }
+        ics: dict[str, float] = {}
+        ns: dict[str, int] = {}
+        for m in active:
+            src = source_map.get(m, m)
+            try:
+                recs = ic_tracker._select(src, None)  # 내부 헬퍼 — 같은 모듈 호환
+                n = len(recs)
+                ns[m] = n
+                if n >= min_samples:
+                    ic_val = ic_tracker.ic(source=src)
+                    ics[m] = float(ic_val) if np.isfinite(ic_val) else 0.0
+                else:
+                    ics[m] = 0.0
+            except Exception as e:
+                logger.debug(f"[Ensemble-IC] {m} IC 조회 실패: {e}")
+                ics[m] = 0.0
+                ns[m] = 0
+
+        # 충분한 샘플이 있는 모델이 2개 미만이면 IC 가중 보류
+        sufficient = [m for m in active if ns.get(m, 0) >= min_samples]
+        if len(sufficient) < 2:
+            logger.debug(
+                f"[Ensemble-IC] 샘플 부족 — IC 가중 보류 (sufficient={len(sufficient)}/{len(active)})"
+            )
+            return {
+                "before": dict(self.weights),
+                "after": dict(self.weights),
+                "ic": ics, "n": ns,
+                "applied": False,
+            }
+
+        # IC → 가중치 매핑:
+        #   IC > 0  : 양의 알파 (가중치 후보)
+        #   IC <= 0 : 비유의/음의 알파 → 0 (그러나 모두 0 방지를 위해 floor=0.05)
+        targets: dict[str, float] = {}
+        for m in active:
+            ic = ics.get(m, 0.0)
+            n = ns.get(m, 0)
+            if n < min_samples:
+                # 샘플 부족 모델은 현재 가중치 유지(샘플 모일 때까지)
+                targets[m] = float(self.weights.get(m, 1.0 / len(active)))
+                continue
+            # IC 양수만 살리고, 음/0은 최소 floor (완전 0이면 모델 죽음 → 회복 불가)
+            score = max(ic, 0.0) + 0.05  # floor
+            targets[m] = score
+
+        total = sum(targets.values())
+        if total <= 0:
+            logger.warning("[Ensemble-IC] 모든 IC 0 이하 — 가중치 갱신 보류")
+            return {
+                "before": dict(self.weights),
+                "after": dict(self.weights),
+                "ic": ics, "n": ns,
+                "applied": False,
+            }
+
+        target_weights = {m: targets[m] / total for m in active}
+
+        # 지수평활 — 급격한 변경 방지
+        s = max(0.0, min(1.0, smoothing))
+        before = dict(self.weights)
+        for m in active:
+            prev = float(self.weights.get(m, 1.0 / len(active)))
+            new = (1 - s) * prev + s * target_weights[m]
+            self.weights[m] = new
+
+        # 정규화 보정
+        wt = sum(self.weights[m] for m in active)
+        if wt > 0:
+            for m in active:
+                self.weights[m] = self.weights[m] / wt
+
+        self._ic_weighting_active = True
+
+        logger.info(
+            "[Ensemble-IC] IC 기반 가중치 갱신 — "
+            + ", ".join(
+                f"{m}:{self.weights[m]:.3f}(IC={ics[m]:+.4f},n={ns[m]})" for m in active
+            )
+        )
+        return {
+            "before": before,
+            "after": dict(self.weights),
+            "ic": ics, "n": ns,
+            "applied": True,
         }
 
     def update_weights(self, model_name: str, recent_accuracy: float):

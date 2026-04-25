@@ -1149,6 +1149,24 @@ class AutoTrader:
                                     )
                         except Exception as ee:
                             logger.debug(f"[SignalWeight] 주기 실행 실패: {ee}")
+                        # [Phase K, 2026-04-25] 앙상블 모델별 IC 가중치 갱신 — 매 1h
+                        # ensemble.py의 정확도 기반 가중치를 IC 기반으로 교체.
+                        # 샘플 부족 시 자동 보류 → safe.
+                        try:
+                            if hasattr(self, "ensemble") and self.ensemble is not None:
+                                _ic_apply = self.ensemble.apply_ic_weights(
+                                    self.ic_tracker, min_samples=20, smoothing=0.5,
+                                )
+                                # apply_ic_weights() 자체가 적용 여부와 IC를 로깅함 — 추가 로그 불필요
+                                _ = _ic_apply  # noqa
+                        except Exception as ee:
+                            logger.debug(f"[Ensemble-IC] 주기 실행 실패: {ee}")
+                        # [Phase J, 2026-04-25] 차단 사유 카운터 — 매 1h 분포 출력 + 리셋
+                        try:
+                            if hasattr(self, "strategy_manager") and self.strategy_manager is not None:
+                                self.strategy_manager.log_block_stats(force=True)
+                        except Exception as ee:
+                            logger.debug(f"[BlockStats] 주기 실행 실패: {ee}")
                         # Paper↔Live 체결 모델 동기화 — LIVE 실측 슬리피지/메이커율 피드백
                         # 백테스트·페이퍼가 실거래와 다른 체결비용으로 돌아가면 전략 신호가
                         # 왜곡되므로, OrderManager가 누적한 중앙값 통계를 PaperTrader로
@@ -1765,6 +1783,12 @@ class AutoTrader:
         elif decision.action == "close":
             price = float(df["close"].iloc[-1])
             volatility = df["returns_1"].std() if "returns_1" in df.columns else 0
+            # [Phase K, 2026-04-25] per-model 시그널 캡처 — IC 기반 앙상블 가중치 재료.
+            # ensemble.predict() 가 마지막 호출의 per-model 출력을 last_per_model_signals에 보관.
+            try:
+                per_model_signals = dict(getattr(self.ensemble, "last_per_model_signals", {}) or {})
+            except Exception:
+                per_model_signals = {}
             trade_context = {
                 "regime": adaptive_params["regime"],
                 "signal": ml_signal.get("signal", 0),
@@ -1774,6 +1798,8 @@ class AutoTrader:
                 "external_direction": ext_signal.get("direction", "neutral"),
                 # Claude-native LLM 전용 IC 평가용 엔트리 시그널 (auto-tune 재료)
                 "llm_score": float(ext_signal.get("llm_score", 0) or 0),
+                # [Phase K] 모델별 시그널 — 청산 시 per-model IC 기록용
+                "per_model_signals": per_model_signals,
             }
 
             # === PAPER 청산 ===
@@ -1824,6 +1850,26 @@ class AutoTrader:
                                 source="llm",
                                 regime=_regime,
                             )
+                        # [Phase K, 2026-04-25] per-model IC 기록 — ensemble.apply_ic_weights() 재료
+                        # entry 시점의 per-model 시그널을 trade_context에서 꺼내 기록.
+                        per_model = trade_context.get("per_model_signals", {}) or {}
+                        _src_map = {
+                            "xgboost": "model_xgb",
+                            "lstm": "model_lstm",
+                            "lightgbm": "model_lgb",
+                            "cnn_attention": "model_cnn",
+                        }
+                        for _mn, _sig in per_model.items():
+                            _src = _src_map.get(_mn, f"model_{_mn}")
+                            try:
+                                self.ic_tracker.record(
+                                    signal=float(_sig or 0.0),
+                                    realized_return=realized,
+                                    source=_src,
+                                    regime=_regime,
+                                )
+                            except Exception as _e:
+                                logger.debug(f"[IC-PerModel] {_mn} 기록 실패: {_e}")
                     except Exception as e:
                         logger.debug(f"[IC] 기록 실패: {e}")
                     if result["pnl"] < 0:
@@ -1913,6 +1959,24 @@ class AutoTrader:
                                     source="llm",
                                     regime=_regime_live,
                                 )
+                            # [Phase K, 2026-04-25] LIVE per-model IC 기록 — 가중치 재료
+                            try:
+                                _per_model = dict(getattr(self.ensemble, "last_per_model_signals", {}) or {})
+                                _src_map = {
+                                    "xgboost": "model_xgb",
+                                    "lstm": "model_lstm",
+                                    "lightgbm": "model_lgb",
+                                    "cnn_attention": "model_cnn",
+                                }
+                                for _mn, _sig in _per_model.items():
+                                    self.ic_tracker.record(
+                                        signal=float(_sig or 0.0),
+                                        realized_return=realized,
+                                        source=_src_map.get(_mn, f"model_{_mn}"),
+                                        regime=_regime_live,
+                                    )
+                            except Exception as _e:
+                                logger.debug(f"[IC-PerModel-LIVE] 실패: {_e}")
                         except Exception as e:
                             logger.debug(f"[IC-LIVE] 기록 실패: {e}")
                         if live_pnl < 0:

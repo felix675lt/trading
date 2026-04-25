@@ -139,6 +139,83 @@ class StrategyManager:
         self._loss_penalty_holds = 0         # 손실 패널티 남은 hold 수
         self._loss_confidence_boost = 0.0    # 손실 후 추가 확신도 요구
 
+        # === [Phase J, 2026-04-25] 차단 사유 카운터 — 분석 마비 실증 진단 ===
+        # decide()가 hold로 결정될 때마다 카테고리별 카운트를 증가.
+        # log_block_stats() 호출 시 분포를 출력하고 카운터 리셋.
+        # 카테고리:
+        #   macro_block: 고임팩트 매크로 이벤트(베어/불) 차단
+        #   regime_bias_block: 레짐 방향 바이어스 차단 (펀비/RSI/모멘텀)
+        #   long_only_block: LONG_ONLY 정책 숏 차단
+        #   smart_short_block: 레짐별 자동 숏 차단
+        #   blacklist_block: 피드백 블랙리스트 차단
+        #   bocpd_block: BOCPD 변환점 차단
+        #   low_confidence: 최소 확신도 미달
+        #   extreme_vol_block: 극심한 변동성 차단
+        #   insufficient_votes: 투표 미달 (default fallthrough)
+        #   close_signal: RL이 청산 요청 (참고용 — 실제 hold가 아님)
+        self._hold_reason_counts: dict[str, int] = {}
+        self._hold_total = 0
+        self._decide_total = 0  # decide() 총 호출 수 (분모)
+        self._block_log_last: datetime | None = None
+
+    # ------------------------------------------------------------------
+    # [Phase J, 2026-04-25] 차단 사유 카운터
+    # ------------------------------------------------------------------
+    def _record_hold(self, category: str) -> None:
+        """decide()의 각 hold 지점에서 카테고리를 누적.
+
+        카운터는 log_block_stats()가 출력 후 리셋한다.
+        """
+        try:
+            self._hold_reason_counts[category] = self._hold_reason_counts.get(category, 0) + 1
+            self._hold_total += 1
+        except Exception:
+            pass
+
+    def log_block_stats(self, force: bool = False, min_interval_sec: int = 3600) -> dict | None:
+        """1시간마다 차단 사유 분포 로깅 + 카운터 리셋.
+
+        Args:
+            force: True면 인터벌 무시
+            min_interval_sec: 최소 호출 간격 (기본 1h)
+
+        Returns:
+            출력된 통계 dict (또는 인터벌 미달 시 None)
+        """
+        now = datetime.utcnow()
+        if not force and self._block_log_last is not None:
+            elapsed = (now - self._block_log_last).total_seconds()
+            if elapsed < min_interval_sec:
+                return None
+        if self._decide_total == 0:
+            self._block_log_last = now
+            return None
+
+        total = max(self._decide_total, 1)
+        sorted_counts = sorted(
+            self._hold_reason_counts.items(), key=lambda x: -x[1]
+        )
+        # Top 사유 + 비율 — 분석 마비 진단 핵심 지표
+        breakdown = ", ".join(
+            f"{cat}={cnt}({cnt/total*100:.1f}%)" for cat, cnt in sorted_counts
+        )
+        hold_rate = self._hold_total / total * 100
+        logger.info(
+            f"[BlockStats] decide={self._decide_total} hold={self._hold_total}({hold_rate:.1f}%) | {breakdown}"
+        )
+        snapshot = {
+            "decide_total": self._decide_total,
+            "hold_total": self._hold_total,
+            "hold_rate_pct": round(hold_rate, 2),
+            "by_category": dict(self._hold_reason_counts),
+        }
+        # 리셋
+        self._hold_reason_counts.clear()
+        self._hold_total = 0
+        self._decide_total = 0
+        self._block_log_last = now
+        return snapshot
+
     def record_loss(self):
         """외부에서 손실 발생 알림 → 확신도 요구 임시 상향"""
         self._recent_loss_count += 1
@@ -347,6 +424,11 @@ class StrategyManager:
         action_map = {0: "hold", 1: "long", 2: "short", 3: "close"}
         rl_direction = action_map.get(rl_action, "hold")
 
+        # [Phase J] decide() 호출 카운트 (block_stats 분모)
+        self._decide_total += 1
+        # 카테고리 기록 시작점 — 끝에서 fallthrough hold를 잡기 위해
+        _hold_total_snap = self._hold_total
+
         # LIVE 공격 롱 모드 활성 여부
         live_aggro = (mode == "live") and self.live_aggressive_long
 
@@ -535,11 +617,13 @@ class StrategyManager:
                     final_action = "hold"
                     reason = f"고임팩트 베어리시 이벤트 → 롱 차단 (ext={ext_score:.2f})"
                     confidence = 0.0
+                    self._record_hold("macro_block")
             elif ext_direction == "bullish" and final_action == "short":
                 logger.warning(f"[고임팩트차단] 숏 차단 (ext_score={ext_score:.2f}, 불리시 이벤트)")
                 final_action = "hold"
                 reason = f"고임팩트 불리시 이벤트 → 숏 차단 (ext={ext_score:.2f})"
                 confidence = 0.0
+                self._record_hold("macro_block")
         elif has_high_impact and abs(ext_score) > 0.4 and macro_fully_disabled:
             logger.debug(
                 f"[A/B:MACRO_OFF] 고임팩트 이벤트 차단 무시 (ext_score={ext_score:.2f}) — variant 정책"
@@ -565,6 +649,7 @@ class StrategyManager:
                     final_action = "hold"
                     reason = direction_block
                     confidence = 0.0
+                    self._record_hold("regime_bias_block")
 
         # 2.85. 방향 필터 (사용자 지시) — 숏 진입 차단
         # 주: live_long_only는 여기서 차단하지 않는다 (PAPER는 양방향 학습 필요).
@@ -575,6 +660,7 @@ class StrategyManager:
             final_action = "hold"
             reason = f"LONG_ONLY 모드 — 숏 차단 (원신호: {reason})"
             confidence = 0.0
+            self._record_hold("long_only_block")
         # (2) 스마트 레짐-조건부 숏필터 — 특정 레짐에서만 숏 거부 (2026-04-24)
         elif (final_action == "short"
               and self.smart_short_blocked_regimes
@@ -586,6 +672,7 @@ class StrategyManager:
             final_action = "hold"
             reason = f"SMART_SHORT 차단: {market_regime} 레짐 숏 금지 (원신호: {reason})"
             confidence = 0.0
+            self._record_hold("smart_short_block")
 
         # 2.9. 피드백 블랙리스트 필터 [재활성화] — 반복 실패 패턴 진입 차단
         if final_action in ["long", "short"] and feedback_blacklist:
@@ -598,6 +685,7 @@ class StrategyManager:
                 final_action = "hold"
                 reason = f"블랙리스트 차단: {combo_key} (반복 실패 패턴)"
                 confidence = 0.0
+                self._record_hold("blacklist_block")
 
         # 2.95. BOCPD 변환점 차단 (stage-1 final gate, 2026-04-25)
         # 레짐 전환점 직후에는 long/short 모두 차단 — 잘못된 방향 진입 방지.
@@ -616,6 +704,7 @@ class StrategyManager:
                     f"regime={bocpd_info.get('regime')})"
                 )
                 confidence = 0.0
+                self._record_hold("bocpd_block")
             else:
                 # 변환점 근처면 포지션 사이즈 축소 (size에 곱해질 multiplier 저장)
                 try:
@@ -640,6 +729,7 @@ class StrategyManager:
                 f"ML:{ml_direction}/{ml_confidence:.2f} RL:{rl_direction}/{rl_confidence:.2f}]"
             )
             final_action = "hold"
+            self._record_hold("low_confidence")
 
         # 4. 시장 레짐 필터
         if market_regime == "extreme_volatility" and final_action in ["long", "short"]:
@@ -647,6 +737,7 @@ class StrategyManager:
             if confidence < effective_min_conf:
                 final_action = "hold"
                 reason = "극심한 변동성 - 진입 보류"
+                self._record_hold("extreme_vol_block")
 
         # 5. 포지션 크기 결정
         confidence = min(confidence, 1.0)
@@ -656,6 +747,14 @@ class StrategyManager:
         trade_type = "scalp"
         if final_action in ("long", "short"):
             trade_type = self._classify_trade_type(confirming)
+
+        # [Phase J] 카테고리 미기록 hold (투표 미달 fallthrough) 보충
+        if final_action == "hold" and self._hold_total == _hold_total_snap:
+            # 어떤 카테고리도 기록되지 않은 hold = 투표 부족 또는 RL=close 핸드오프
+            if rl_direction == "close":
+                self._record_hold("close_signal")
+            else:
+                self._record_hold("insufficient_votes")
 
         # 자기진단: hold 카운터
         if final_action == "hold":
