@@ -4093,15 +4093,18 @@ class AutoTrader:
                         "SELECT name FROM pragma_table_info('llm_signal_snapshots')"
                     )
                     db_cols = {r[0] for r in cur.fetchall()}
-                    expected_llm = {
-                        "ext_llm_score", "ext_llm_conviction", "ext_llm_expected_value",
-                        "ext_llm_max_risk_severity", "ext_llm_is_bullish", "ext_llm_is_bearish",
+                    # DB는 bare column 사용 (score, conviction, …); ext_llm_* prefix는
+                    # trainer.py 가 add_prefix("ext_llm_") 로 in-memory 추가한다.
+                    # 따라서 bare name 의 존재 여부를 검사해야 정합.
+                    expected_bare = {
+                        "score", "conviction", "expected_value",
+                        "max_risk_severity", "direction",
                     }
-                    missing = expected_llm - db_cols
+                    missing = expected_bare - db_cols
                     if missing:
                         issues.append(
-                            f"[Schema] llm_signal_snapshots 컬럼 누락: {sorted(missing)} "
-                            f"(external_manager.py 와 DB 스키마 불일치)"
+                            f"[Schema] llm_signal_snapshots bare 컬럼 누락: {sorted(missing)} "
+                            f"(external_manager.py insert ↔ DB 스키마 불일치)"
                         )
             except Exception as e:
                 logger.debug(f"[Schema] llm_signal_snapshots 점검 실패: {e}")
