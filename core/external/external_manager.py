@@ -260,24 +260,29 @@ class ExternalDataManager:
                 )
                 self._last_llm_signal = llm_sig.to_external_signal()
                 # 학습 피처용 평탄화 (ML 피처는 숫자만 허용)
+                # 컬럼명은 DB 스키마(llm_signal_snapshots)와 일치해야 함 — trainer.py가
+                # storage.load_llm_snapshots() 결과에 add_prefix("ext_llm_")를 붙여 학습하므로
+                # 추론 시 동일 컬럼명을 생성하지 않으면 LightGBM/XGBoost가 컬럼을 못 찾음.
+                # to_external_signal()이 반환하는 "confidence" → 내부적으로는 conviction,
+                # 따라서 ext_llm_conviction / ext_llm_expected_value / ext_llm_max_risk_severity로 통일.
                 llm_features = {
-                    "ext_llm_score":      float(self._last_llm_signal.get("score", 0.0)),
-                    "ext_llm_confidence": float(self._last_llm_signal.get("confidence", 0.0)),
-                    "ext_llm_ev":         float(self._last_llm_signal.get("expected_value", 0.0)),
-                    "ext_llm_max_severity": float(self._last_llm_signal.get("max_risk_severity", 0.0)),
-                    "ext_llm_is_bullish": 1.0 if self._last_llm_signal.get("direction") == "bullish" else 0.0,
-                    "ext_llm_is_bearish": 1.0 if self._last_llm_signal.get("direction") == "bearish" else 0.0,
+                    "ext_llm_score":             float(self._last_llm_signal.get("score", 0.0)),
+                    "ext_llm_conviction":        float(self._last_llm_signal.get("confidence", 0.0)),
+                    "ext_llm_expected_value":    float(self._last_llm_signal.get("expected_value", 0.0)),
+                    "ext_llm_max_risk_severity": float(self._last_llm_signal.get("max_risk_severity", 0.0)),
+                    "ext_llm_is_bullish":        1.0 if self._last_llm_signal.get("direction") == "bullish" else 0.0,
+                    "ext_llm_is_bearish":        1.0 if self._last_llm_signal.get("direction") == "bearish" else 0.0,
                 }
             except Exception as e:
                 logger.debug(f"[LLM] 시그널 수집 실패 → 0 값으로 폴백: {e}")
                 self._last_llm_signal = {}
                 llm_features = {
-                    "ext_llm_score":      0.0,
-                    "ext_llm_confidence": 0.0,
-                    "ext_llm_ev":         0.0,
-                    "ext_llm_max_severity": 0.0,
-                    "ext_llm_is_bullish": 0.0,
-                    "ext_llm_is_bearish": 0.0,
+                    "ext_llm_score":             0.0,
+                    "ext_llm_conviction":        0.0,
+                    "ext_llm_expected_value":    0.0,
+                    "ext_llm_max_risk_severity": 0.0,
+                    "ext_llm_is_bullish":        0.0,
+                    "ext_llm_is_bearish":        0.0,
                 }
 
             # 각 모듈의 피처 수집 (공포탐욕 완전 제거)
