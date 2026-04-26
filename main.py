@@ -4083,12 +4083,16 @@ class AutoTrader:
         issues = []
         try:
             # === (1) llm_signal_snapshots 스키마 ↔ external_manager 사용 컬럼 ===
+            # 행이 1개 이상 존재할 때만 검증 — 빈 테이블은 스키마가 동적 생성되므로 false-positive.
             try:
-                cur = self.storage.conn.execute(
-                    "SELECT name FROM pragma_table_info('llm_signal_snapshots')"
-                )
-                db_cols = {r[0] for r in cur.fetchall()}
-                if db_cols:
+                row_cnt = self.storage.conn.execute(
+                    "SELECT COUNT(*) FROM llm_signal_snapshots"
+                ).fetchone()[0]
+                if row_cnt > 0:
+                    cur = self.storage.conn.execute(
+                        "SELECT name FROM pragma_table_info('llm_signal_snapshots')"
+                    )
+                    db_cols = {r[0] for r in cur.fetchall()}
                     expected_llm = {
                         "ext_llm_score", "ext_llm_conviction", "ext_llm_expected_value",
                         "ext_llm_max_risk_severity", "ext_llm_is_bullish", "ext_llm_is_bearish",
@@ -4097,7 +4101,7 @@ class AutoTrader:
                     if missing:
                         issues.append(
                             f"[Schema] llm_signal_snapshots 컬럼 누락: {sorted(missing)} "
-                            f"(external_manager.py 와 DB 스키마 불일치 가능성)"
+                            f"(external_manager.py 와 DB 스키마 불일치)"
                         )
             except Exception as e:
                 logger.debug(f"[Schema] llm_signal_snapshots 점검 실패: {e}")
@@ -4121,7 +4125,13 @@ class AutoTrader:
                         }, index=idx)
                         gen = self.feature_engineer.generate(sdf)
                         cur_feats = set(self.feature_engineer.get_feature_columns(gen))
-                        missing = [c for c in model_feats if c not in cur_feats]
+                        # 동적 주입 피처 (학습 시점에만 set_btc_reference / external_features 로 추가) 제외
+                        # btc_*: cross-asset BTC 선행 / ext_*: 외부 데이터 매니저 / deriv_*: 파생 스냅샷
+                        DYN_PREFIXES = ("btc_", "ext_", "deriv_")
+                        missing = [
+                            c for c in model_feats
+                            if c not in cur_feats and not c.startswith(DYN_PREFIXES)
+                        ]
                         if missing:
                             issues.append(
                                 f"[Schema] 모델학습 컬럼 {len(missing)}개가 현재 FeatureEngineer "
