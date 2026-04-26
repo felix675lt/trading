@@ -209,12 +209,29 @@ class XGBoostPredictor:
         )
 
         # 성능 가드: 기존 모델보다 5%p 이상 하락하면 롤백
+        # [Patch H, 2026-04-27] 단, 피처 차원이 변경됐으면 롤백 시 호환성 깨짐 → 신모델 강제 채택
+        # (Patch A로 9개 시간피처 추가 → 기존 39 vs 신규 54처럼 차원 늘어났을 때
+        #  롤백된 모델이 추후 predict_proba(X_new) 호출 시 shape mismatch 발생)
         if self.accuracy > 0 and mean_acc < self.accuracy - 0.05:
-            logger.warning(
-                f"[WalkForward-XGB] OOS 평균 {mean_acc:.4f} < 기존 {self.accuracy:.4f} - 0.05 → 롤백"
-            )
-            if self.load():
-                return self.accuracy
+            n_features_new = int(X.shape[1])
+            try:
+                # 디스크에 저장된 모델의 기대 피처 수 확인
+                saved_n_features = None
+                if self.model is not None and hasattr(self.model, "n_features_in_"):
+                    saved_n_features = int(self.model.n_features_in_)
+            except Exception:
+                saved_n_features = None
+            if saved_n_features is not None and saved_n_features != n_features_new:
+                logger.warning(
+                    f"[WalkForward-XGB] OOS {mean_acc:.4f} < 기존 {self.accuracy:.4f} 이지만 "
+                    f"피처 차원 변경 ({saved_n_features}→{n_features_new}) → 롤백 불가, 신모델 채택"
+                )
+            else:
+                logger.warning(
+                    f"[WalkForward-XGB] OOS 평균 {mean_acc:.4f} < 기존 {self.accuracy:.4f} - 0.05 → 롤백"
+                )
+                if self.load():
+                    return self.accuracy
 
         # 채택: 마지막 폴드의 모델을 최종 모델로 (가장 많은 데이터 본 것)
         self.model = last_model

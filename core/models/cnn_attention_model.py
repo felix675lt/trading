@@ -177,6 +177,21 @@ class CNNAttentionPredictor:
             lab.append(y[i])
         return np.array(seq, dtype=np.float32), np.array(lab, dtype=np.int64)
 
+    def _eval_chunked(self, X_arr: np.ndarray, chunk: int = 4096) -> np.ndarray:
+        """[Patch H] 큰 평가 텐서를 청크 단위로 GPU에 올려 OOM 방지.
+
+        X_arr: (N, seq_len, input_dim) numpy → preds: (N,) int64 numpy
+        """
+        n = len(X_arr)
+        out = np.zeros(n, dtype=np.int64)
+        for i in range(0, n, chunk):
+            j = min(i + chunk, n)
+            xb = torch.from_numpy(X_arr[i:j]).to(self.device)
+            logits = self.model(xb)
+            out[i:j] = logits.argmax(dim=1).cpu().numpy()
+            del xb, logits
+        return out
+
     def _mixup(self, x: torch.Tensor, y: torch.Tensor, alpha: float):
         if alpha <= 0:
             return x, y, y, 1.0
@@ -211,6 +226,21 @@ class CNNAttentionPredictor:
                 f"[CNN-Attn] 시퀀스 부족 ({len(X_seq)} < 100) → 학습 스킵"
             )
             return self.accuracy
+
+        # [Patch H, 2026-04-27] MPS OOM 방지 — 시퀀스 데이터셋이 너무 크면 최근 N개로 cap
+        # 691310 캔들 × seq_len × dim × 4byte → MPS 20GiB 한도 초과 사례 발생
+        try:
+            is_mps = (str(self.device).startswith("mps"))
+        except Exception:
+            is_mps = False
+        if is_mps:
+            MPS_MAX_SEQ = 200_000  # 약 4GiB(seq60×dim54×4byte) 기준 안전 한계
+            if len(X_seq) > MPS_MAX_SEQ:
+                logger.warning(
+                    f"[CNN-Attn] MPS 메모리 안전화 — 시퀀스 {len(X_seq):,} → 최근 {MPS_MAX_SEQ:,}개 사용"
+                )
+                X_seq = X_seq[-MPS_MAX_SEQ:]
+                y_seq = y_seq[-MPS_MAX_SEQ:]
 
         split = int(len(X_seq) * 0.8)
         X_tr, X_te = X_seq[:split], X_seq[split:]
@@ -282,12 +312,10 @@ class CNNAttentionPredictor:
                 total_loss += float(loss.item())
             scheduler.step()
 
-            # 검증
+            # 검증 — [Patch H] 청크 평가로 MPS OOM 방지
             self.model.eval()
             with torch.no_grad():
-                xte = torch.from_numpy(X_te).to(self.device)
-                logits = self.model(xte)
-                preds = logits.argmax(dim=1).cpu().numpy()
+                preds = self._eval_chunked(X_te)
                 val_acc = float(accuracy_score(y_te, preds))
             if val_acc > best_val:
                 best_val = val_acc
@@ -311,12 +339,10 @@ class CNNAttentionPredictor:
             self.model.load_state_dict(best_state)
             self.model.to(self.device)
 
-        # 최종 평가
+        # 최종 평가 — [Patch H] 청크 평가로 MPS OOM 방지
         self.model.eval()
         with torch.no_grad():
-            xte = torch.from_numpy(X_te).to(self.device)
-            logits = self.model(xte)
-            preds = logits.argmax(dim=1).cpu().numpy()
+            preds = self._eval_chunked(X_te)
             new_acc = float(accuracy_score(y_te, preds))
             new_f1 = float(f1_score(y_te, preds, average="weighted"))
 

@@ -323,8 +323,21 @@ class SelfLearningTrainer:
                     # 1차 시그널 주입: XGB 예측값을 DF에 컬럼으로 추가
                     df_meta = df.copy()
                     try:
-                        X_all = df_meta[all_feature_cols].values
+                        # [Patch H, 2026-04-27] XGB가 롤백되었거나 다른 차원으로 학습됐을 수 있으므로
+                        # XGB 모델이 실제 학습된 feature_columns를 우선 사용 (shape mismatch 방지)
+                        xgb_feats = getattr(self.ensemble.xgb, "feature_columns", None) or all_feature_cols
+                        # df_meta에 없는 컬럼은 제외하여 안전하게 정합화
+                        xgb_feats = [c for c in xgb_feats if c in df_meta.columns]
+                        if not xgb_feats:
+                            raise RuntimeError("xgb feature_columns 비어있음")
+                        X_all = df_meta[xgb_feats].values
                         if self.ensemble.xgb.model is not None:
+                            # 추가 안전장치: 모델이 기대하는 차원과 다르면 우회
+                            expected = getattr(self.ensemble.xgb.model, "n_features_in_", X_all.shape[1])
+                            if expected != X_all.shape[1]:
+                                raise RuntimeError(
+                                    f"XGB 차원 불일치 expected={expected} got={X_all.shape[1]} → 메타 학습 스킵"
+                                )
                             proba = self.ensemble.xgb.model.predict_proba(X_all)
                             # signal = P(up) - P(down), confidence = max proba
                             df_meta["primary_signal"] = proba[:, 2] - proba[:, 0]
