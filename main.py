@@ -228,6 +228,17 @@ class AutoTrader:
         self._daily_dd_trigger_time = None
         self._daily_dd_threshold_pct = -3.0  # LIVE 일 누적 PnL / 초기자본 < -3% → 24h LIVE 정지
 
+        # [Patch C, 2026-04-26] LIVE EV (Expected Value) 자동 정지 상태 — LIVE 전용
+        # 무인 1개월 운영 안전장치: 최근 50 LIVE 거래 EV<0이면 LIVE만 무기한 정지.
+        # 시간 기반 자동 재개 없음 — EV>0 회복(또는 모델 재학습 후 신규 신호) 시에만 해제.
+        # PAPER는 영향 없음 (학습 데이터 계속 수집).
+        self._live_ev_paused = False
+        self._live_ev_pause_reason = ""
+        self._live_ev_pause_time = None
+        self._live_ev_lookback = 50    # 최근 N LIVE 트레이드 (HIPPO 제외)
+        self._live_ev_threshold = -0.5  # USD/trade — EV < -0.5$ 면 정지 (잡음 마진)
+        self._live_ev_min_samples = 20  # 표본 N개 이상일 때만 판단
+
         # 외부 요인 알림 상태 추적 (공포탐욕 제거됨)
         self._ext_alert_state = {
             "last_composite_score": 0.0,
@@ -571,6 +582,25 @@ class AutoTrader:
             logger.info("기존 ML 모델 로드 성공")
         if self.rl_agent.load():
             logger.info("기존 RL 모델 로드 성공")
+
+        # [Patch D, 2026-04-26] 부팅 직후 스키마 검증 — silent breakage 조기 발견
+        try:
+            schema_issues = self._check_schema_health(sample=True)
+            if schema_issues:
+                logger.warning(f"[Schema-Boot] 발견된 문제 {len(schema_issues)}건")
+                try:
+                    body = "\n".join(f"  • {it}" for it in schema_issues)
+                    tg_notify(
+                        f"⚠️ <b>부팅 스키마 검증 경고 (Patch D)</b>\n"
+                        f"━━━━━━━━━━━━━\n{body}\n"
+                        f"📝 학습/거래 계속 진행 (자동 재학습 사이클이 정정)"
+                    )
+                except Exception:
+                    pass
+            else:
+                logger.info("[Schema-Boot] ✅ 모델/DB/피처 스키마 정합")
+        except Exception as e:
+            logger.debug(f"[Schema-Boot] 검증 호출 실패: {e}")
 
         # 외부 데이터 초기 수집
         if self.external_manager.enabled:
@@ -2666,6 +2696,13 @@ class AutoTrader:
                 f"(사유: {getattr(self, '_daily_dd_reason', '?')})"
             )
             return
+        # [Patch C, 2026-04-26] LIVE EV 음수 정지 — LIVE 전용
+        if getattr(self, '_live_ev_paused', False):
+            logger.info(
+                f"[EV정지] {c.get('symbol')} LIVE 엔트리 차단 "
+                f"(사유: {getattr(self, '_live_ev_pause_reason', '?')})"
+            )
+            return
         # symbol 은 함수 상단에서 이미 c.get("symbol") 로 설정됨
         om = self.order_managers.get(exchange_name)
         if not om:
@@ -3395,6 +3432,15 @@ class AutoTrader:
             if dd_result:
                 issues.append(dd_result)
 
+            # ──── 4c. LIVE EV 모니터 (Patch C, 2026-04-26) ────
+            ev_result = self._check_live_ev_monitor()
+            if ev_result:
+                issues.append(ev_result)
+
+            # ──── 4d. 스키마 정합성 (Patch D, 2026-04-26) ────
+            for sch_issue in self._check_schema_health(sample=False):
+                issues.append(sch_issue)
+
             # ──── 5. SL/TP 콜백 등록 확인 ────
             cb_fixes = self._check_callbacks()
             for item in cb_fixes:
@@ -4017,6 +4063,168 @@ class AutoTrader:
         except Exception as e:
             logger.debug(f"[진단] 일일 DD 체크 실패: {e}")
 
+        return None
+
+    def _check_schema_health(self, sample: bool = True) -> list[str]:
+        """[Patch D, 2026-04-26] 스키마 정합성 검증 — silent breakage 재발 방지.
+
+        2026-04-21 사고 재현 방지:
+        - external_manager가 DB에 ext_llm_confidence/_ev/_max_severity 로 insert
+        - 학습 코드는 ext_llm_conviction/_expected_value/_max_risk_severity 로 SELECT
+        - 5시간 동안 1,594건 silent log 만 누적, 거래 0건
+
+        검사 항목:
+        (1) llm_signal_snapshots 테이블의 컬럼 ⊇ external_manager 가 사용하는 컬럼
+        (2) XGBoost 모델의 feature_columns ⊆ FeatureEngineer가 생성하는 컬럼 (drift 검출)
+        (3) 모델이 학습된 컬럼이 inference 시점 DataFrame에 모두 존재하는지
+
+        Returns: 발견된 문제점 list (빈 리스트면 정상)
+        """
+        issues = []
+        try:
+            # === (1) llm_signal_snapshots 스키마 ↔ external_manager 사용 컬럼 ===
+            try:
+                cur = self.storage.conn.execute(
+                    "SELECT name FROM pragma_table_info('llm_signal_snapshots')"
+                )
+                db_cols = {r[0] for r in cur.fetchall()}
+                if db_cols:
+                    expected_llm = {
+                        "ext_llm_score", "ext_llm_conviction", "ext_llm_expected_value",
+                        "ext_llm_max_risk_severity", "ext_llm_is_bullish", "ext_llm_is_bearish",
+                    }
+                    missing = expected_llm - db_cols
+                    if missing:
+                        issues.append(
+                            f"[Schema] llm_signal_snapshots 컬럼 누락: {sorted(missing)} "
+                            f"(external_manager.py 와 DB 스키마 불일치 가능성)"
+                        )
+            except Exception as e:
+                logger.debug(f"[Schema] llm_signal_snapshots 점검 실패: {e}")
+
+            # === (2/3) XGBoost feature_columns vs FeatureEngineer 출력 ===
+            xgb = getattr(self.ensemble, "xgb", None)
+            if xgb is not None and getattr(xgb, "model", None) is not None:
+                model_feats = list(getattr(xgb, "feature_columns", []) or [])
+                if model_feats and sample:
+                    try:
+                        # 샘플 DF 생성으로 FeatureEngineer가 만들어낼 컬럼 셋 검사
+                        import numpy as _np
+                        import pandas as _pd
+                        idx = _pd.date_range("2025-01-01", periods=300, freq="5min", tz="UTC")
+                        sdf = _pd.DataFrame({
+                            "open": _np.random.rand(300) * 100 + 50,
+                            "high": _np.random.rand(300) * 100 + 55,
+                            "low": _np.random.rand(300) * 100 + 45,
+                            "close": _np.random.rand(300) * 100 + 50,
+                            "volume": _np.random.rand(300) * 1000,
+                        }, index=idx)
+                        gen = self.feature_engineer.generate(sdf)
+                        cur_feats = set(self.feature_engineer.get_feature_columns(gen))
+                        missing = [c for c in model_feats if c not in cur_feats]
+                        if missing:
+                            issues.append(
+                                f"[Schema] 모델학습 컬럼 {len(missing)}개가 현재 FeatureEngineer "
+                                f"출력에 없음 (예시: {missing[:5]}) — 재학습 필요"
+                            )
+                    except Exception as e:
+                        logger.debug(f"[Schema] FeatureEngineer 샘플 점검 실패: {e}")
+
+            if not issues:
+                logger.debug("[Schema] ✅ 검증 통과 — 모델/DB/피처 스키마 정합")
+            else:
+                for it in issues:
+                    logger.warning(it)
+        except Exception as e:
+            logger.debug(f"[Schema] 검증 실행 실패: {e}")
+        return issues
+
+    def _check_live_ev_monitor(self) -> str | None:
+        """[Patch C, 2026-04-26] LIVE EV 자동 정지 감시.
+
+        무인 운영 핵심 안전장치:
+        - 최근 N LIVE 트레이드(HIPPO 제외)의 expected value (mean PnL/trade) 계산.
+        - EV ≤ threshold(기본 -$0.5/trade) 면 LIVE 만 정지 (PAPER 무관).
+        - 재개 조건: EV가 threshold 초과로 회복 (시간 기반 재개 없음).
+                     → 모델 재학습 후 새 신호로 EV 회복 시에만 자연스럽게 해제.
+
+        분리 이유:
+        - _check_consecutive_losses 는 5건 전패라는 단기 노이즈 정지.
+        - _check_live_ev_monitor 는 50건 표본 기반 통계적 엣지 정지.
+          (WR 60% 라도 RR<<1 이면 EV<0 → 의미없는 거래로 자본 잠식.)
+
+        반환: 정지 메시지 (issues 리포트용) 또는 None.
+        """
+        try:
+            cur = self.storage.conn.execute(
+                """
+                SELECT pnl FROM trades
+                WHERE mode='LIVE' AND symbol != 'HIPPO/USDT:USDT'
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (int(self._live_ev_lookback),),
+            )
+            pnls = [float(r[0]) for r in cur.fetchall() if r and r[0] is not None]
+            n = len(pnls)
+            if n < self._live_ev_min_samples:
+                # 표본 부족 — 판단 보류 (정지/재개 모두 안 함)
+                return None
+
+            ev = sum(pnls) / n
+            wins = sum(1 for p in pnls if p > 0)
+            wr = wins / n
+
+            # === 신규 정지 ===
+            if not self._live_ev_paused and ev <= self._live_ev_threshold:
+                self._live_ev_paused = True
+                self._live_ev_pause_time = datetime.utcnow()
+                self._live_ev_pause_reason = (
+                    f"최근 {n}건 LIVE EV={ev:+.2f}$/trade ≤ {self._live_ev_threshold:+.2f}$ "
+                    f"(WR {wr:.0%})"
+                )
+                logger.warning(f"[EV모니터] 🛑 LIVE 자동 정지: {self._live_ev_pause_reason}")
+                try:
+                    tg_notify(
+                        f"🛑 <b>LIVE EV 자동 정지 (Patch C)</b>\n"
+                        f"━━━━━━━━━━━━━\n"
+                        f"최근 {n}건 평균 PnL: ${ev:+.2f}/거래\n"
+                        f"승률: {wr:.0%} ({wins}/{n})\n"
+                        f"한계: ${self._live_ev_threshold:+.2f}/거래\n"
+                        f"━━━━━━━━━━━━━\n"
+                        f"📝 PAPER 학습 계속 진행\n"
+                        f"📝 모델 재학습 후 EV 회복 시 자동 재개\n"
+                        f"⚠️ 시간 기반 강제 재개 없음 — 엣지 회복까지 정지"
+                    )
+                except Exception:
+                    pass
+                return f"LIVE EV 정지: {self._live_ev_pause_reason}"
+
+            # === 재개 (EV 회복) ===
+            if self._live_ev_paused and ev > self._live_ev_threshold:
+                pause_dur = datetime.utcnow() - (self._live_ev_pause_time or datetime.utcnow())
+                self._live_ev_paused = False
+                logger.info(
+                    f"[EV모니터] ✅ LIVE 재개 — EV={ev:+.2f}$/trade > {self._live_ev_threshold:+.2f}$ "
+                    f"(정지 기간 {pause_dur})"
+                )
+                try:
+                    tg_notify(
+                        f"✅ <b>LIVE EV 자동 재개</b>\n"
+                        f"━━━━━━━━━━━━━\n"
+                        f"최근 {n}건 평균 PnL: ${ev:+.2f}/거래\n"
+                        f"승률: {wr:.0%}\n"
+                        f"정지 기간: {pause_dur}"
+                    )
+                except Exception:
+                    pass
+                return None
+
+            # === 정지 유지 메시지 ===
+            if self._live_ev_paused:
+                return f"LIVE EV 정지 유지 (현 {n}건 EV={ev:+.2f}$)"
+
+        except Exception as e:
+            logger.debug(f"[EV모니터] 체크 실패: {e}")
         return None
 
     def _compute_live_kelly(self, lookback: int = 50, fraction: float = 0.25) -> float:

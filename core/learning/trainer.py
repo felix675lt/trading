@@ -312,13 +312,13 @@ class SelfLearningTrainer:
             use_purged_kfold=use_purged,
         )
 
-        # === Meta-Labeler 학습 (tier=large+) ===
-        if self.meta_labeler is not None and self.tier_manager is not None:
+        # === Meta-Labeler 학습 (Patch G, 2026-04-26: 티어 무관 강제 활성) ===
+        # 기존: tier=large+에서만 — 자본 적은 시점엔 메타라벨 학습 자체가 안 돼
+        # 누적 시그널이 부족했음. 이제 meta_labeler 객체가 존재하면 무조건 학습.
+        # (precision/recall 가드는 inference 시점에 self.meta_labeler.precision으로 자동 처리)
+        if self.meta_labeler is not None:
             try:
-                meta_on = (
-                    self.tier_manager.feature_enabled("meta_labeling", mode="paper")
-                    or self.tier_manager.feature_enabled("meta_labeling", mode="live")
-                )
+                meta_on = True  # 강제 ON
                 if meta_on and "tb_label" in df.columns:
                     # 1차 시그널 주입: XGB 예측값을 DF에 컬럼으로 추가
                     df_meta = df.copy()

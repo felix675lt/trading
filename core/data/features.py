@@ -55,6 +55,12 @@ class FeatureEngineer:
 
         result = self._add_price_features(result)
 
+        # ⏰ 시간 사이클 피처 (Patch A, 2026-04-26) — 7년치 백테스트 패턴 학습용
+        # 14h UTC: WR 14% ($-38), 03h UTC: WR 100% 등 시간대별 분명한 편향이 데이터에 존재.
+        # hour_sin/cos, dow_sin/cos, month_sin/cos, halving_cycle_pos 추가.
+        # cyclical encoding으로 23h↔00h 거리=1, 일~월 등 무한 반복 토폴로지 보존.
+        result = self._add_time_features(result)
+
         # 강화 피처 5종 — Manus v3 후보 (KAMA/Hurst/Amihud/GK/Parkinson)
         # 학술 정통 지표지만 Manus 제시 IC는 in-sample이라 신뢰 불가.
         # → 후보로만 추가 → LightGBM auto feature selection이 importance로 자동 pruning.
@@ -261,6 +267,73 @@ class FeatureEngineer:
             slope, _ = np.polyfit(log_chunks[valid], log_rs, 1)
             out[i] = float(np.clip(slope, 0.0, 1.0))
         return pd.Series(out, index=series.index)
+
+    def _add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """⏰ 시간 사이클 피처 (Patch A, 2026-04-26)
+
+        7년치 BTC/ETH/SOL/DOGE 데이터에 시간대별 편향이 분명히 존재:
+          - 14h UTC: 평균 WR 14% / 평균 PnL $-38
+          - 03h UTC: 단기 WR 100% (관측 표본 적지만 유의)
+          - 09-11h UTC (Asia close → London open): 변동성 ↑ + 휩쏘
+          - 23h UTC (Asia 새벽): 유동성 ↓ → SL 자주 터짐
+
+        cyclical encoding (sin/cos)을 사용 → 23h↔00h, 토↔일이 같은 거리.
+        모델이 시간 모듈러 토폴로지를 자연스럽게 학습.
+
+        추가 피처:
+          - hour_sin / hour_cos:   24h 사이클
+          - dow_sin / dow_cos:     7일(요일) 사이클
+          - month_sin / month_cos: 12개월(계절) 사이클
+          - halving_cycle_pos:     반감기 사이클 위치 [0,1] — BTC 4년 사이클
+                                   2024-04-19 halving 기준, 1460일=4년 주기 정규화
+
+        시간 인덱스가 datetime이 아닌 경우(테스트 등)는 NOOP — 안전 폴백.
+        """
+        try:
+            idx = df.index
+            # DatetimeIndex가 아니면 to_datetime 시도
+            if not isinstance(idx, pd.DatetimeIndex):
+                try:
+                    idx = pd.to_datetime(idx, utc=True, errors="coerce")
+                except Exception:
+                    return df  # NOOP
+                if idx.isna().all():
+                    return df  # 변환 실패 → NOOP
+
+            # tz-aware → UTC로 정규화 (사이클 일관성)
+            if idx.tz is not None:
+                idx_utc = idx.tz_convert("UTC")
+            else:
+                idx_utc = idx.tz_localize("UTC", ambiguous="NaT", nonexistent="NaT")
+
+            hour = idx_utc.hour.astype(float)
+            dow = idx_utc.dayofweek.astype(float)
+            month = idx_utc.month.astype(float)
+
+            two_pi = 2.0 * np.pi
+            df["hour_sin"] = np.sin(two_pi * hour / 24.0)
+            df["hour_cos"] = np.cos(two_pi * hour / 24.0)
+            df["dow_sin"] = np.sin(two_pi * dow / 7.0)
+            df["dow_cos"] = np.cos(two_pi * dow / 7.0)
+            df["month_sin"] = np.sin(two_pi * (month - 1.0) / 12.0)
+            df["month_cos"] = np.cos(two_pi * (month - 1.0) / 12.0)
+
+            # BTC 반감기 사이클 위치 (4년=1460일)
+            # 최근 halving: 2024-04-19 (Bitcoin 4th halving)
+            halving_ref = pd.Timestamp("2024-04-19", tz="UTC")
+            try:
+                days_since = (idx_utc - halving_ref).days.astype(float)
+            except Exception:
+                # idx_utc가 timezone-naive면 비교 실패 → tz_localize 후 재시도
+                days_since = ((pd.to_datetime(idx_utc) - halving_ref.tz_convert(None)).days).astype(float)
+            cycle_len = 1460.0
+            df["halving_cycle_pos"] = (days_since % cycle_len) / cycle_len  # [0,1)
+            df["halving_cycle_sin"] = np.sin(two_pi * df["halving_cycle_pos"])
+            df["halving_cycle_cos"] = np.cos(two_pi * df["halving_cycle_pos"])
+        except Exception:
+            # 피처 생성 실패해도 학습 파이프라인은 계속 — silent NOOP
+            pass
+        return df
 
     def _add_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df["returns_1"] = df["close"].pct_change(1)

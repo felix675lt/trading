@@ -112,6 +112,25 @@ class StrategyManager:
         self.live_long_conf_boost = config.get("live_long_conf_boost", 1.0)
         self.live_disable_macro_block = config.get("live_disable_macro_block", False)
 
+        # === ⏰ Time Blacklist (Patch B+F, 2026-04-26) — LIVE 전용 ===
+        # 7년치 백테스트(BTC/ETH/SOL/DOGE 5m, 2019-09 ~ 2026-04, ~2.5M 캔들)에서
+        # pooled forward 1h EV < 0 인 시간대를 데이터 기반으로 자동 추출.
+        # → 추천 차단 시간 (UTC): [1, 2, 8, 13, 16]
+        #   - 13h UTC: ETH/SOL/DOGE 모두 최악 (변동성 hangover, NY pre-market 휩쏘)
+        #   - 01-02h UTC: BTC/ETH 모두 음수 (Asia 야간 유동성 함정)
+        #   - 08h UTC: London open 직전 휩쏘 (DOGE 최악)
+        #   - 16h UTC: NY 점심 휩쏘 (SOL 음수)
+        # PAPER는 차단 없음 (학습 데이터 수집 우선 — 손실도 정보).
+        # config.live_blacklist_hours_utc 로 오버라이드 가능 (list[int]).
+        self.live_blacklist_hours_utc = set(
+            config.get("live_blacklist_hours_utc", [1, 2, 8, 13, 16]) or []
+        )
+        if self.live_blacklist_hours_utc:
+            logger.info(
+                f"[Strategy] LIVE Time Blacklist 활성 — "
+                f"UTC {sorted(self.live_blacklist_hours_utc)}h 진입 차단 (PAPER는 무관)"
+            )
+
         if self.long_only:
             logger.warning("[Strategy] LONG_ONLY (global) 모드 활성화 — 전 모드 숏 진입 차단")
         elif self.live_long_only:
@@ -119,7 +138,7 @@ class StrategyManager:
         if self.smart_short_blocked_regimes:
             logger.warning(
                 f"[Strategy] SMART_SHORT_FILTER 활성 — {sorted(self.smart_short_blocked_regimes)} "
-                f"레짐에서는 PAPER/LIVE 모두 숏 차단 (실측 WR < 30%)"
+                f"레짐에서 LIVE 숏 차단 (실측 WR < 30%) — PAPER는 학습 위해 양방향 허용"
             )
         if self.live_aggressive_long:
             logger.warning(
@@ -662,15 +681,18 @@ class StrategyManager:
             confidence = 0.0
             self._record_hold("long_only_block")
         # (2) 스마트 레짐-조건부 숏필터 — 특정 레짐에서만 숏 거부 (2026-04-24)
-        elif (final_action == "short"
+        # [Patch B+, 2026-04-26] PAPER 학습 데이터 수집 우선 → LIVE에서만 차단.
+        # PAPER에서는 이런 "통계상 나쁜 레짐"의 SHORT도 학습해야 향후 모델이 회피 가능.
+        elif (mode == "live"
+              and final_action == "short"
               and self.smart_short_blocked_regimes
               and market_regime in self.smart_short_blocked_regimes):
             logger.warning(
-                f"[SMART_SHORT] 레짐={market_regime} 숏 자동차단 (실측 WR<30% 통계 거부) "
+                f"[SMART_SHORT] LIVE 레짐={market_regime} 숏 자동차단 (실측 WR<30% 통계 거부) "
                 f"→ hold (원 사유: {reason})"
             )
             final_action = "hold"
-            reason = f"SMART_SHORT 차단: {market_regime} 레짐 숏 금지 (원신호: {reason})"
+            reason = f"SMART_SHORT 차단: {market_regime} 레짐 숏 금지 LIVE (원신호: {reason})"
             confidence = 0.0
             self._record_hold("smart_short_block")
 
@@ -686,6 +708,27 @@ class StrategyManager:
                 reason = f"블랙리스트 차단: {combo_key} (반복 실패 패턴)"
                 confidence = 0.0
                 self._record_hold("blacklist_block")
+
+        # 2.93. ⏰ Time Blacklist — LIVE 전용 (Patch B, 2026-04-26)
+        # 7년치 통계상 EV 음수 시간대 차단. PAPER는 학습 위해 통과.
+        if (
+            mode == "live"
+            and final_action in ("long", "short")
+            and self.live_blacklist_hours_utc
+        ):
+            try:
+                cur_hour = datetime.utcnow().hour
+                if cur_hour in self.live_blacklist_hours_utc:
+                    logger.warning(
+                        f"[TimeBlacklist] LIVE 차단: UTC {cur_hour}h 는 통계상 EV<0 시간대 "
+                        f"→ {final_action} 차단 (원 사유: {reason})"
+                    )
+                    final_action = "hold"
+                    reason = f"TimeBlacklist 차단: UTC {cur_hour}h (LIVE only)"
+                    confidence = 0.0
+                    self._record_hold("time_blacklist_block")
+            except Exception as e:
+                logger.debug(f"[TimeBlacklist] 시간 체크 실패: {e}")
 
         # 2.95. BOCPD 변환점 차단 (stage-1 final gate, 2026-04-25)
         # 레짐 전환점 직후에는 long/short 모두 차단 — 잘못된 방향 진입 방지.
