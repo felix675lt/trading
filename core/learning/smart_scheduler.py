@@ -227,7 +227,34 @@ class SmartTrainingScheduler:
             logger.debug(f"[SmartSched] 상태 저장 실패: {e}")
 
     def _load_state(self):
+        # [Patch J+, 2026-04-28] state 파일 부재 시 모델 파일 mtime으로 fallback —
+        # 첫 부팅 catch-22(파일 만들려면 학습 끝나야 함, 학습 12h 걸림) 해결.
         if not self._state_path.exists():
+            try:
+                import os
+                from pathlib import Path as _P
+                model_dir = _P("models_saved")
+                if model_dir.exists():
+                    candidates = ["xgboost.pkl", "lstm.pt", "lightgbm.pkl", "ppo_trader.zip"]
+                    mtimes = []
+                    for c in candidates:
+                        p = model_dir / c
+                        if p.exists():
+                            mtimes.append(datetime.utcfromtimestamp(os.path.getmtime(p)))
+                    if mtimes:
+                        latest = max(mtimes)  # 가장 최근 학습 산출물의 mtime
+                        for sch in self.schedules.values():
+                            sch.last_train_time = latest
+                        age_h = (datetime.utcnow() - latest).total_seconds() / 3600
+                        logger.info(
+                            f"[SmartSched] state 파일 없음 → 모델 mtime fallback "
+                            f"({age_h:.1f}h ago) — 12시간 강제 재학습 차단"
+                        )
+                        # 즉시 디스크 저장 → 다음 부팅부터 정상 경로
+                        self._save_state()
+                        return
+            except Exception as e:
+                logger.debug(f"[SmartSched] mtime fallback 실패: {e}")
             return
         try:
             data = json.loads(self._state_path.read_text())
