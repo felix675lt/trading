@@ -84,7 +84,14 @@ class AutoTrader:
         log_cfg = self.config.get("logging", {})
         log_file = log_cfg.get("file", "logs/autotrader.log")
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        logger.add(log_file, rotation="10 MB", level=log_cfg.get("level", "INFO"))
+        # [Patch K+, 2026-04-28] retention/compression 추가 — 1개월 무인 운영 시 디스크 보호
+        logger.add(
+            log_file,
+            rotation="10 MB",
+            retention="14 days",   # 14일 이상 옛 로그 자동 삭제
+            compression="gz",      # 회전된 로그 gz 압축 (10MB → ~1MB)
+            level=log_cfg.get("level", "INFO"),
+        )
 
         # 컴포넌트 초기화 (한 번만)
         self.storage = Storage()
