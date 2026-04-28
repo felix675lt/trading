@@ -1,6 +1,7 @@
 """자기학습 트레이너 - 주기적 재학습 및 모델 관리"""
 
 import asyncio
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -277,34 +278,55 @@ class SelfLearningTrainer:
         prev_xgb_acc = self.ensemble.xgb.accuracy
         prev_lstm_acc = self.ensemble.lstm.accuracy
 
-        # 2. ML 앙상블 학습 (기존 모델 이어서 / 외부 피처 포함)
-        #    티어 기반 Walk-Forward CV: small+ 에서 활성화 (PAPER 가상 시드 포함)
-        use_walk_forward = False
-        if self.tier_manager is not None:
-            try:
-                use_walk_forward = (
-                    self.tier_manager.feature_enabled("walk_forward_cv", mode="paper")
-                    or self.tier_manager.feature_enabled("walk_forward_cv", mode="live")
-                )
-            except Exception as e:
-                logger.debug(f"[WalkForward] 티어 조회 실패: {e}")
+        # === [Patch L, 2026-04-28] 진정한 심화학습 (Continual Learning) ===
+        # 사용자 직관 적용: "재학습 아니라 심화학습. 데이터를 계속 쌓아가면서"
+        #
+        # 변경 전: tier=large+ 면 walk_forward=True → 매 사이클 from-scratch 5-fold
+        #   → 691k 캔들을 매번 처음부터 학습 → 시간 지나도 누적 효과 0
+        # 변경 후: 매 7번째 사이클만 walk_forward CV (평가 목적), 나머지 6번은 incremental
+        #   → fine-tune (XGB 트리 +100 / LSTM epochs 추가 / LGB init_model)
+        #   → 시간 갈수록 모델이 더 똑똑해짐 (진정한 누적 학습)
+        #
+        # 효과:
+        #   - 학습 시간 12h → ~2h (incremental fast-path) → 더 자주 학습 가능
+        #   - 시장 변화 적응 빨라짐
+        #   - Walk-Forward OOS acc 평가는 매 7번째 사이클에 보존 (모델 품질 보장)
+        cycle_state_path = Path("data/learning_cycle_state.json")
+        cycle_count = 0
+        try:
+            if cycle_state_path.exists():
+                cycle_count = int(json.loads(cycle_state_path.read_text()).get("cycle", 0))
+        except Exception:
+            cycle_count = 0
 
-        if use_walk_forward:
+        # 매 7번째만 평가 (eval cycle)
+        is_eval_cycle = (cycle_count > 0 and cycle_count % 7 == 0)
+        use_walk_forward = is_eval_cycle  # 평가 사이클만 from-scratch CV
+        use_purged = is_eval_cycle
+
+        if is_eval_cycle:
             logger.info(
-                f"[WalkForward] 활성화 — tier(paper={self.tier_manager.get_tier('paper').name}"
-                f", live={self.tier_manager.get_tier('live').name})"
+                f"[Patch L] 사이클 #{cycle_count} = 평가 사이클 (매 7회 1번) → "
+                f"Walk-Forward CV from-scratch (모델 품질 OOS 검증)"
+            )
+        else:
+            logger.info(
+                f"[Patch L] 사이클 #{cycle_count} = 심화학습 사이클 → "
+                f"incremental fine-tune (XGB 트리+100 / LSTM 추가 epochs / LGB init_model)"
             )
 
-        # tier=large+ 에서 PurgedKFold + Embargo (Lopez de Prado) 활성화 — meta_labeling 플래그와 동일 gating
-        use_purged = False
-        if self.tier_manager is not None:
-            try:
-                use_purged = (
-                    self.tier_manager.feature_enabled("meta_labeling", mode="paper")
-                    or self.tier_manager.feature_enabled("meta_labeling", mode="live")
-                )
-            except Exception:
-                pass
+        # 사이클 카운터 갱신 + 디스크 persist
+        try:
+            cycle_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cycle_state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "cycle": cycle_count + 1,
+                "last_mode": "eval" if is_eval_cycle else "incremental",
+                "updated_at": datetime.utcnow().isoformat(),
+            }, indent=2))
+            tmp.rename(cycle_state_path)
+        except Exception as e:
+            logger.debug(f"[Patch L] cycle state 저장 실패: {e}")
 
         self.ensemble.train_all(
             df, all_feature_cols,
