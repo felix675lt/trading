@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -96,6 +97,11 @@ class AutoTrader:
         # 컴포넌트 초기화 (한 번만)
         self.storage = Storage()
         self.feature_engineer = FeatureEngineer(self.config.get("ml", {}).get("features"))
+        # [Patch M, 2026-04-28] Pattern Memory Bank — Retrieval-Augmented Trading (Phase 1)
+        # 사용자 통찰: 데이터를 백업해서 보존했으니, ML 모델로 압축 외울 필요 없이
+        # 필요할 때 직접 retrieve. ML 모델은 보조 역할로 작게 유지.
+        # Phase 1: shadow mode (로그만 출력, 결정에 영향 없음 — 신호 품질 검증 후 Phase 2에서 통합)
+        self.pattern_banks: dict = {}  # symbol → PatternMemoryBank
         self.ensemble = EnsembleSignalGenerator()
         self.rl_agent = RLAgent(self.config.get("rl", {}))
         self.risk_manager = RiskManager(self.config["risk"])
@@ -712,6 +718,32 @@ class AutoTrader:
                         f"SL: ${pos.stop_loss:.4f}\n"
                         f"TP: ${pos.take_profit:.4f}"
                     )
+
+        # [Patch M, 2026-04-28] Pattern Memory Bank 디스크 로드 (있으면)
+        try:
+            from core.patterns.memory_bank import PatternMemoryBank
+            bank_dir = Path("data/pattern_bank")
+            if bank_dir.exists():
+                loaded = 0
+                for npz_file in sorted(bank_dir.glob("*.npz")):
+                    try:
+                        bank = PatternMemoryBank.load(npz_file)
+                        # 파일명에서 symbol 복원 (BTC_USDT_USDT_5m.npz → BTC/USDT:USDT)
+                        sym_part = npz_file.stem.rsplit("_", 1)[0]
+                        # _USDT_USDT → /USDT:USDT 패턴
+                        sym = sym_part.replace("_USDT_USDT", "/USDT:USDT")
+                        self.pattern_banks[sym] = bank
+                        loaded += 1
+                    except Exception as e:
+                        logger.debug(f"[PatternBank] {npz_file.name} 로드 실패: {e}")
+                if loaded > 0:
+                    total_patterns = sum(len(b.embeddings) for b in self.pattern_banks.values())
+                    logger.info(
+                        f"[PatternBank] {loaded}개 심볼 인덱스 로드 — 총 {total_patterns:,}개 패턴 "
+                        f"(retrieval-augmented Phase 1 shadow mode 활성)"
+                    )
+        except Exception as e:
+            logger.debug(f"[PatternBank] 초기화 실패 (무시): {e}")
 
         logger.info("AutoTrader 초기화 완료")
 
@@ -2149,6 +2181,35 @@ class AutoTrader:
 
             # 레짐 기반 시그널 가중치 (ensemble.REGIME_SIGNAL_WEIGHT 참고)
             ml_signal = self.ensemble.predict(df, regime=adaptive_params.get("regime"))
+
+            # [Patch M, 2026-04-28] Pattern Memory Bank — Retrieval-Augmented (Phase 1: shadow mode)
+            # 현재 캔들과 유사한 과거 패턴 100개의 forward return 통계.
+            # ML signal과 비교하여 일치/불일치 검증 → Phase 2에서 결정 통합.
+            pattern_signal = None
+            try:
+                bank = self.pattern_banks.get(symbol)
+                if bank is not None:
+                    pstats = bank.predict(df.iloc[[-1]])
+                    if pstats is not None:
+                        pattern_signal = pstats.to_signal()
+                        ml_dir = ml_signal.get("direction", "neutral")
+                        agree = pattern_signal["direction"] == ml_dir
+                        agree_emoji = "🟢" if agree else "🔴"
+                        if not getattr(self, '_pattern_log_throttle', None):
+                            self._pattern_log_throttle = {}
+                        # 심볼당 5분에 1번만 로그 (소음 방지)
+                        last_ts = self._pattern_log_throttle.get(symbol, 0)
+                        now_ts = time.time()
+                        if now_ts - last_ts > 300:
+                            logger.info(
+                                f"[PatternBank] {symbol} {agree_emoji} ML={ml_dir}/{ml_signal.get('signal',0):+.3f} "
+                                f"vs Pattern={pattern_signal['direction']}/{pattern_signal['signal']:+.3f} "
+                                f"| n={pattern_signal['n_neighbors']} WR_1h={pattern_signal['winrate_1h']*100:.0f}% "
+                                f"EV_1h={pattern_signal['ev_1h_pct']:+.3f}% sim={pattern_signal['similarity']:.3f}"
+                            )
+                            self._pattern_log_throttle[symbol] = now_ts
+            except Exception as pat_e:
+                logger.debug(f"[PatternBank] {symbol} 추론 실패 (shadow mode 무시): {pat_e}")
 
             base_feature_cols = self.feature_engineer.get_base_feature_columns(df)
             rl_obs_data = df[base_feature_cols].values[-1].astype(np.float32)

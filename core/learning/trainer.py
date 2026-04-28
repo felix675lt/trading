@@ -462,6 +462,19 @@ class SelfLearningTrainer:
             except Exception as e:
                 logger.debug(f"[SmartSched] 완료 기록 실패: {e}")
 
+        # === [Patch M, 2026-04-28] Pattern Memory Bank 인덱스 갱신 ===
+        # 학습 사이클이 fetch한 모든 데이터를 그대로 retrieval 인덱스로 빌드.
+        # raw 데이터 직접 활용 — ML 모델 압축 손실 우회 (사용자 통찰 적용).
+        try:
+            from core.patterns.memory_bank import PatternMemoryBank
+            bank = PatternMemoryBank()
+            bank.build_from_dataframe(df, symbol=symbol)
+            sym_safe = symbol.replace("/", "_").replace(":", "_")
+            bank_path = Path(f"data/pattern_bank/{sym_safe}_{timeframe}.npz")
+            bank.save(bank_path)
+        except Exception as e:
+            logger.warning(f"[PatternBank] {symbol} 인덱스 빌드 실패 (학습은 정상): {e}")
+
         logger.info(f"=== 자기학습 사이클 완료 ===")
 
     async def run_continuous(self, exchange_name: str, symbols: list[str], timeframe: str = "1h"):

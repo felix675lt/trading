@@ -13,3 +13,10 @@ models_saved/
 venv/
 trading/
 .DS_Store
+
+# [Patch M, 2026-04-28] Pattern Memory Bank — runtime indices (auto-rebuildable)
+data/pattern_bank/
+data/paper_positions_*.json
+data/learning_cycle_state.json
+reports/monthly_review_*.json
+reports/backtest_*.json
