@@ -1768,7 +1768,8 @@ class AutoTrader:
                         "notional": round(notional, 2),
                         "reason": decision.reason,
                     })
-                    tg_notify(format_trade_open("PAPER", symbol, decision.action, price, notional, dynamic_lev, decision.reason), silent=True)
+                    # [Patch K] PAPER 진입은 알림 ON (silent=False) — 사용자가 무인 운영 중 진입 인지 가능
+                    tg_notify(format_trade_open("PAPER", symbol, decision.action, price, notional, dynamic_lev, decision.reason), silent=False)
 
             # === LIVE 실행 (live / dual 모드) ===
             # [LIVE_LONG_ONLY] LIVE만 숏 차단 — PAPER는 위에서 이미 실행됐으므로 학습 데이터 수집 계속
@@ -2533,7 +2534,8 @@ class AutoTrader:
                     "notional": round(c["notional"], 2),
                     "reason": c["reason"],
                 })
-                tg_notify(format_trade_open("PAPER", symbol, c["action"], c["price"], c["notional"], c["dynamic_lev"], c["reason"]), silent=True)
+                # [Patch K] PAPER 진입은 알림 ON (사용자 무인 운영 인지)
+                tg_notify(format_trade_open("PAPER", symbol, c["action"], c["price"], c["notional"], c["dynamic_lev"], c["reason"]), silent=False)
         elif c["action"] == "close" and symbol in self.paper_trader.positions:
             result = self.paper_trader.close_position(symbol, c["price"], c["reason"])
             if result:

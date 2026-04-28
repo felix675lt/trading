@@ -47,7 +47,7 @@ def send_message(text: str, parse_mode: str = "HTML", silent: bool = False):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        resp = urllib.request.urlopen(req, timeout=10)
+        resp = urllib.request.urlopen(req, timeout=30)  # [Patch K] 30s — 시스템 부하 시 10s 자주 초과
         result = json.loads(resp.read())
         if not result.get("ok"):
             print(f"[Telegram] API error: {result.get('description', '')}")

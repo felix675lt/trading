@@ -11,9 +11,11 @@
 모든 수치는 LIVE 실측 데이터를 기반으로 재보정 가능.
 """
 
+import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
+from pathlib import Path
 
 from loguru import logger
 
@@ -86,6 +88,13 @@ class PaperTrader:
         # 자동 청산 콜백 (SL/TP/트레일링으로 청산 시 호출)
         self._on_auto_close_callback = None
 
+        # [Patch K, 2026-04-28] 활성 포지션 디스크 persist —
+        # launchd 재기동 시 in-memory 포지션 손실 방지 (SL/TP 정보까지 보존).
+        # variant별 분리: PAPER / PAPER_MACRO_ON / PAPER_MACRO_OFF
+        safe_var = (variant or "PAPER").lower().replace("/", "_")
+        self._positions_path = Path(f"data/paper_positions_{safe_var}.json")
+        self._load_positions()
+
         # Limit-first routing (tier=small+ 활성화)
         self.limit_first_enabled = False
         # 지정가 체결률 통계 — maker fee 적용률 추적
@@ -129,6 +138,67 @@ class PaperTrader:
     def set_atr(self, symbol: str, atr_pct: float):
         """심볼별 ATR(%) 주입 — 슬리피지 동적 계산용"""
         self._atr_cache[symbol] = max(0.0, float(atr_pct))
+
+    # ------------------------------------------------------------------
+    # [Patch K, 2026-04-28] 활성 포지션 디스크 persist
+    # 목적: launchd 재기동 시 in-memory 포지션 손실 방지.
+    # 무인 1개월 운영 중 launchd 한 번이라도 재기동되면 SL/TP 정보 + 진입가
+    # 모두 사라져 청산 못 함 → 학습 데이터 손실 + 가상 자본 정확도 손상.
+    # 해결: open/close/SL-TP 자동청산 시점마다 atomic write.
+    # ------------------------------------------------------------------
+    def _save_positions(self):
+        try:
+            data = {
+                "saved_at": datetime.utcnow().isoformat(),
+                "variant": self.variant,
+                "equity": float(self.equity),
+                "positions": {},
+                "sl_cooldown": {
+                    s: t.isoformat() for s, t in self._sl_cooldown.items()
+                },
+            }
+            for sym, pos in self.positions.items():
+                d = asdict(pos)
+                # entry_time은 datetime → ISO 문자열로
+                if d.get("entry_time"):
+                    d["entry_time"] = d["entry_time"].isoformat() if hasattr(d["entry_time"], "isoformat") else str(d["entry_time"])
+                data["positions"][sym] = d
+            tmp = self._positions_path.with_suffix(".tmp")
+            self._positions_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(data, indent=2, default=str))
+            tmp.rename(self._positions_path)
+        except Exception as e:
+            logger.warning(f"[Paper-Persist] 포지션 저장 실패: {e}")
+
+    def _load_positions(self):
+        if not self._positions_path.exists():
+            return
+        try:
+            data = json.loads(self._positions_path.read_text())
+            saved_at = data.get("saved_at", "?")
+            self.equity = float(data.get("equity", self.equity))
+            for sym, d in (data.get("positions") or {}).items():
+                # entry_time 복원
+                et = d.get("entry_time")
+                if et and isinstance(et, str):
+                    try:
+                        d["entry_time"] = datetime.fromisoformat(et)
+                    except Exception:
+                        d["entry_time"] = datetime.utcnow()
+                self.positions[sym] = PaperPosition(**d)
+            for s, ts in (data.get("sl_cooldown") or {}).items():
+                try:
+                    self._sl_cooldown[s] = datetime.fromisoformat(ts)
+                except Exception:
+                    continue
+            n = len(self.positions)
+            if n > 0:
+                logger.warning(
+                    f"[Paper-Persist] 디스크 복원 완료 — {self.variant} {n}개 활성 포지션 "
+                    f"(저장 시각 {saved_at}) — SL/TP 정보 보존, 즉시 update_prices에서 자동 청산 평가"
+                )
+        except Exception as e:
+            logger.warning(f"[Paper-Persist] 포지션 복원 실패: {e}")
 
     def set_routing(self, limit_first: bool):
         """Capital Tier 기반 라우팅 설정"""
@@ -396,6 +466,7 @@ class PaperTrader:
             funding_rate=funding_rate,
         )
         self.positions[symbol] = pos
+        self._save_positions()  # [Patch K] 진입 즉시 디스크 동기화
         fill_tag = "MAKER" if is_maker else ("MKT-FALLBACK" if is_market_fallback else "MARKET")
         slip_pct = (fill_price - price) / price * 100 if side == "long" else (price - fill_price) / price * 100
         logger.info(
@@ -460,6 +531,7 @@ class PaperTrader:
         }
         self.trade_history.append(trade)
         del self.positions[symbol]
+        self._save_positions()  # [Patch K] 청산 즉시 디스크 동기화
 
         # SL 청산이면 쿨다운 등록
         if "SL" in reason.upper() or "sl" in reason:
