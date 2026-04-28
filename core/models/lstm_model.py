@@ -352,6 +352,18 @@ class LSTMPredictor:
         if self.model is None or self.mean is None:
             return {"signal": 0.0, "confidence": 0.0, "direction": "neutral"}
 
+        # [Patch I, 2026-04-28] 학습 시 추가된 ext_* 누락 컬럼 보정
+        missing = [c for c in self.feature_columns if c not in df.columns]
+        if missing:
+            if not getattr(self, "_missing_logged", False):
+                logger.warning(
+                    f"[LSTM] 누락 피처 {len(missing)}개를 0.0으로 보정 (예: {missing[:5]})"
+                )
+                self._missing_logged = True
+            df = df.copy()
+            for c in missing:
+                df[c] = 0.0
+
         X = df[self.feature_columns].values[-self.seq_length:].astype(np.float32)
         X = (X - self.mean) / self.std
         X_tensor = torch.FloatTensor(X).unsqueeze(0).to(self.device)

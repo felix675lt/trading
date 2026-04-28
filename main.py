@@ -4169,10 +4169,14 @@ class AutoTrader:
         반환: 정지 메시지 (issues 리포트용) 또는 None.
         """
         try:
+            # [Patch I, 2026-04-28] 시간 윈도우 필터 추가 — 7일 이상 묵은 트레이드는 EV 판단에서 제외.
+            # 기존: 최근 N건 (시간 무관) → 거래 정지 시 새 트레이드 0건이라 옛날 데이터로 영원히 정지 (catch-22).
+            # 변경: 최근 7일 내 LIVE 트레이드 중 최대 N건. 7일 이상 새 트레이드 없으면 표본 부족으로 자연 해제.
             cur = self.storage.conn.execute(
                 """
-                SELECT pnl FROM trades
+                SELECT pnl, timestamp FROM trades
                 WHERE mode='LIVE' AND symbol != 'HIPPO/USDT:USDT'
+                  AND timestamp > datetime('now', '-7 days')
                 ORDER BY timestamp DESC LIMIT ?
                 """,
                 (int(self._live_ev_lookback),),
@@ -4180,7 +4184,24 @@ class AutoTrader:
             pnls = [float(r[0]) for r in cur.fetchall() if r and r[0] is not None]
             n = len(pnls)
             if n < self._live_ev_min_samples:
-                # 표본 부족 — 판단 보류 (정지/재개 모두 안 함)
+                # 표본 부족 — 판단 보류. 단, 이미 정지된 상태로 표본이 부족해진 경우(데드락) 자동 해제.
+                if self._live_ev_paused:
+                    pause_dur = datetime.utcnow() - (self._live_ev_pause_time or datetime.utcnow())
+                    self._live_ev_paused = False
+                    logger.info(
+                        f"[EV모니터] ✅ LIVE 자동 해제 — 7일 윈도우 표본 부족({n}건<{self._live_ev_min_samples}건). "
+                        f"정지 기간 {pause_dur} → 신규 LIVE 트레이드로 EV 재평가 시작"
+                    )
+                    try:
+                        tg_notify(
+                            f"✅ <b>LIVE EV 정지 자동 해제</b>\n"
+                            f"━━━━━━━━━━━━━\n"
+                            f"7일 윈도우에 LIVE 트레이드 {n}건 (필요 {self._live_ev_min_samples}건)\n"
+                            f"옛날 표본 만료 → 새 트레이드로 EV 재평가 시작\n"
+                            f"정지 기간: {pause_dur}"
+                        )
+                    except Exception:
+                        pass
                 return None
 
             ev = sum(pnls) / n

@@ -243,6 +243,20 @@ class XGBoostPredictor:
         if self.model is None:
             return {"signal": 0.0, "confidence": 0.0, "direction": "neutral"}
 
+        # [Patch I, 2026-04-28] 학습 시 추가된 ext_llm_/ext_deriv_ 등이 inference df에 없을 수 있음.
+        # 누락 컬럼은 0.0 으로 채워 KeyError 방지 (live LLM/derivatives 누적 부족 시 자동 회복).
+        missing = [c for c in self.feature_columns if c not in df.columns]
+        if missing:
+            if not getattr(self, "_missing_logged", False):
+                logger.warning(
+                    f"[XGB] 누락 피처 {len(missing)}개를 0.0으로 보정 (예: {missing[:5]}) "
+                    f"— 학습 시 ext_* 컬럼이 추가됐으나 inference DF에 없음"
+                )
+                self._missing_logged = True
+            df = df.copy()
+            for c in missing:
+                df[c] = 0.0
+
         X = df[self.feature_columns].values[-1:]
         proba = self.model.predict_proba(X)[0]
         pred = int(self.model.predict(X)[0])

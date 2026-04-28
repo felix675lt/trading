@@ -152,10 +152,23 @@ class EnsembleSignalGenerator:
 
     def predict(self, df: pd.DataFrame, regime: str | None = None) -> dict:
         """앙상블 시그널 생성 (XGB + LSTM + 옵션 LGB + 옵션 CNN-Attn 가중합)"""
-        preds: dict[str, dict] = {
-            "xgboost": self.xgb.predict(df),
-            "lstm": self.lstm.predict(df),
-        }
+        # [Patch I, 2026-04-28] 모든 모델 predict를 try-except로 감싸 한 모델 실패 시
+        # 전체 분석이 죽는 것을 방지 (특히 ext_llm_* 누락 컬럼 KeyError 케이스).
+        preds: dict[str, dict] = {}
+        try:
+            preds["xgboost"] = self.xgb.predict(df)
+        except Exception as e:
+            logger.warning(f"[Ensemble] XGB predict 실패: {e} → 가중치 0으로 우회")
+        try:
+            preds["lstm"] = self.lstm.predict(df)
+        except Exception as e:
+            logger.warning(f"[Ensemble] LSTM predict 실패: {e} → 가중치 0으로 우회")
+        if not preds:
+            # 모든 핵심 모델 실패 시 neutral 신호 반환
+            return {
+                "signal": 0.0, "confidence": 0.0, "direction": "neutral",
+                "raw_signal": 0.0, "regime_multiplier": 1.0,
+            }
         if self.has_lgb and self.lgb is not None:
             try:
                 preds["lightgbm"] = self.lgb.predict(df)
