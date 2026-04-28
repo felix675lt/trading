@@ -180,6 +180,29 @@ class EnsembleSignalGenerator:
             except Exception as e:
                 logger.debug(f"[Ensemble] CNN predict 실패: {e}")
 
+        # [Patch I, 2026-04-28] NaN 출력 모델 자동 제외 — corrupt weights(LSTM 등)가
+        # 합산 시 전체 신호를 NaN으로 만드는 문제 차단.
+        import math
+        bad = []
+        for k, p in list(preds.items()):
+            sig = p.get("signal", 0.0)
+            conf = p.get("confidence", 0.0)
+            if (sig is None or math.isnan(float(sig)) or math.isinf(float(sig))
+                    or conf is None or math.isnan(float(conf))):
+                bad.append(k)
+                preds.pop(k)
+        if bad and not getattr(self, "_nan_model_warned", False):
+            logger.warning(
+                f"[Ensemble] NaN 신호 모델 자동 제외 — {bad}. 해당 모델 재학습 필요 "
+                f"(weights corrupt 가능성)."
+            )
+            self._nan_model_warned = True
+        if not preds:
+            return {
+                "signal": 0.0, "confidence": 0.0, "direction": "neutral",
+                "raw_signal": 0.0, "regime_multiplier": 1.0,
+            }
+
         # 활성 모델만 가중치 정규화
         w = {k: float(self.weights.get(k, 0.0)) for k in preds}
         s = sum(w.values())

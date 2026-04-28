@@ -258,6 +258,8 @@ class XGBoostPredictor:
                 df[c] = 0.0
 
         X = df[self.feature_columns].values[-1:]
+        # [Patch I, 2026-04-28] NaN/Inf 보정 — 부족한 캔들로 indicator NaN 발생 시 모델이 NaN 출력
+        X = np.nan_to_num(X.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
         proba = self.model.predict_proba(X)[0]
         pred = int(self.model.predict(X)[0])
 

@@ -13,8 +13,10 @@
 참고: 운영 시 단일 모델("ensemble") 스케줄로도 충분 — 모델별 분리는 향후 확장.
 """
 
+import json
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from loguru import logger
@@ -73,6 +75,10 @@ class SmartTrainingScheduler:
 
         self._last_train_end = datetime.utcnow() - timedelta(hours=1)
         self._training_history: list[dict] = []
+
+        # [Patch J, 2026-04-28] last_train_time 디스크 persist — 재기동마다 12시간 재학습 방지
+        self._state_path = Path("data/smart_scheduler_state.json")
+        self._load_state()
 
     # ------------------------------------------------------------------
     def should_retrain(
@@ -193,6 +199,61 @@ class SmartTrainingScheduler:
             "time": datetime.utcnow().isoformat(),
         })
         logger.info(f"[SmartSched] {model_name} 완료 — Acc {new_accuracy:.4f}")
+        # [Patch J] 학습 완료 시 상태 디스크 저장 (재기동 시 max_interval 재트리거 방지)
+        self._save_state()
+
+    # ------------------------------------------------------------------
+    # [Patch J, 2026-04-28] 디스크 persistence — 재기동 시 학습 시각 복원
+    # ------------------------------------------------------------------
+    def _save_state(self):
+        try:
+            data = {
+                "saved_at": datetime.utcnow().isoformat(),
+                "schedules": {
+                    name: {
+                        "last_train_time": sch.last_train_time.isoformat(),
+                        "last_accuracy": float(sch.last_accuracy),
+                        "current_accuracy": float(sch.current_accuracy),
+                        "consecutive_declines": int(sch.consecutive_declines),
+                    }
+                    for name, sch in self.schedules.items()
+                },
+            }
+            tmp = self._state_path.with_suffix(".tmp")
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.rename(self._state_path)
+        except Exception as e:
+            logger.debug(f"[SmartSched] 상태 저장 실패: {e}")
+
+    def _load_state(self):
+        if not self._state_path.exists():
+            return
+        try:
+            data = json.loads(self._state_path.read_text())
+            restored = 0
+            for name, sch in self.schedules.items():
+                meta = (data.get("schedules") or {}).get(name)
+                if not meta:
+                    continue
+                try:
+                    sch.last_train_time = datetime.fromisoformat(meta["last_train_time"])
+                    sch.last_accuracy = float(meta.get("last_accuracy", 0.0))
+                    sch.current_accuracy = float(meta.get("current_accuracy", 0.0))
+                    sch.consecutive_declines = int(meta.get("consecutive_declines", 0))
+                    restored += 1
+                except Exception:
+                    continue
+            if restored > 0:
+                ages = []
+                for name, sch in self.schedules.items():
+                    age_h = (datetime.utcnow() - sch.last_train_time).total_seconds() / 3600
+                    ages.append(f"{name}={age_h:.1f}h")
+                logger.info(
+                    f"[SmartSched] 디스크 상태 복원 완료 ({restored}개 모델) — last_train: {', '.join(ages)}"
+                )
+        except Exception as e:
+            logger.warning(f"[SmartSched] 상태 복원 실패: {e} — 초기값 사용")
 
     def estimate_total_train_minutes(self, queue: list) -> float:
         total = 0.0

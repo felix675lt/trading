@@ -365,7 +365,15 @@ class LSTMPredictor:
                 df[c] = 0.0
 
         X = df[self.feature_columns].values[-self.seq_length:].astype(np.float32)
-        X = (X - self.mean) / self.std
+        # [Patch I, 2026-04-28] NaN/Inf 보정 — 부족한 indicator로 NaN 출력 방지
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        # [Patch I] mean/std 가드 — 저장된 normalizer가 NaN/0 가질 수 있음
+        # (예: BTC reference 컬럼이 학습 일부 구간에서 NaN → np.mean 결과 NaN)
+        mean_safe = np.nan_to_num(self.mean, nan=0.0, posinf=0.0, neginf=0.0)
+        std_safe = np.nan_to_num(self.std, nan=1.0, posinf=1.0, neginf=1.0)
+        std_safe = np.where(std_safe == 0, 1.0, std_safe)
+        X = (X - mean_safe) / std_safe
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         X_tensor = torch.FloatTensor(X).unsqueeze(0).to(self.device)
 
         self.model.eval()

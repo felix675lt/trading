@@ -2147,7 +2147,17 @@ class AutoTrader:
             rl_obs_data = np.nan_to_num(rl_obs_data, nan=0.0)
             position_info = np.array([0.0, 0.0, self.equity / self.initial_capital, 0.0], dtype=np.float32)
             obs = np.concatenate([rl_obs_data, position_info])
-            rl_action, rl_confidence = self.rl_agent.predict(obs)
+            # [Patch I, 2026-04-28] RL observation shape 불일치 시 거래 분석 자체가 죽지 않도록 격리
+            try:
+                rl_action, rl_confidence = self.rl_agent.predict(obs)
+            except Exception as rl_e:
+                if not getattr(self, '_rl_shape_warned', False):
+                    logger.warning(
+                        f"[RL] obs shape 불일치 또는 예측 실패 → neutral fallback: {rl_e} "
+                        f"(다음 RL 재학습 시 자동 복구)"
+                    )
+                    self._rl_shape_warned = True
+                rl_action, rl_confidence = 1, 0.0  # 1=neutral/hold
 
             ext_signal = self.external_manager.get_signal_for_strategy()
             mtf_signal = self.external_manager.multi_tf.get_signal_for_strategy()
