@@ -6,7 +6,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -3984,9 +3984,47 @@ class AutoTrader:
         - 해결책 C: 'PAPER 최근 5건 ≥ 3승' 충족 시 LIVE 즉시 재개 (정지 30분+ 후).
         """
         try:
-            recent_live = self.storage.get_recent_trades(mode="LIVE", limit=10)
+            # [Patch N, 2026-05-22] 7일 윈도우 필터 — deadlock 근본 해소.
+            # 기존 버그: get_recent_trades는 시간 무관 최근 10건 → LIVE 거래가 끊기면
+            #   한 달 전 전패 5건을 영원히 보고 정지/재개/정지 무한 반복.
+            #   (실측: LIVE 04-20 마지막 거래 후 30일간 0건, deadlock 지속 확인)
+            _recent_live_raw = self.storage.get_recent_trades(mode="LIVE", limit=10)
+            _cutoff_7d = datetime.utcnow() - timedelta(days=7)
+            recent_live = []
+            for _t in _recent_live_raw:
+                _ts = _t.get("timestamp")
+                try:
+                    _dt = datetime.fromisoformat(
+                        str(_ts).replace("Z", "").split("+")[0].split(".")[0]
+                    )
+                    if _dt >= _cutoff_7d:
+                        recent_live.append(_t)
+                except Exception:
+                    # 파싱 실패 시 보수적으로 포함
+                    recent_live.append(_t)
 
             # ──── 정지 중일 때: PAPER 성과 + 시간 기반 재개 검사 (Resume Deadlock 방지) ────
+            if getattr(self, '_live_paused', False):
+                # [Patch N] 7일 윈도우에 LIVE 거래가 5건 미만이면 stale-pause 자동 해제.
+                # 옛날 전패 데이터로 영구 정지되는 deadlock 차단.
+                if len(recent_live) < 5:
+                    self._live_paused = False
+                    _pd = datetime.utcnow() - getattr(self, '_live_pause_time', datetime.utcnow())
+                    logger.warning(
+                        f"[자가진단] ✅ LIVE stale-pause 자동 해제 — 7일 내 LIVE 거래 "
+                        f"{len(recent_live)}건(<5) → 옛 전패 데이터 만료 (정지 {_pd})"
+                    )
+                    try:
+                        tg_notify(
+                            f"✅ <b>LIVE 정지 자동 해제 (Patch N)</b>\n"
+                            f"━━━━━━━━━━━━━\n"
+                            f"7일 윈도우 LIVE 거래 {len(recent_live)}건 (필요 5건)\n"
+                            f"옛 전패 데이터 만료 → LIVE 거래 재개\n"
+                            f"정지 기간: {_pd}"
+                        )
+                    except Exception:
+                        pass
+                    return None
             if getattr(self, '_live_paused', False):
                 pause_dur = datetime.utcnow() - getattr(self, '_live_pause_time', datetime.utcnow())
                 pause_sec = pause_dur.total_seconds()
