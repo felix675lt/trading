@@ -2257,6 +2257,60 @@ class AutoTrader:
                 ohlcv_df=df,
             )
 
+            # === [Patch O, 2026-05-22] Pattern Bank Decision Fusion (Phase 2) ===
+            # 데이터 근거 (24일 운영): ML 모델 WR 17%, ML-Pattern 일치율 35.7%.
+            # → Pattern Bank(실제 과거 통계)에 veto power 부여.
+            #   ML이 진입하려는데 유사 과거 패턴이 명확히 반대면 차단.
+            #   Pattern도 같은 방향 + 높은 WR이면 confidence 강화.
+            if pattern_signal is not None and decision.action in ("long", "short"):
+                try:
+                    pat_dir = pattern_signal["direction"]
+                    pat_wr = float(pattern_signal["winrate_1h"])
+                    pat_sim = float(pattern_signal["similarity"])
+                    pat_ev = float(pattern_signal["ev_1h_pct"])
+
+                    # 1) 충돌 veto — ML 진입 방향과 Pattern 방향이 정반대
+                    conflict = (
+                        (decision.action == "long" and pat_dir == "short")
+                        or (decision.action == "short" and pat_dir == "long")
+                    )
+                    # 2) Pattern이 진입 방향과 반대 EV (long인데 과거 패턴 EV<0 등)
+                    adverse_ev = (
+                        (decision.action == "long" and pat_ev < -0.05)
+                        or (decision.action == "short" and pat_ev > 0.05)
+                    )
+
+                    if conflict and pat_sim >= 0.90:
+                        logger.info(
+                            f"[Fusion] {symbol} 🛑 Pattern VETO — "
+                            f"ML={decision.action} vs Pattern={pat_dir} "
+                            f"(sim {pat_sim:.3f}, WR {pat_wr*100:.0f}%)"
+                        )
+                        decision.action = "hold"
+                        decision.confidence = 0.0
+                        decision.reason = (decision.reason or "") + " | Pattern VETO(충돌)"
+                    elif adverse_ev and pat_sim >= 0.92:
+                        logger.info(
+                            f"[Fusion] {symbol} 🛑 Pattern VETO — "
+                            f"{decision.action} 인데 과거 패턴 EV_1h={pat_ev:+.3f}% (sim {pat_sim:.3f})"
+                        )
+                        decision.action = "hold"
+                        decision.confidence = 0.0
+                        decision.reason = (decision.reason or "") + " | Pattern VETO(역EV)"
+                    elif pat_dir == decision.action and pat_wr >= 0.58 and pat_sim >= 0.92:
+                        # 3) 확증 — Pattern도 같은 방향 + 높은 WR + 높은 유사도
+                        old_conf = decision.confidence
+                        decision.confidence = min(decision.confidence * 1.25, 1.0)
+                        decision.reason = (decision.reason or "") + (
+                            f" | Pattern 확증(WR{pat_wr*100:.0f}% sim{pat_sim:.2f})"
+                        )
+                        logger.info(
+                            f"[Fusion] {symbol} ✅ Pattern 확증 — {decision.action} "
+                            f"conf {old_conf:.2f}→{decision.confidence:.2f}"
+                        )
+                except Exception as fus_e:
+                    logger.debug(f"[Fusion] {symbol} fusion 실패 (무시): {fus_e}")
+
             # MTF 필터 적용
             if decision.action in ["long", "short"]:
                 mtf_agreement = mtf_signal.get("agreement", 0)
