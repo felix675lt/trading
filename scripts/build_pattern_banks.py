@@ -22,7 +22,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.data.features import FeatureEngineer
 from core.patterns.memory_bank import PatternMemoryBank
 
-SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"]
+SYMBOLS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT",
+    "HYPE/USDT:USDT",  # [Patch P, 2026-05-22] 차세대 탈중앙 거래소(Hyperliquid) 토큰
+]
 TIMEFRAME = "5m"
 DB_PATH = "data/autotrader.db"
 OUT_DIR = Path("data/pattern_bank")

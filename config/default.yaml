@@ -25,6 +25,9 @@ trading:
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
     - "DOGE/USDT:USDT"
+    # [Patch P, 2026-05-22] HYPE 추가 — 차세대 탈중앙 거래소(Hyperliquid)
+    # 토큰. PAPER 트래킹 우선, 데이터 누적 후 LIVE 검토.
+    - "HYPE/USDT:USDT"
   # LIVE: 엣지 검증된 메이저만 (수학적 최적화 2026-04-20)
   #   알트 투기 제거 — whitelist와 동일
   live_symbols_override:
@@ -32,6 +35,7 @@ trading:
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
     - "DOGE/USDT:USDT"
+    # [Patch P] HYPE — 아직 LIVE 미투입. PAPER 데이터 1주일 검증 후 추가 검토.
 
   timeframes:
     - "5m"
