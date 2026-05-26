@@ -196,9 +196,13 @@ risk:
   # notional = (target_risk × equity) / (sl_atr_mult × atr_pct)
   atr_sizing:
     enabled: true
-    target_risk_pct: 0.010      # 1% 손실/트레이드 (MaxDD 15% 대비 15회 연패 버퍼)
-    sl_atr_mult: 1.5            # SL = 1.5×ATR 기본 가정 (실제 sl_pct와 독립)
-    atr_min_pct: 0.003          # 0.3% 미만 atr이면 사이즈 폭주 방지 floor
+    target_risk_pct: 0.010          # LIVE: 1% 손실/트레이드 (실자본 보호)
+    paper_target_risk_pct: 0.030    # [Patch Q, 2026-05-22] PAPER: 3% — 학습 데이터 수집 우선
+                                    # 사용자 결정: "live는 테스팅 소액. 학습되고 매매 돌리면 시드 커진다"
+                                    # → PAPER는 의미있는 사이즈로 진입해서 데이터 가치 ↑
+                                    # 효과: PAPER 트레이드 사이즈 약 3배 증가 ($500→$1,500급)
+    sl_atr_mult: 1.5                # SL = 1.5×ATR 기본 가정 (실제 sl_pct와 독립)
+    atr_min_pct: 0.003              # 0.3% 미만 atr이면 사이즈 폭주 방지 floor
 
   # === 종목별 스캘핑 프로파일 (수학적 재조정 2026-04-20) ===
   # 모든 프로파일 RR ≥ 2.5:1 강제 (EV 양수 조건: WR > 28.6%)

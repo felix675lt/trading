@@ -2432,6 +2432,7 @@ class AutoTrader:
                 kelly_stats=kelly_stats,
                 atr_pct=atr_pct,
                 leverage=dynamic_lev,
+                mode="paper",  # [Patch Q] _analyze_symbol은 PAPER 가상시드 기준 분석 → 3% target_risk
             )
 
             # 최소 notional 보장

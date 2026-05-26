@@ -62,7 +62,11 @@ class RiskManager:
         # 저변동성기엔 더 크게, 고변동성기엔 더 작게 — 같은 expected loss.
         atr_cfg = config.get("atr_sizing", {})
         self.atr_sizing_enabled: bool = bool(atr_cfg.get("enabled", True))
-        self.atr_target_risk_pct: float = float(atr_cfg.get("target_risk_pct", 0.01))  # 1%/trade
+        self.atr_target_risk_pct: float = float(atr_cfg.get("target_risk_pct", 0.01))  # LIVE: 1%/trade
+        # [Patch Q, 2026-05-22] PAPER 전용 더 공격적 사이징 — 학습 데이터 가치 우선
+        self.paper_atr_target_risk_pct: float = float(
+            atr_cfg.get("paper_target_risk_pct", 0.03)
+        )
         self.atr_sl_mult: float = float(atr_cfg.get("sl_atr_mult", 1.5))  # SL = 1.5×ATR 가정
         self.atr_min_pct: float = float(atr_cfg.get("atr_min_pct", 0.003))  # 0.3% 미만이면 사이즈 폭주 방지
         self._last_atr_size: dict = {"used": False, "notional": 0.0, "size": 0.0}
@@ -347,6 +351,7 @@ class RiskManager:
         kelly_stats: dict | None = None,
         atr_pct: float | None = None,      # NEW (B): 현재 ATR / price
         leverage: float | None = None,     # NEW (B): notional 계산용
+        mode: str = "live",                # [Patch Q] paper/live 별 risk budget 분리
     ) -> float:
         """포지션 크기 계산 — ATR-target + Kelly 혼합 (2026-04-24 B)
 
@@ -388,7 +393,9 @@ class RiskManager:
         ):
             # outlier 방어 — 극단적 저ATR이면 사이즈 폭주 → 하한 적용
             effective_atr = max(float(atr_pct), self.atr_min_pct)
-            target_risk = self.atr_target_risk_pct * equity
+            # [Patch Q, 2026-05-22] PAPER는 3% target_risk (학습 사이즈 ↑), LIVE는 1% 유지
+            tgt_pct = self.paper_atr_target_risk_pct if str(mode).lower() == "paper" else self.atr_target_risk_pct
+            target_risk = tgt_pct * equity
             stop_distance_pct = self.atr_sl_mult * effective_atr
             try:
                 atr_notional = target_risk / max(stop_distance_pct, 1e-6)
