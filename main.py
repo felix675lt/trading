@@ -6,6 +6,7 @@ import signal
 import sys
 import threading
 import time
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -85,7 +86,12 @@ class AutoTrader:
         log_cfg = self.config.get("logging", {})
         log_file = log_cfg.get("file", "logs/autotrader.log")
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        # [Patch K+, 2026-04-28] retention/compression 추가 — 1개월 무인 운영 시 디스크 보호
+        # [Patch R, 2026-06-03] service_stderr.log 무한증식(522MB) 차단.
+        #   원인: loguru 기본 stderr 싱크(level=DEBUG)가 모든 로그를 launchd
+        #   StandardErrorPath(service_stderr.log)로 흘림 → launchd는 회전 안 함 → 무한증식.
+        #   파일 싱크(autotrader.log, 회전됨)만 유지하고 stderr엔 ERROR만 남긴다.
+        #   추가로 매 사이클 반복되는 Python 경고(DeprecationWarning/sklearn)도 필터.
+        logger.remove()  # 기본 stderr(DEBUG) 싱크 제거 — 핵심 수정
         logger.add(
             log_file,
             rotation="10 MB",
@@ -93,6 +99,9 @@ class AutoTrader:
             compression="gz",      # 회전된 로그 gz 압축 (10MB → ~1MB)
             level=log_cfg.get("level", "INFO"),
         )
+        logger.add(sys.stderr, level="ERROR")  # 콘솔/launchd stderr엔 에러만
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        warnings.filterwarnings("ignore", message=".*does not have valid feature names.*")
 
         # 컴포넌트 초기화 (한 번만)
         self.storage = Storage()
@@ -1715,6 +1724,21 @@ class AutoTrader:
                 logger.warning(f"[Quant] {symbol} 시그널 수집 실패: {e}")
                 quant_risk_scale = 1.0
 
+            # === [Patch R, 2026-06-03] HYPE 신생토큰 숏 페이드 차단 ===
+            # 실측(2주): HYPE 숏 37건 WR 13.5% −$909 vs HYPE 롱 19건 −$161.
+            # HYPE는 상장 ~6개월 신토큰 + 지속 상승추세라 숏 페이드가 참사.
+            # 데이터 수집은 유지(롱/강한 숏은 통과)하되 숏 신뢰도 0.6× 감액 →
+            # 약한 숏은 임계 미달 hold 전환 → 최악 트레이드 빈도/사이즈 축소.
+            # PAPER 전용 영향 — HYPE는 live_symbol_whitelist에 없어 LIVE 무관.
+            if symbol.startswith("HYPE") and decision.action == "short":
+                decision.confidence *= 0.6
+                decision.reason += " !HYPE숏감액(R)"
+                if decision.confidence < self.strategy_manager.min_confidence:
+                    decision.action = "hold"
+                    decision.size = 0.0
+                    decision.reason += "→차단"
+                    return
+
             # 7.1. 포지션 상관관계 체크
             current_positions = {
                 s: {"side": p.side} for s, p in self.paper_trader.positions.items()
@@ -1766,6 +1790,7 @@ class AutoTrader:
                 kelly_stats=kelly_stats,
                 atr_pct=atr_pct,
                 leverage=dynamic_lev,
+                mode="paper",  # [Patch R] 이 call-site가 실제 PAPER/dual 진입 사이징 → 3% target_risk (Patch Q가 놓친 경로)
             )
 
             # 7.4. 최소 주문 notional 보장 (Binance 최소 $100 + 여유분)
@@ -3260,6 +3285,7 @@ class AutoTrader:
                 kelly_stats=kelly_stats,
                 atr_pct=atr_pct,
                 leverage=dynamic_lev,
+                mode="paper",  # [Patch R] PAPER variant 재진입 경로 — 3% target_risk
             )
             notional = size * dynamic_lev
             min_notional = self.min_order_notional * 1.05
