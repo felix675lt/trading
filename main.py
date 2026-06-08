@@ -2821,9 +2821,15 @@ class AutoTrader:
         if quant_min > 0:
             qs = c.get("quant_alpha_score")
             if qs is None:
-                # 분석결과에서 quant score 추출 — 없으면 0으로 보수적 처리
                 qs_dict = c.get("quant", {}) or {}
-                qs = qs_dict.get("alpha_score", 0.0)
+                qs = qs_dict.get("alpha_score")
+            if qs is None:
+                # [Patch S, 2026-06-09] 후보 dict엔 combined quant_score만 담겨 옴.
+                # quant_alpha_score 키가 없어 qs가 항상 None→0.0으로 떨어졌고
+                # |0.0|<0.25 로 *모든* LIVE 진입이 영구 차단됐음 (LIVE 4/20 이후
+                # 0거래의 직접 원인 — 롱 포함). 실제 edge 측정값(combined_score)으로 평가.
+                # 7일 표본: 롱 4,776건 중 7.8%가 |score|≥0.25 → 상위 엣지만 통과(보수적 유지).
+                qs = c.get("quant_score", 0.0)
             if abs(float(qs)) < quant_min:
                 logger.info(
                     f"[Quant-Gate] {symbol} LIVE 차단 — |score|={abs(float(qs)):.3f} "
