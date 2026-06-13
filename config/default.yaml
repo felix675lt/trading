@@ -28,6 +28,9 @@ trading:
     # [Patch P, 2026-05-22] HYPE 추가 — 차세대 탈중앙 거래소(Hyperliquid)
     # 토큰. PAPER 트래킹 우선, 데이터 누적 후 LIVE 검토.
     - "HYPE/USDT:USDT"
+    # [Patch V, 2026-06-13] SPCX — SpaceX pre-IPO 무기한 (5/21 Binance 상장,
+    # 24h $5.9B 유동성). 사용자 지시: PAPER 학습 전용, 거래 검토는 데이터 누적 후.
+    - "SPCX/USDT:USDT"
   # LIVE: 엣지 검증된 메이저만 (수학적 최적화 2026-04-20)
   #   알트 투기 제거 — whitelist와 동일
   live_symbols_override:
@@ -35,7 +38,10 @@ trading:
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
     - "DOGE/USDT:USDT"
-    # [Patch P] HYPE — 아직 LIVE 미투입. PAPER 데이터 1주일 검증 후 추가 검토.
+    # [Patch V, 2026-06-13] HYPE LIVE 투입 — 사용자 승인. 근거: PAPER 숏차단 후
+    # WR 51.6% +$75(5종목 1위), min_notional $5(소액시드 안전), LIVE는 롱 전용이라
+    # HYPE 약점(숏 페이드) 원천 차단. conf 0.62/quant 0.25 게이트는 그대로.
+    - "HYPE/USDT:USDT"
 
   timeframes:
     - "5m"
@@ -113,6 +119,7 @@ trading:
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
     - "DOGE/USDT:USDT"
+    - "HYPE/USDT:USDT"             # [Patch V, 2026-06-13] 사용자 승인 — HYPE LIVE 투입
 
   # === Kelly 분수 기반 포지션 사이징 (2026-04-20 신설) ===
   # f* = (p·b − q) / b, where b=win/loss_ratio, p=WR, q=1−p
@@ -122,7 +129,8 @@ trading:
     enabled: true
     fraction: 0.25                  # 1/4-Kelly (보수)
     lookback_trades: 50             # 최근 50트레이드 empirical로 WR/RR 추정
-    min_size_pct: 0.10              # f*≤0일 때 최소 10% (탐색 유지)
+    min_size_pct: 0.30              # [Patch V, 2026-06-13] 0.10→0.30 사용자 지시 ("ETH 포지션 너무 작다")
+                                    # f*≤0일 때도 잔고 30% 진입 (예: $84 free → $25 마진 × 2x = $50 notional)
     max_size_pct: 0.50              # f*>0일 때 상한 50% (과집중 방지)
 
   # === $100K 타겟 ===
@@ -345,7 +353,7 @@ capital_tiers:
       max: 500
       description: "소시드 집중매매 ($0~$500) — 1포지션 풀시드, 알트 위주 공격 롱"
       features:
-        symbols: ["ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT"]
+        symbols: ["ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT", "HYPE/USDT:USDT"]  # [Patch V] HYPE LIVE 투입 (사용자 승인)
         max_positions: 1
         concentration_mode: true
         sizing_method: kelly_fractional   # micro부터 Kelly 활성 ($100K 빠른 도달)
