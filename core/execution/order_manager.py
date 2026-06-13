@@ -766,6 +766,23 @@ class OrderManager:
                             f"수익 확보선: {pos.stop_loss:.2f}"
                         )
 
+                # === [Patch T, 2026-06-13] stale 자기수정 — PAPER 동일 정책을 LIVE에 적용 ===
+                # PAPER는 main.py에서 240분+손실 포지션을 강제청산(auto_close)하지만
+                # LIVE엔 시간 청산이 없어 scalp 포지션이 SL 직전에서 수일간 표류하며
+                # 슬롯(max_concurrent_live=1)을 점유 → LIVE 신규진입 전체 정지 (6/9 ETH 97h 사례).
+                if not any(s == symbol for s, _, _ in auto_closed):
+                    try:
+                        age_min = (datetime.utcnow() - datetime.fromisoformat(pos.opened_at)).total_seconds() / 60
+                    except Exception:
+                        age_min = 0.0
+                    if age_min > 240 and profit_pct < 0:
+                        logger.info(
+                            f"[LIVE-Stale] {symbol} {pos.side} {age_min:.0f}분 보유 + "
+                            f"손실 {profit_pct:.2%} → 자기수정 청산"
+                        )
+                        # reason에 'SL' 포함 → SL 콜백 경로로 기록(손실 학습+리포트)
+                        auto_closed.append((symbol, price, f"자기수정 SL ({age_min:.0f}분 보유+손실)"))
+
                 logger.info(
                     f"[Monitor] {symbol} {pos.side}({pos.trade_type}) | "
                     f"현재: {price:.5f} | 진입: {pos.entry_price:.5f} | "
