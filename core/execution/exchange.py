@@ -42,10 +42,10 @@ class ExchangeClient:
         except Exception as e:
             logger.warning(f"레버리지 설정 실패: {e}")
 
-    async def create_market_order(self, symbol: str, side: str, amount: float) -> dict:
+    async def create_market_order(self, symbol: str, side: str, amount: float, params: dict | None = None) -> dict:
         """시장가 주문"""
         try:
-            order = await self.exchange.create_order(symbol, "market", side, amount)
+            order = await self.exchange.create_order(symbol, "market", side, amount, None, params or {})
             logger.info(f"시장가 주문 체결: {side} {amount} {symbol} @ {order.get('average', 'N/A')}")
             return order
         except Exception as e:
@@ -113,7 +113,10 @@ class ExchangeClient:
             return {}
 
         close_side = "sell" if side_raw == "long" else "buy"
-        return await self.create_market_order(symbol, close_side, size)
+        # [Patch U, 2026-06-13] reduceOnly — Binance는 청산전용 주문에 MIN_NOTIONAL($20)
+        # 필터를 면제. 가격 하락으로 notional이 $20 밑으로 내려간 포지션이 -4164로
+        # 청산 거부(72회)되며 영구 락 → SL/stale/시그널 청산 전부 이 경로라 일괄 해결.
+        return await self.create_market_order(symbol, close_side, size, params={"reduceOnly": True})
 
     async def cancel_all_orders(self, symbol: str):
         """모든 미체결 주문 취소 (일반 주문 + Algo 조건부 주문)"""
