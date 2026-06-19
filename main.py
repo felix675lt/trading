@@ -36,6 +36,7 @@ from core.capital_tiers import CapitalTierManager
 from core.treasury.btc_reserve import BTCReserve
 from core.learning.ic_tracker import ICTracker, SignalWeightOptimizer
 from core.learning.meta_labeler import MetaLabeler
+from core.monitoring import heartbeat as hb
 from core.strategy.regime_hmm import HMMRegimeClassifier
 from core.strategy.cointegration import CointegrationTester
 from core.strategy.pairs_trading import PairsTradingStrategy
@@ -754,6 +755,18 @@ class AutoTrader:
         except Exception as e:
             logger.debug(f"[PatternBank] 초기화 실패 (무시): {e}")
 
+        # [Patch Y, 2026-06-19] 확률 캘리브레이터 로드 (shadow mode — 게이트 미적용).
+        # 적합 결과: 앙상블 conf는 방향 예측력 ~48%(동전던지기), 高신뢰일수록 역상관.
+        # → 게이트에 걸면 거래가 얼어붙으므로 진단/사이징 참고용으로만 shadow 로깅.
+        self.calibrator = None
+        try:
+            from core.learning.calibration import ConfidenceCalibrator
+            cal = ConfidenceCalibrator()
+            if cal.load("models_saved/confidence_calibrator.json"):
+                self.calibrator = cal
+        except Exception as e:
+            logger.debug(f"[Calibration] 로드 실패 (무시): {e}")
+
         logger.info("AutoTrader 초기화 완료")
 
     async def run_backtest(self):
@@ -1388,6 +1401,10 @@ class AutoTrader:
                 # === 4시간마다 전략 자체 리뷰 (480 루프 × 30초 ≈ 4시간) ===
                 if loop_count % 480 == 0 and loop_count > 0:
                     await self._strategic_self_review()
+
+                # === [Patch W] 가동 감시 — 매 루프 alive 기록 + dead-man switch ping ===
+                hb.write_alive_marker({"loop": loop_count, "equity": round(getattr(self, "equity", 0.0), 2)})
+                hb.ping_healthcheck()
 
                 # 대기
                 await asyncio.sleep(30)
@@ -2236,6 +2253,19 @@ class AutoTrader:
             except Exception as pat_e:
                 logger.debug(f"[PatternBank] {symbol} 추론 실패 (shadow mode 무시): {pat_e}")
 
+            # [Patch Y] 캘리브레이션 shadow — raw conf vs calibrated (게이트 미적용, 진단용)
+            if self.calibrator is not None:
+                try:
+                    _raw = float(ml_signal.get("confidence", 0.0))
+                    _cal = self.calibrator.transform(_raw)
+                    if not hasattr(self, "_calib_log_throttle"):
+                        self._calib_log_throttle = {}
+                    if time.time() - self._calib_log_throttle.get(symbol, 0) > 600:
+                        logger.info(f"[Calibration-shadow] {symbol} raw={_raw:.3f} → cal={_cal:.3f}")
+                        self._calib_log_throttle[symbol] = time.time()
+                except Exception:
+                    pass
+
             base_feature_cols = self.feature_engineer.get_base_feature_columns(df)
             rl_obs_data = df[base_feature_cols].values[-1].astype(np.float32)
             rl_obs_data = np.nan_to_num(rl_obs_data, nan=0.0)
@@ -2305,7 +2335,13 @@ class AutoTrader:
                         or (decision.action == "short" and pat_ev > 0.05)
                     )
 
-                    if conflict and pat_sim >= 0.90:
+                    # [Patch Z, 2026-06-19] Pattern Bank 승격 — veto 임계 완화 + 그라데이션 감액.
+                    # 근거: 캘리브레이션 실측상 앙상블 방향 적중률 48%(동전던지기, 高신뢰 역상관)인
+                    # 반면 Pattern Bank는 유사 과거패턴 forward WR 50~67%로 실제 예측력 보유.
+                    # → Pattern Bank veto를 더 신뢰(임계 0.90→0.87, 0.92→0.90)하고,
+                    #   애매한 충돌(0.80~0.87)은 차단 대신 신뢰도 감액(그라데이션).
+                    #   이 변경은 '보호 강화' 방향뿐 — LIVE 리스크 단조 감소.
+                    if conflict and pat_sim >= 0.87:
                         logger.info(
                             f"[Fusion] {symbol} 🛑 Pattern VETO — "
                             f"ML={decision.action} vs Pattern={pat_dir} "
@@ -2314,7 +2350,7 @@ class AutoTrader:
                         decision.action = "hold"
                         decision.confidence = 0.0
                         decision.reason = (decision.reason or "") + " | Pattern VETO(충돌)"
-                    elif adverse_ev and pat_sim >= 0.92:
+                    elif adverse_ev and pat_sim >= 0.90:
                         logger.info(
                             f"[Fusion] {symbol} 🛑 Pattern VETO — "
                             f"{decision.action} 인데 과거 패턴 EV_1h={pat_ev:+.3f}% (sim {pat_sim:.3f})"
@@ -2322,8 +2358,17 @@ class AutoTrader:
                         decision.action = "hold"
                         decision.confidence = 0.0
                         decision.reason = (decision.reason or "") + " | Pattern VETO(역EV)"
-                    elif pat_dir == decision.action and pat_wr >= 0.58 and pat_sim >= 0.92:
-                        # 3) 확증 — Pattern도 같은 방향 + 높은 WR + 높은 유사도
+                    elif (conflict or adverse_ev) and pat_sim >= 0.80:
+                        # 그라데이션 — 애매한 반대 신호는 차단 대신 신뢰도/사이즈 감액
+                        old_conf = decision.confidence
+                        decision.confidence *= 0.6
+                        decision.reason = (decision.reason or "") + " | Pattern 약veto(감액)"
+                        logger.info(
+                            f"[Fusion] {symbol} ⚠️ Pattern 약veto — {decision.action} "
+                            f"conf {old_conf:.2f}→{decision.confidence:.2f} (sim {pat_sim:.3f})"
+                        )
+                    elif pat_dir == decision.action and pat_wr >= 0.56 and pat_sim >= 0.88:
+                        # 확증 — Pattern도 같은 방향 + 높은 WR + 높은 유사도 (임계 소폭 완화)
                         old_conf = decision.confidence
                         decision.confidence = min(decision.confidence * 1.25, 1.0)
                         decision.reason = (decision.reason or "") + (
@@ -5049,6 +5094,12 @@ class AutoTrader:
             except Exception:
                 pass
         self.storage.close()
+        # [Patch W] 종료 알림 — graceful 종료 시 통지 (하드 정전은 dead-man switch가 커버)
+        try:
+            hb.ping_healthcheck("/fail")
+            tg_notify("🔴 <b>시스템 종료</b> — 봇이 정상 종료 신호로 중단됩니다 (재부팅/수동중단)")
+        except Exception:
+            pass
         logger.info("AutoTrader 종료 완료")
 
 
@@ -5076,6 +5127,31 @@ async def main():
     )
     dash_thread.start()
     logger.info(f"대시보드: http://localhost:{dash_config.get('port', 8888)}")
+
+    # === [Patch W] 부팅 다운타임 감지 + 생애주기 알림 ===
+    # 직전 alive 기록과 비교해 봇이 죽어 있던 시간을 산출 → 부팅 텔레그램으로 통지.
+    # (6/18 ~20h 무인 정지가 무알림이었던 문제 해결 — 외부 의존 없이 즉시 동작)
+    downtime = hb.read_downtime_seconds()
+    if downtime is not None and downtime > hb.DOWNTIME_THRESHOLD_SEC:
+        tg_notify(
+            f"🟢 <b>시스템 부팅</b>\n"
+            f"━━━━━━━━━━━━━\n"
+            f"⚠️ 직전 <b>{hb.format_downtime(downtime)}</b> 동안 정지 상태였습니다\n"
+            f"(맥 재부팅/절전/크래시 추정 — 자동 복귀됨)"
+        )
+        logger.warning(f"[Heartbeat] 부팅 — 직전 다운타임 {hb.format_downtime(downtime)} 감지")
+    else:
+        tg_notify("🟢 <b>시스템 부팅</b> — 정상 기동")
+    hb.ping_healthcheck("/start")
+
+    # SIGTERM(launchd stop/재부팅) graceful 처리 — 기존 finally→shutdown() 경로로 유도
+    def _on_sigterm(signum, frame):
+        logger.warning(f"[Heartbeat] 종료 시그널 {signum} 수신 → graceful shutdown")
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception as e:
+        logger.debug(f"[Heartbeat] SIGTERM 핸들러 등록 실패(무시): {e}")
 
     # 초기화
     await trader.initialize()

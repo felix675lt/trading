@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- [Patch W, 2026-06-19] LaunchDaemon 판 — 로그인 없이 부팅 즉시 기동.
+         재부팅 후 ~20시간 정지(LaunchAgent는 GUI 로그인 필요) 문제 해결.
+         UserName=d 로 사용자 권한 실행(venv/.env/data 접근).
+         주의: 데몬은 GUI 세션이 없어 Apple MPS(GPU) 비활성 → torch는 CPU로 폴백.
+               (CNN은 폐기 예정이라 영향 미미; 추론은 CPU로 충분) -->
+    <key>Label</key>
+    <string>com.autotrader.ai</string>
+    <key>UserName</key>
+    <string>d</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/d/trading/venv/bin/python3</string>
+        <string>/Users/d/trading/main.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/d/trading</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/d/trading/logs/service_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/d/trading/logs/service_stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/Users/d/trading/venv/bin</string>
+    </dict>
+</dict>
+</plist>

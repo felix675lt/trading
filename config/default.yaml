@@ -270,6 +270,8 @@ ml:
     - atr
     - volume_profile
     - funding_rate
+    - stoch          # [Patch Z, 2026-06-19] Pattern Bank signature의 죽은 2차원(stoch_k/d) 복구
+                     # — 뱅크는 빌드 시 stoch 보유했으나 추론이 누락→0.0 보내던 불일치 해소. 재빌드 불요.
 
 rl:
   total_timesteps: 100000

@@ -68,10 +68,13 @@ class AdaptiveOptimizer:
                 "stop_loss_mult": 1.5,
                 "prefer_direction": "short",
             },
+            # [Patch X, 2026-06-19] 레짐 게이팅 — 실측 누적 P&L 기반 강화.
+            # ranging: 누적 232승/63패인데도 -$2,809(최대 손실 레짐) — 작은 익절/큰 손절의
+            # 전형적 횡보 함정. 사이즈 0.6→0.3, 신뢰도 0.65→0.72로 진입 정밀화.
             "ranging": {
-                "signal_threshold": 0.25,
-                "min_confidence": 0.65,
-                "position_scale": 0.6,
+                "signal_threshold": 0.30,
+                "min_confidence": 0.72,
+                "position_scale": 0.30,
                 "stop_loss_mult": 0.8,
                 "prefer_direction": "neutral",
             },
@@ -82,10 +85,13 @@ class AdaptiveOptimizer:
                 "stop_loss_mult": 2.0,
                 "prefer_direction": "neutral",
             },
+            # [Patch X, 2026-06-19] high_volume_breakout: 9승/29패(WR 23.7%) -$2,658.
+            # 돌파 페이드 참사인데 풀사이즈(1.0)+낮은 게이트(0.55)로 방치돼 있었음 →
+            # 사이즈 1.0→0.35, 신뢰도 0.55→0.70, 임계 0.12→0.25로 강하게 차단.
             "high_volume_breakout": {
-                "signal_threshold": 0.12,
-                "min_confidence": 0.55,
-                "position_scale": 1.0,
+                "signal_threshold": 0.25,
+                "min_confidence": 0.70,
+                "position_scale": 0.35,
                 "stop_loss_mult": 1.2,
                 "prefer_direction": "neutral",
             },
