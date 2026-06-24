@@ -1,10 +1,19 @@
 """크립토 트위터/소셜 실시간 수집 - Stocktwits + Free Crypto News API"""
 
+import re
 import time
 from datetime import datetime, timedelta
 
 import aiohttp
 from loguru import logger
+
+
+def _kw_match(keyword: str, text: str) -> bool:
+    """[Patch AA, 2026-06-24] 단어경계 매칭 — 'ban' in 'Lebanon/Dybantsa' 류 오탐 차단.
+    이 경로는 감성점수(-4.0~+3.0)로 매매에 직접 영향 → 오탐이 매매 왜곡. \\b로 방지."""
+    if keyword.isascii():
+        return re.search(r"\b" + re.escape(keyword) + r"\b", text) is not None
+    return keyword in text
 
 
 class CryptoTwitterCollector:
@@ -218,9 +227,9 @@ class CryptoTwitterCollector:
                     if symbol.lower() not in text and "bitcoin" not in text and "crypto" not in text:
                         continue
 
-                    # 긴급 이벤트 감지
+                    # 긴급 이벤트 감지 ([Patch AA] 단어경계 매칭)
                     for keyword, impact in self.URGENT_KEYWORDS.items():
-                        if keyword in text:
+                        if _kw_match(keyword, text):
                             urgent_events.append({
                                 "keyword": keyword,
                                 "impact": impact,
@@ -228,9 +237,9 @@ class CryptoTwitterCollector:
                                 "time": article.get("published", "") if isinstance(article, dict) else "",
                             })
 
-                    # 영향력 인물 감지
+                    # 영향력 인물 감지 ([Patch AA] 단어경계 매칭)
                     for keyword, weight in self.INFLUENCER_KEYWORDS.items():
-                        if keyword in text:
+                        if _kw_match(keyword, text):
                             influencer_mentions.append({
                                 "keyword": keyword,
                                 "weight": weight,

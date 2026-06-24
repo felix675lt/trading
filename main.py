@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import signal
 import sys
 import threading
@@ -62,6 +63,15 @@ except Exception:
         return f"⚠️ {msg}"
     def format_external_alert(alert_type, data):
         return f"📢 {alert_type}: {data}"
+
+def _kw_match(keyword: str, text: str) -> bool:
+    """[Patch AA, 2026-06-24] 단어경계 매칭 — 부분문자열 오탐 방지.
+    예: 'ban' in 'AJ Dybantsa'(NBA 선수) → 과거엔 크립토 HIGH 오탐. \\b로 차단.
+    ASCII 키워드만 \\b 적용(한글 등 비ASCII는 단어경계 개념이 달라 부분문자열 유지)."""
+    if keyword.isascii():
+        return re.search(r"\b" + re.escape(keyword) + r"\b", text) is not None
+    return keyword in text
+
 
 def tg_notify(text, silent=False):
     """비동기 안전 텔레그램 알림 (실패 무시)"""
@@ -382,7 +392,7 @@ class AutoTrader:
                 "war", "iran", "sanctions", "tariff", "missile", "ceasefire",
                 "peace", "invasion", "nuclear", "troops", "military",
                 "oil price", "opec", "embargo", "strait", "hormuz",
-                "conflict", "airstrike", "escalat", "de-escalat",
+                "conflict", "airstrike", "escalate", "escalation", "de-escalation",
                 "negotiate", "deal", "treaty", "withdraw",
                 "oman", "houthi", "yemen", "hezbollah", "gaza", "israel",
                 "taiwan", "china", "nato", "russia", "ukraine",
@@ -412,14 +422,14 @@ class AutoTrader:
                 if title_key in st["alerted_headlines"]:
                     continue
 
-                # 지정학 키워드 감지
-                geo_hit = [kw for kw in GEO_KEYWORDS if kw in title_lower]
+                # 지정학 키워드 감지 ([Patch AA] 단어경계 매칭 — 부분문자열 오탐 차단)
+                geo_hit = [kw for kw in GEO_KEYWORDS if _kw_match(kw, title_lower)]
                 if geo_hit:
                     geo_headlines.append(f"{title} [{', '.join(geo_hit[:3])}]")
                     st["alerted_headlines"].add(title_key)
 
-                # 크립토 직접 영향 키워드 감지
-                crypto_hit = [kw for kw in CRYPTO_IMPACT_KEYWORDS if kw in title_lower]
+                # 크립토 직접 영향 키워드 감지 ([Patch AA] 단어경계 매칭)
+                crypto_hit = [kw for kw in CRYPTO_IMPACT_KEYWORDS if _kw_match(kw, title_lower)]
                 if crypto_hit:
                     crypto_headlines.append(f"{title} [{', '.join(crypto_hit[:3])}]")
                     st["alerted_headlines"].add(title_key)
