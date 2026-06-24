@@ -1157,12 +1157,32 @@ class AutoTrader:
                         if getattr(self.strategy_manager, "live_long_only", False):
                             live_candidates = [c for c in candidates if c.get("action") == "long"]
                         if live_candidates:
-                            # 확신도 × (1 - priority/10) 로 최종 순위 결정
-                            best = max(
-                                live_candidates,
-                                key=lambda c: c["confidence"] * (1 - c["priority"] / 10),
-                            )
-                            await self._execute_live(exchange_name, best)
+                            # [Patch AB, 2026-06-24] HYPE LIVE 미러링 — 사용자 지시.
+                            # PAPER가 HYPE 롱을 잡으면 LIVE도 같이 진입(시드 N% 집중).
+                            # HYPE는 LIVE 최고 성과종목(WR54.5%), 롱전용이라 약점(숏) 차단됨.
+                            # 미러는 퀀트게이트를 우회하되 화이트리스트/롱전용/잔고/리스크게이트는 유지.
+                            mirror_cfg = self.config.get("trading", {}).get("hype_live_mirror", {}) or {}
+                            hype_mirror = None
+                            if mirror_cfg.get("enabled", False):
+                                hype_mirror = next(
+                                    (c for c in live_candidates if c.get("symbol", "").startswith("HYPE")),
+                                    None,
+                                )
+                            if hype_mirror is not None:
+                                hype_mirror["_mirror_alloc"] = float(mirror_cfg.get("seed_pct", 0.70))
+                                hype_mirror["_mirror"] = True
+                                logger.info(
+                                    f"[HYPE-Mirror] PAPER HYPE 롱 감지 → LIVE 미러 진입 "
+                                    f"(시드 {hype_mirror['_mirror_alloc']*100:.0f}%)"
+                                )
+                                await self._execute_live(exchange_name, hype_mirror)
+                            else:
+                                # 확신도 × (1 - priority/10) 로 최종 순위 결정
+                                best = max(
+                                    live_candidates,
+                                    key=lambda c: c["confidence"] * (1 - c["priority"] / 10),
+                                )
+                                await self._execute_live(exchange_name, best)
                 else:
                     # 기존 모드: 각 심볼 독립 매매
                     for symbol in symbols:
@@ -2873,6 +2893,9 @@ class AutoTrader:
         # === Quant score 게이트 (엣지 없는 구간 차단, 2026-04-20) ===
         # |quant_alpha_score| < 0.25 면 진입 포기 — 최근 LIVE 손실 대부분 |score|<0.2 구간
         quant_min = self.config.get("trading", {}).get("live_quant_score_min", 0.25)
+        if c.get("_mirror"):
+            quant_min = 0  # [Patch AB] HYPE 미러는 퀀트게이트 우회 — PAPER 진입과 동기화가 목적
+            logger.info(f"[HYPE-Mirror] {symbol} 퀀트게이트 우회 (PAPER 동기 진입)")
         if quant_min > 0:
             qs = c.get("quant_alpha_score")
             if qs is None:
@@ -2949,7 +2972,11 @@ class AutoTrader:
                 # f*≤0 (negative edge)이면 min_size로 축소 (탐색 유지)
                 kelly_cfg = self.config.get("trading", {}).get("kelly_sizing", {}) or {}
                 base_alloc = 0.90  # 기본 잔고 90%
-                if kelly_cfg.get("enabled", False):
+                if c.get("_mirror_alloc"):
+                    # [Patch AB] HYPE 미러 — Kelly 무시하고 지정 시드비율(기본 70%) 집중
+                    base_alloc = float(c["_mirror_alloc"])
+                    logger.info(f"[HYPE-Mirror] {symbol} 사이징 오버라이드 → 시드 {base_alloc*100:.0f}%")
+                elif kelly_cfg.get("enabled", False):
                     try:
                         f_frac = self._compute_live_kelly(
                             lookback=int(kelly_cfg.get("lookback_trades", 50)),
