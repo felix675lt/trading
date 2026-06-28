@@ -2883,11 +2883,18 @@ class AutoTrader:
         # _execute_paper 진입 시 다시 'paper'로 복원되므로 단방향 set OK.
         try:
             self.risk_manager.set_trading_mode("live")
-            num_live_pos = sum(len(om.positions) for om in self.order_managers.values())
-            can_live, live_reason = self.risk_manager.check_can_trade(self.equity, num_live_pos)
-            if not can_live:
-                logger.warning(f"[리스크-LIVE] {symbol} 진입 차단: {live_reason}")
-                return
+            if c.get("_mirror"):
+                # [Patch AC, 2026-06-29] HYPE 미러는 리스크게이트(드로다운/쿨다운) 우회.
+                # 버그: check_can_trade가 self.equity=PAPER equity로 DD를 계산 → PAPER가
+                # 28% DD라 LIVE($93, 거의 무거래)와 무관하게 미러 진입을 영구 차단했음.
+                # 미러는 PAPER 동기화가 목적이므로 우회. 잔고/롱전용/화이트리스트는 유지.
+                logger.info(f"[HYPE-Mirror] {symbol} 리스크게이트(DD/쿨다운) 우회 — PAPER 동기 진입")
+            else:
+                num_live_pos = sum(len(om.positions) for om in self.order_managers.values())
+                can_live, live_reason = self.risk_manager.check_can_trade(self.equity, num_live_pos)
+                if not can_live:
+                    logger.warning(f"[리스크-LIVE] {symbol} 진입 차단: {live_reason}")
+                    return
         except Exception as _gate_err:
             logger.debug(f"[리스크-LIVE] 게이트 체크 실패(무시): {_gate_err}")
         # === Quant score 게이트 (엣지 없는 구간 차단, 2026-04-20) ===
