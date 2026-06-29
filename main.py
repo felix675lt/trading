@@ -1575,6 +1575,7 @@ class AutoTrader:
             mode=decide_mode,
             ohlcv_df=df,
         )
+        self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단
 
         # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
         if decision.action in ["long", "short"]:
@@ -1771,20 +1772,9 @@ class AutoTrader:
                 logger.warning(f"[Quant] {symbol} 시그널 수집 실패: {e}")
                 quant_risk_scale = 1.0
 
-            # === [Patch R, 2026-06-03] HYPE 신생토큰 숏 페이드 차단 ===
-            # 실측(2주): HYPE 숏 37건 WR 13.5% −$909 vs HYPE 롱 19건 −$161.
-            # HYPE는 상장 ~6개월 신토큰 + 지속 상승추세라 숏 페이드가 참사.
-            # 데이터 수집은 유지(롱/강한 숏은 통과)하되 숏 신뢰도 0.6× 감액 →
-            # 약한 숏은 임계 미달 hold 전환 → 최악 트레이드 빈도/사이즈 축소.
-            # PAPER 전용 영향 — HYPE는 live_symbol_whitelist에 없어 LIVE 무관.
-            if symbol.startswith("HYPE") and decision.action == "short":
-                decision.confidence *= 0.6
-                decision.reason += " !HYPE숏감액(R)"
-                if decision.confidence < self.strategy_manager.min_confidence:
-                    decision.action = "hold"
-                    decision.size = 0.0
-                    decision.reason += "→차단"
-                    return
+            # [Patch AD, 2026-06-30] HYPE 숏 차단은 이제 decide() 직후 self._block_hype_short()로
+            # 일원화됨(전 경로 전면차단). 구 Patch R 감액블록은 제거 — 감액일 뿐 강한 숏 통과 +
+            # 이 경로(_process_symbol)는 집중매매 모드에서 비활성이라 실효 없었음.
 
             # 7.1. 포지션 상관관계 체크
             current_positions = {
@@ -2227,6 +2217,20 @@ class AutoTrader:
     # 집중 매매 모드 메서드 (concentration_mode=true)
     # =========================================================================
 
+    def _block_hype_short(self, symbol: str, decision) -> None:
+        """[Patch AD, 2026-06-30] HYPE 숏 전면 차단 — 사용자 강행규칙('HYPE 숏 치지마').
+
+        배경: Patch R(2026-06-03)은 (1) 감액(haircut)일 뿐 강한 숏은 통과했고,
+        (2) 비활성 경로 _process_symbol에만 있어 실제 집중매매 경로(_analyze_symbol/
+        _run_shadow_macro_off)엔 적용된 적이 없음 → HYPE가 계속 숏쳤음.
+        이 헬퍼를 모든 decide() 직후에 호출해 어떤 신뢰도/경로든 HYPE 숏을 무조건 hold.
+        """
+        if symbol and symbol.startswith("HYPE") and getattr(decision, "action", None) == "short":
+            decision.action = "hold"
+            decision.size = 0.0
+            decision.confidence = 0.0
+            decision.reason = (getattr(decision, "reason", "") or "") + " | HYPE 숏 전면차단(AD)"
+
     async def _analyze_symbol(self, exchange_name: str, symbol: str, timeframe: str) -> dict | None:
         """심볼 분석만 수행하고 시그널 반환 (실행 X)"""
         try:
@@ -2341,6 +2345,7 @@ class AutoTrader:
                 mode=decide_mode,
                 ohlcv_df=df,
             )
+            self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단
 
             # === [Patch O, 2026-05-22] Pattern Bank Decision Fusion (Phase 2) ===
             # 데이터 근거 (24일 운영): ML 모델 WR 17%, ML-Pattern 일치율 35.7%.
@@ -3306,6 +3311,7 @@ class AutoTrader:
                 variant_override={"disable_macro_block": True},
                 ohlcv_df=df,
             )
+            self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단 (shadow도)
 
             # MTF 필터 — primary와 동일 로직 (양쪽 동일 적용해야 macro 차이만 분리됨)
             if decision.action in ["long", "short"]:
