@@ -2269,11 +2269,13 @@ class AutoTrader:
         LIVE는 live_symbol_whitelist로 보호되어 자동편입 대상 아님(실자본 안전)."""
         cfg = (self.config.get("trading", {}) or {}).get("trend_scanner", {}) or {}
         max_total = int(cfg.get("max_total_dynamic", 8))
+        max_add = int(cfg.get("max_auto_add", 3))
         tracked = set(symbols) | set(self.tier_manager.get_symbols("live"))
         result = await self.trend_scanner.scan(tracked)
         scanned = result.get("scanned", 0)
         added = []
-        room = max(0, max_total - len(self.dynamic_symbols))
+        # 1회 스캔당 max_add, 총합 max_total 둘 다 준수 (점진적 편입)
+        room = min(max_add, max(0, max_total - len(self.dynamic_symbols)))
         for c in result.get("candidates", []):
             if room <= 0:
                 break

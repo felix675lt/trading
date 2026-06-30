@@ -151,7 +151,7 @@ trading:
     min_volume_usd: 300000000       # 유동성 바닥 $300M (거래량 붙는 종목만)
     min_momentum_pct: 5.0           # |24h 변동| ≥5% (추세/네러티브 타는 종목)
     max_auto_add: 3                 # 1회 스캔당 PAPER 자동편입 최대
-    max_total_dynamic: 8            # 동적 심볼 총 상한 (유니버스 폭주 방지)
+    max_total_dynamic: 6            # 동적 심볼 총 상한 (현 6종목 락 — 부하 고려. 올리면 더 편입)
     interval_hours: 12              # 스캔 주기
     top_n_report: 12
 
