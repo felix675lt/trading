@@ -1,6 +1,7 @@
 """AutoTrader AI - 자기학습 선물 트레이딩 시스템 메인 실행"""
 
 import asyncio
+import json
 import os
 import re
 import signal
@@ -38,6 +39,7 @@ from core.treasury.btc_reserve import BTCReserve
 from core.learning.ic_tracker import ICTracker, SignalWeightOptimizer
 from core.learning.meta_labeler import MetaLabeler
 from core.monitoring import heartbeat as hb
+from core.discovery.trend_scanner import TrendScanner
 from core.strategy.regime_hmm import HMMRegimeClassifier
 from core.strategy.cointegration import CointegrationTester
 from core.strategy.pairs_trading import PairsTradingStrategy
@@ -777,6 +779,14 @@ class AutoTrader:
         except Exception as e:
             logger.debug(f"[Calibration] 로드 실패 (무시): {e}")
 
+        # [Patch AE, 2026-06-30] 트렌드 스크리너 + 동적 PAPER 심볼 (거래량·네러티브 자동발굴)
+        self.trend_scanner = TrendScanner(self.config)
+        self._dyn_sym_path = Path("data/dynamic_symbols.json")
+        self.dynamic_symbols: list[str] = self._load_dynamic_symbols()
+        self._last_trend_scan = None
+        if self.dynamic_symbols:
+            logger.info(f"[TrendScanner] 동적 PAPER 심볼 {len(self.dynamic_symbols)}개 복원: {self.dynamic_symbols}")
+
         logger.info("AutoTrader 초기화 완료")
 
     async def run_backtest(self):
@@ -838,6 +848,14 @@ class AutoTrader:
             )
         else:
             symbols = self.config["trading"]["symbols"]
+        # [Patch AE] 동적 트렌드 심볼 병합 — PAPER 데이터 수집 (LIVE는 whitelist로 보호)
+        symbols = list(symbols)
+        for ds in self.dynamic_symbols:
+            if ds not in symbols:
+                symbols.append(ds)
+            paper_ov = self.tier_manager.symbol_overrides.setdefault("paper", [])
+            if ds not in paper_ov:
+                paper_ov.append(ds)
         timeframes = self.config["trading"]["timeframes"]  # 멀티타임프레임
         primary_tf = timeframes[0]  # 메인 타임프레임 (5m)
 
@@ -1431,6 +1449,18 @@ class AutoTrader:
                 # === 4시간마다 전략 자체 리뷰 (480 루프 × 30초 ≈ 4시간) ===
                 if loop_count % 480 == 0 and loop_count > 0:
                     await self._strategic_self_review()
+
+                # === [Patch AE] 트렌드 스크리너 — interval_hours마다 (부팅 직후 1회 포함) ===
+                if getattr(self, "trend_scanner", None) and self.trend_scanner.enabled:
+                    _sc = (self.config.get("trading", {}) or {}).get("trend_scanner", {}) or {}
+                    _iv = float(_sc.get("interval_hours", 12)) * 3600
+                    _now = datetime.utcnow()
+                    if self._last_trend_scan is None or (_now - self._last_trend_scan).total_seconds() > _iv:
+                        self._last_trend_scan = _now
+                        try:
+                            await self._run_trend_scan(symbols)
+                        except Exception as e:
+                            logger.warning(f"[TrendScanner] 실행 실패: {e}")
 
                 # === [Patch W] 가동 감시 — 매 루프 alive 기록 + dead-man switch ping ===
                 hb.write_alive_marker({"loop": loop_count, "equity": round(getattr(self, "equity", 0.0), 2)})
@@ -2216,6 +2246,63 @@ class AutoTrader:
     # =========================================================================
     # 집중 매매 모드 메서드 (concentration_mode=true)
     # =========================================================================
+
+    def _load_dynamic_symbols(self) -> list[str]:
+        try:
+            if self._dyn_sym_path.exists():
+                return list(json.loads(self._dyn_sym_path.read_text()))
+        except Exception:
+            pass
+        return []
+
+    def _save_dynamic_symbols(self) -> None:
+        try:
+            self._dyn_sym_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._dyn_sym_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.dynamic_symbols))
+            tmp.replace(self._dyn_sym_path)
+        except Exception as e:
+            logger.debug(f"[TrendScanner] 동적심볼 저장 실패: {e}")
+
+    async def _run_trend_scan(self, symbols: list) -> None:
+        """[Patch AE] 트렌드 스캔 → 상위 후보 PAPER 자동편입 + 텔레그램 보고.
+        LIVE는 live_symbol_whitelist로 보호되어 자동편입 대상 아님(실자본 안전)."""
+        cfg = (self.config.get("trading", {}) or {}).get("trend_scanner", {}) or {}
+        max_total = int(cfg.get("max_total_dynamic", 8))
+        tracked = set(symbols) | set(self.tier_manager.get_symbols("live"))
+        result = await self.trend_scanner.scan(tracked)
+        scanned = result.get("scanned", 0)
+        added = []
+        room = max(0, max_total - len(self.dynamic_symbols))
+        for c in result.get("candidates", []):
+            if room <= 0:
+                break
+            sym = c["symbol"]
+            if sym in symbols or sym in self.dynamic_symbols:
+                continue
+            symbols.append(sym)
+            self.dynamic_symbols.append(sym)
+            self.tier_manager.symbol_overrides.setdefault("paper", []).append(sym)
+            added.append(c)
+            room -= 1
+        if added:
+            self._save_dynamic_symbols()
+        try:
+            report = result.get("report", [])
+            top = ", ".join(f"{c['base']}({c['pct']:+.0f}%)" for c in report[:6])
+            if added:
+                lines = "\n".join(
+                    f"  ➕ {c['base']} {'🆕신규' if c.get('is_new') else '🔥추세'} "
+                    f"(${c['volume_usd']/1e9:.2f}B, {c['pct']:+.1f}%)"
+                    for c in added
+                )
+                body = f"<b>PAPER 자동편입 {len(added)}종목</b>\n{lines}"
+            else:
+                body = "신규 편입 없음 (이미 추적 중이거나 기준 미달)"
+            tg_notify(f"🔭 <b>트렌드 스캔</b> ({scanned}종목)\n{body}\n상위: {top}", silent=True)
+            logger.info(f"[TrendScanner] 스캔 {scanned}종목 → PAPER 편입 {[c['base'] for c in added]}")
+        except Exception as e:
+            logger.debug(f"[TrendScanner] 보고 실패: {e}")
 
     def _block_hype_short(self, symbol: str, decision) -> None:
         """[Patch AD, 2026-06-30] HYPE 숏 전면 차단 — 사용자 강행규칙('HYPE 숏 치지마').

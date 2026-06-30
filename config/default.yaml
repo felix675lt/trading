@@ -142,6 +142,19 @@ trading:
     enabled: true
     seed_pct: 0.70                  # 가용잔고의 70% (소액 시드라 집중 — 거래당 절대손실 $2~5)
 
+  # === [Patch AE, 2026-06-30] 트렌드 스크리너 — 거래량·네러티브 자동발굴 (사용자 전략) ===
+  # 바이낸스 선물 전 USDT-perp을 주기적으로 스캔 → 거래량+모멘텀+신규상장 스코어링 →
+  # 상위 후보를 PAPER에 자동 편입(데이터 수집) + 텔레그램 통지(반자동).
+  # LIVE는 live_symbol_whitelist로 보호 — 자동편입 대상 아님(실자본 안전).
+  trend_scanner:
+    enabled: true
+    min_volume_usd: 300000000       # 유동성 바닥 $300M (거래량 붙는 종목만)
+    min_momentum_pct: 5.0           # |24h 변동| ≥5% (추세/네러티브 타는 종목)
+    max_auto_add: 3                 # 1회 스캔당 PAPER 자동편입 최대
+    max_total_dynamic: 8            # 동적 심볼 총 상한 (유니버스 폭주 방지)
+    interval_hours: 12              # 스캔 주기
+    top_n_report: 12
+
   # === $100K 타겟 ===
   # 전체 시스템이 이 목표를 향해 공격성 자동 조절
   #   < $1K : 극공격 (Kelly 0.35)
