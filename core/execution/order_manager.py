@@ -524,6 +524,15 @@ class OrderManager:
                 trade_type=trade_type,
                 leverage=leverage,
             )
+            # [Patch AF-3, 2026-07-02] ATR 비례 트레일링 (PAPER와 동일 로직 — 대칭 유지)
+            ta_cfg = getattr(self, "trailing_atr_cfg", None) or {}
+            if ta_cfg.get("enabled") and atr_pct and atr_pct > 0:
+                position.trail_act_ovr = min(max(atr_pct * float(ta_cfg.get("activate_mult", 6.0)),
+                                                 float(ta_cfg.get("activate_min", 0.015))),
+                                             float(ta_cfg.get("activate_max", 0.06)))
+                position.trail_dist_ovr = min(max(atr_pct * float(ta_cfg.get("distance_mult", 3.5)),
+                                                  float(ta_cfg.get("distance_min", 0.008))),
+                                              float(ta_cfg.get("distance_max", 0.035)))
             self.positions[symbol] = position
             self._failed_attempts.pop(symbol, None)
             logger.info(
@@ -685,6 +694,11 @@ class OrderManager:
             try:
                 price = await self.exchange.get_ticker_price(symbol)
                 t_activate, t_distance, t_step = self._get_trailing_params(pos.trade_type)
+                # [Patch AF-3] ATR 비례 트레일링 오버라이드
+                if getattr(pos, "trail_act_ovr", 0.0) > 0:
+                    t_activate = pos.trail_act_ovr
+                if getattr(pos, "trail_dist_ovr", 0.0) > 0:
+                    t_distance = pos.trail_dist_ovr
 
                 if pos.side == "long":
                     pos.unrealized_pnl = (price - pos.entry_price) / pos.entry_price

@@ -151,9 +151,29 @@ trading:
     min_volume_usd: 300000000       # 유동성 바닥 $300M (거래량 붙는 종목만)
     min_momentum_pct: 5.0           # |24h 변동| ≥5% (추세/네러티브 타는 종목)
     max_auto_add: 3                 # 1회 스캔당 PAPER 자동편입 최대
-    max_total_dynamic: 6            # 동적 심볼 총 상한 (현 6종목 락 — 부하 고려. 올리면 더 편입)
+    max_total_dynamic: 6            # 동적 심볼 총 상한 (부하 고려 — 로테이션으로 회전)
     interval_hours: 12              # 스캔 주기
     top_n_report: 12
+    # === [Patch AF-1, 2026-07-02] 로테이션(퇴출·재편입) — 나스닥100식 리밸런싱 ===
+    eject_grace_days: 5             # 편입 후 유예 5일 (최소 데이터 수집 보장 — 심사 면제)
+    eject_min_trades: 8             # 성과심사 최소 표본
+    eject_wr_below: 35.0            # WR<35% & 순손실 → 성과부진 퇴출
+    eject_volume_floor_usd: 150000000  # 24h 거래대금 < $150M(편입바닥의 ½) → 유동성소멸 퇴출
+    readmit_cooldown_days: 7        # 퇴출 후 재편입 금지 기간
+    readmit_bar_mult: 1.5           # 재편입 상향기준 — 모멘텀·거래량 1.5배 (플립플롭 방지)
+
+  # === [Patch AF-3, 2026-07-02] ATR 비례 트레일링 — 변동성 적응형 ===
+  # 실측: 고정값(activate 2.5%/distance 1.5%)은 BTC(5m ATR 0.24%)엔 10배로 너무 멀고
+  # HYPE/TAC(0.6%+)엔 4배로 너무 좁았음. 종목 변동성에 비례시켜 저변동=빠른 수익확보,
+  # 고변동=수익 러닝. PAPER·LIVE 대칭 적용. 끄면 기존 고정값.
+  trailing_atr_adaptive:
+    enabled: true
+    activate_mult: 6.0              # activate = 6 × ATR% (클램프 1.5%~6%)
+    activate_min: 0.015
+    activate_max: 0.06
+    distance_mult: 3.5              # distance = 3.5 × ATR% (클램프 0.8%~3.5%)
+    distance_min: 0.008
+    distance_max: 0.035
 
   # === $100K 타겟 ===
   # 전체 시스템이 이 목표를 향해 공격성 자동 조절

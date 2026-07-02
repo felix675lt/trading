@@ -465,6 +465,19 @@ class PaperTrader:
             last_funded_ts=int(now.timestamp()) // (8 * 3600),
             funding_rate=funding_rate,
         )
+        # [Patch AF-3, 2026-07-02] ATR 비례 트레일링 — 변동성 큰 종목은 넓게(수익 러닝),
+        # 낮은 종목은 좁게(빠른 수익확보). 고정값(2.5%/1.5%)은 BTC(ATR 0.24%)엔 너무 멀고
+        # HYPE/TAC(0.6%+)엔 너무 좁았음. cfg 미설정 시 기존 고정값 그대로(안전).
+        ta_cfg = getattr(self, "trailing_atr_cfg", None) or {}
+        if ta_cfg.get("enabled") and atr_pct and atr_pct > 0:
+            act = min(max(atr_pct * float(ta_cfg.get("activate_mult", 6.0)),
+                          float(ta_cfg.get("activate_min", 0.015))),
+                      float(ta_cfg.get("activate_max", 0.06)))
+            dist = min(max(atr_pct * float(ta_cfg.get("distance_mult", 3.5)),
+                           float(ta_cfg.get("distance_min", 0.008))),
+                       float(ta_cfg.get("distance_max", 0.035)))
+            pos.trail_act_ovr = act
+            pos.trail_dist_ovr = dist
         self.positions[symbol] = pos
         self._save_positions()  # [Patch K] 진입 즉시 디스크 동기화
         fill_tag = "MAKER" if is_maker else ("MKT-FALLBACK" if is_market_fallback else "MARKET")
@@ -570,6 +583,11 @@ class PaperTrader:
                 continue
             pos = self.positions[symbol]
             t_activate, t_distance, t_step = self._get_trailing_params(pos.trade_type)
+            # [Patch AF-3] ATR 비례 트레일링 오버라이드 (진입 시 계산·저장된 값)
+            if getattr(pos, "trail_act_ovr", 0.0) > 0:
+                t_activate = pos.trail_act_ovr
+            if getattr(pos, "trail_dist_ovr", 0.0) > 0:
+                t_distance = pos.trail_dist_ovr
 
             # === 1. 펀딩비 차감 — 8h 경계 넘었으면 ===
             # Binance Futures: 00/08/16 UTC에 funding 지불/수취

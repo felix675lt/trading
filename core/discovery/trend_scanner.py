@@ -62,15 +62,21 @@ class TrendScanner:
 
         rows = []
         all_syms = set()
+        tracked_info: dict[str, dict] = {}  # [Patch AF] 퇴출 판정용 — 추적심볼은 필터 무관 정보 제공
         for sym, t in tickers.items():
             if not sym.endswith("USDT:USDT"):
                 continue
             all_syms.add(sym)
+            qv = float(t.get("quoteVolume") or 0)
+            pc = float(t.get("percentage") or 0)
+            if sym in tracked:
+                tracked_info[sym] = {
+                    "volume_usd": qv, "pct": pc,
+                    "last": float(t.get("last") or 0),
+                }
             base = sym.split("/")[0]
             if base in _EXCLUDE_BASES:
                 continue
-            qv = float(t.get("quoteVolume") or 0)
-            pc = float(t.get("percentage") or 0)
             if qv < self.min_volume_usd:
                 continue
             rows.append({"symbol": sym, "base": base, "volume_usd": qv, "pct": pc})
@@ -81,7 +87,8 @@ class TrendScanner:
         self._save_snapshot(all_syms)
 
         if not rows:
-            return {"candidates": [], "new_listings": [], "scanned": len(all_syms)}
+            return {"candidates": [], "new_listings": [], "report": [],
+                    "tracked_info": tracked_info, "scanned": len(all_syms)}
 
         # 스코어링: z(log 거래량) + z(|모멘텀|) — 유동성·추세 동시 보상
         vols = [math.log10(r["volume_usd"]) for r in rows]
@@ -108,6 +115,7 @@ class TrendScanner:
             "candidates": candidates,
             "new_listings": new_listings,
             "report": rows[: self.top_n_report],
+            "tracked_info": tracked_info,
             "scanned": len(all_syms),
         }
 
@@ -117,7 +125,8 @@ class TrendScanner:
             return await asyncio.to_thread(self._scan_sync, tracked)
         except Exception as e:
             logger.warning(f"[TrendScanner] 스캔 실패: {e}")
-            return {"candidates": [], "new_listings": [], "report": [], "scanned": 0}
+            return {"candidates": [], "new_listings": [], "report": [],
+                    "tracked_info": {}, "scanned": 0}
 
 
 def _mean_std(xs: list[float]) -> tuple[float, float]:

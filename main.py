@@ -181,6 +181,11 @@ class AutoTrader:
         self.paper_trader.set_auto_close_callback(self._on_paper_auto_close)
         self.paper_trader_off.set_auto_close_callback(self._on_paper_auto_close)
 
+        # [Patch AF-3] ATR 비례 트레일링 설정 주입 (PAPER 양 variant)
+        _ta_cfg = self.config.get("trading", {}).get("trailing_atr_adaptive", {}) or {}
+        self.paper_trader.trailing_atr_cfg = _ta_cfg
+        self.paper_trader_off.trailing_atr_cfg = _ta_cfg
+
         # === BTC Treasury Reserve (2026-04-18) ===
         # 선물 실현수익의 일부를 현물 BTC로 자동 적립. 티어별 적립률 적용.
         # collector는 initialize()에서 생성되므로 여기선 None으로 만들고 나중에 주입.
@@ -582,6 +587,8 @@ class AutoTrader:
                 )
                 # LIVE 청산 → BTC 적립 콜백 주입 (async — 내부에서 create_task)
                 self.order_managers[name].set_profit_callback(self.btc_reserve.on_live_close)
+                # [Patch AF-3] ATR 비례 트레일링 설정 주입 (LIVE — PAPER와 대칭)
+                self.order_managers[name].trailing_atr_cfg = self.config.get("trading", {}).get("trailing_atr_adaptive", {}) or {}
 
             # === Binance Spot 클라이언트 (BTC Reserve 실매수용) ===
             # 선물(defaultType=future)과 분리된 spot 모드로 별도 ExchangeClient 생성.
@@ -2264,45 +2271,196 @@ class AutoTrader:
         except Exception as e:
             logger.debug(f"[TrendScanner] 동적심볼 저장 실패: {e}")
 
+    # ------------------------------------------------------------------
+    # [Patch AF, 2026-07-02] 로테이션 상태 (편입·퇴출·재편입 이력)
+    # ------------------------------------------------------------------
+    _ROTATION_PATH = Path("data/symbol_rotation.json")
+
+    def _load_rotation(self) -> dict:
+        try:
+            if self._ROTATION_PATH.exists():
+                return json.loads(self._ROTATION_PATH.read_text())
+        except Exception:
+            pass
+        return {}
+
+    def _save_rotation(self, hist: dict) -> None:
+        try:
+            tmp = self._ROTATION_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(hist, indent=1))
+            tmp.replace(self._ROTATION_PATH)
+        except Exception as e:
+            logger.debug(f"[Rotation] 이력 저장 실패: {e}")
+
+    def _symbol_recent_stats(self, symbol: str, limit: int = 30, since: str | None = None) -> tuple[int, float, float]:
+        """[Patch AF] 종목 최근 청산거래 (n, WR%, net). Symbol-Kelly와 퇴출 판정 공용."""
+        try:
+            import sqlite3 as _sq
+            conn = _sq.connect("file:data/autotrader.db?mode=ro", uri=True, timeout=3)
+            cur = conn.cursor()
+            if since:
+                cur.execute(
+                    "SELECT pnl FROM (SELECT pnl FROM trades WHERE symbol=? AND mode='PAPER' "
+                    "AND pnl!=0 AND timestamp>=? ORDER BY timestamp DESC LIMIT ?)",
+                    (symbol, since, limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT pnl FROM (SELECT pnl FROM trades WHERE symbol=? AND mode='PAPER' "
+                    "AND pnl!=0 ORDER BY timestamp DESC LIMIT ?)",
+                    (symbol, limit),
+                )
+            pnls = [r[0] for r in cur.fetchall()]
+            conn.close()
+            n = len(pnls)
+            if n == 0:
+                return 0, 0.0, 0.0
+            wins = sum(1 for p in pnls if p > 0)
+            return n, 100.0 * wins / n, sum(pnls)
+        except Exception as e:
+            logger.debug(f"[SymbolStats] {symbol} 조회 실패: {e}")
+            return 0, 0.0, 0.0
+
+    def _symbol_perf_scale(self, symbol: str) -> float:
+        """[Patch AF-2] 종목별 성과 사이징 배율 (0.5~1.3x, 30분 캐시).
+        근거: SPCX +$1,635 vs DOGE -$1,235 — 같은 사이즈로 들어갈 이유가 없음."""
+        cache = getattr(self, "_sym_scale_cache", None)
+        if cache is None:
+            cache = self._sym_scale_cache = {}
+        ent = cache.get(symbol)
+        now = time.time()
+        if ent and now - ent[1] < 1800:
+            return ent[0]
+        n, wr, net = self._symbol_recent_stats(symbol, limit=30)
+        if n < 8:
+            scale = 1.0          # 표본 부족 — 중립
+        elif wr >= 45.0 and net > 0:
+            scale = 1.3          # 검증된 승자
+        elif net > 0:
+            scale = 1.15         # 순익 양수
+        elif wr < 30.0 and net < 0:
+            scale = 0.5          # 만성 패자 — 절반
+        elif net < 0:
+            scale = 0.75
+        else:
+            scale = 1.0
+        if ent is None or abs(ent[0] - scale) > 1e-9:
+            logger.info(f"[Symbol-Kelly] {symbol} n={n} WR={wr:.0f}% net=${net:+.0f} → 사이즈 ×{scale}")
+        cache[symbol] = (scale, now)
+        return scale
+
     async def _run_trend_scan(self, symbols: list) -> None:
-        """[Patch AE] 트렌드 스캔 → 상위 후보 PAPER 자동편입 + 텔레그램 보고.
-        LIVE는 live_symbol_whitelist로 보호되어 자동편입 대상 아님(실자본 안전)."""
+        """[Patch AE→AF] 트렌드 스캔 → 퇴출(로테이션) → 편입 — 나스닥100식 리밸런싱.
+        LIVE는 live_symbol_whitelist로 보호되어 자동편입/퇴출 대상 아님(실자본 안전)."""
         cfg = (self.config.get("trading", {}) or {}).get("trend_scanner", {}) or {}
         max_total = int(cfg.get("max_total_dynamic", 8))
         max_add = int(cfg.get("max_auto_add", 3))
+        grace_days = float(cfg.get("eject_grace_days", 5))
+        eject_min_trades = int(cfg.get("eject_min_trades", 8))
+        eject_wr_below = float(cfg.get("eject_wr_below", 35.0))
+        vol_floor = float(cfg.get("eject_volume_floor_usd", 150_000_000))
+        cooldown_days = float(cfg.get("readmit_cooldown_days", 7))
+        readmit_mult = float(cfg.get("readmit_bar_mult", 1.5))
+
         tracked = set(symbols) | set(self.tier_manager.get_symbols("live"))
         result = await self.trend_scanner.scan(tracked)
         scanned = result.get("scanned", 0)
+        tinfo = result.get("tracked_info", {})
+        hist = self._load_rotation()
+        now = datetime.utcnow()
+
+        # ── 1) 퇴출 패스 — 유예기간 지난 동적심볼의 성과·유동성 심사 ──
+        ejected = []
+        for sym in list(self.dynamic_symbols):
+            h = hist.setdefault(sym, {"added_at": now.isoformat(), "eject_count": 0})
+            try:
+                added_at = datetime.fromisoformat(h.get("added_at", now.isoformat()))
+            except Exception:
+                added_at = now
+            age_days = (now - added_at).total_seconds() / 86400
+            if age_days < grace_days:
+                continue  # 유예기간 — 데이터 수집 보장
+            ti = tinfo.get(sym, {})
+            vol_now = float(ti.get("volume_usd", 0))
+            n, wr, net = self._symbol_recent_stats(sym, limit=50, since=h.get("added_at"))
+            reason = None
+            if n >= eject_min_trades and wr < eject_wr_below and net < 0:
+                reason = f"성과부진 (n={n} WR={wr:.0f}% net=${net:+.0f})"
+            elif vol_now > 0 and vol_now < vol_floor:
+                reason = f"유동성소멸 (${vol_now/1e6:.0f}M < ${vol_floor/1e6:.0f}M)"
+            if not reason:
+                continue
+            # 퇴출 실행 — 유니버스 제거 (캔들·PatternBank·거래이력은 보존 = 검색자산화)
+            self.dynamic_symbols.remove(sym)
+            if sym in symbols:
+                symbols.remove(sym)
+            po = self.tier_manager.symbol_overrides.get("paper", [])
+            if sym in po:
+                po.remove(sym)
+            # 열린 PAPER 포지션 정리 (좀비 방지 — 유니버스에서 빠지면 모니터링 중단됨)
+            last_px = float(ti.get("last", 0))
+            for pt in (self.paper_trader, self.paper_trader_off):
+                try:
+                    if pt and sym in pt.positions and last_px > 0:
+                        pt.close_position(sym, last_px, f"로테이션 퇴출: {reason}")
+                except Exception as ce:
+                    logger.debug(f"[Rotation] {sym} 포지션 정리 실패: {ce}")
+            h["ejected_at"] = now.isoformat()
+            h["eject_count"] = int(h.get("eject_count", 0)) + 1
+            h["last_eject_reason"] = reason
+            ejected.append((sym, reason, n, wr, net))
+            logger.info(f"[Rotation] 🔻 퇴출 {sym} — {reason} (데이터 보존, 재편입 쿨다운 {cooldown_days:.0f}일)")
+
+        # ── 2) 편입 패스 — 쿨다운·재편입 상향기준(이력 있으면 1.5배 엄격) ──
         added = []
-        # 1회 스캔당 max_add, 총합 max_total 둘 다 준수 (점진적 편입)
         room = min(max_add, max(0, max_total - len(self.dynamic_symbols)))
+        min_mom = self.trend_scanner.min_momentum_pct
+        min_vol = self.trend_scanner.min_volume_usd
         for c in result.get("candidates", []):
             if room <= 0:
                 break
             sym = c["symbol"]
             if sym in symbols or sym in self.dynamic_symbols:
                 continue
+            h = hist.get(sym, {})
+            if h.get("ejected_at"):
+                try:
+                    ej = datetime.fromisoformat(h["ejected_at"])
+                    if (now - ej).total_seconds() < cooldown_days * 86400:
+                        continue  # 쿨다운 중 — 재편입 금지
+                except Exception:
+                    pass
+                # 재편입 상향기준: 모멘텀·거래량 모두 1.5배 (플립플롭 방지 히스테리시스)
+                if not (abs(c["pct"]) >= min_mom * readmit_mult and c["volume_usd"] >= min_vol * readmit_mult):
+                    continue
             symbols.append(sym)
             self.dynamic_symbols.append(sym)
             self.tier_manager.symbol_overrides.setdefault("paper", []).append(sym)
+            hist.setdefault(sym, {"eject_count": 0})["added_at"] = now.isoformat()
+            hist[sym].pop("ejected_at", None)
             added.append(c)
             room -= 1
-        if added:
+
+        if added or ejected:
             self._save_dynamic_symbols()
+        self._save_rotation(hist)
+
+        # ── 3) 보고 ──
         try:
             report = result.get("report", [])
             top = ", ".join(f"{c['base']}({c['pct']:+.0f}%)" for c in report[:6])
+            parts = []
+            if ejected:
+                parts.append("<b>🔻 로테이션 퇴출</b>\n" + "\n".join(
+                    f"  − {s.split('/')[0]}: {r}" for s, r, *_ in ejected))
             if added:
-                lines = "\n".join(
-                    f"  ➕ {c['base']} {'🆕신규' if c.get('is_new') else '🔥추세'} "
-                    f"(${c['volume_usd']/1e9:.2f}B, {c['pct']:+.1f}%)"
-                    for c in added
-                )
-                body = f"<b>PAPER 자동편입 {len(added)}종목</b>\n{lines}"
-            else:
-                body = "신규 편입 없음 (이미 추적 중이거나 기준 미달)"
-            tg_notify(f"🔭 <b>트렌드 스캔</b> ({scanned}종목)\n{body}\n상위: {top}", silent=True)
-            logger.info(f"[TrendScanner] 스캔 {scanned}종목 → PAPER 편입 {[c['base'] for c in added]}")
+                parts.append(f"<b>➕ PAPER 편입 {len(added)}종목</b>\n" + "\n".join(
+                    f"  + {c['base']} {'🆕신규' if c.get('is_new') else ('🔁재편입' if hist.get(c['symbol'],{}).get('eject_count',0)>0 else '🔥추세')} "
+                    f"(${c['volume_usd']/1e9:.2f}B, {c['pct']:+.1f}%)" for c in added))
+            if not parts:
+                parts.append("변동 없음 (전원 유지)")
+            tg_notify(f"🔭 <b>트렌드 로테이션</b> ({scanned}종목 스캔)\n" + "\n".join(parts) + f"\n상위: {top}", silent=True)
+            logger.info(f"[TrendScanner] 스캔 {scanned} | 퇴출 {[s.split('/')[0] for s,*_ in ejected]} | 편입 {[c['base'] for c in added]}")
         except Exception as e:
             logger.debug(f"[TrendScanner] 보고 실패: {e}")
 
@@ -2620,7 +2778,8 @@ class AutoTrader:
             )
             size = self.risk_manager.calculate_position_size(
                 self.equity, decision.confidence, volatility,
-                adaptive_params["position_scale"] * fb_scale * quant_risk_scale,
+                adaptive_params["position_scale"] * fb_scale * quant_risk_scale
+                * self._symbol_perf_scale(symbol),  # [Patch AF-2] 종목별 성과 사이징 (0.5~1.3x)
                 kelly_enabled=kelly_enabled,
                 kelly_fraction=float(kelly_fraction),
                 kelly_stats=kelly_stats,
@@ -3469,7 +3628,8 @@ class AutoTrader:
             )
             size = self.risk_manager.calculate_position_size(
                 pt.equity, decision.confidence, volatility,
-                adaptive_params["position_scale"] * fb_scale * quant_risk_scale,
+                adaptive_params["position_scale"] * fb_scale * quant_risk_scale
+                * self._symbol_perf_scale(symbol),  # [Patch AF-2] 종목별 성과 사이징
                 kelly_enabled=kelly_enabled,
                 kelly_fraction=float(kelly_fraction),
                 kelly_stats=kelly_stats,
