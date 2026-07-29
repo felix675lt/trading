@@ -791,8 +791,18 @@ class AutoTrader:
         self._dyn_sym_path = Path("data/dynamic_symbols.json")
         self.dynamic_symbols: list[str] = self._load_dynamic_symbols()
         self._last_trend_scan = None
+        # [Patch AH] 편입 모멘텀 방향 맵 — 역행 진입 차단용 (이력에서 복원)
+        self._momentum_dirs: dict = {}
+        try:
+            for _s, _v in self._load_rotation().items():
+                if _v.get("momentum_dir"):
+                    self._momentum_dirs[_s] = _v["momentum_dir"]
+        except Exception as e:
+            logger.debug(f"[Rotation] 모멘텀 방향 복원 실패: {e}")
         if self.dynamic_symbols:
             logger.info(f"[TrendScanner] 동적 PAPER 심볼 {len(self.dynamic_symbols)}개 복원: {self.dynamic_symbols}")
+            _known = {s: d for s, d in self._momentum_dirs.items() if s in self.dynamic_symbols}
+            logger.info(f"[Rotation] 편입모멘텀 방향: {_known or '없음(다음 스캔에서 백필)'}")
 
         logger.info("AutoTrader 초기화 완료")
 
@@ -1621,6 +1631,7 @@ class AutoTrader:
             ohlcv_df=df,
         )
         self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단
+        self._block_counter_momentum(symbol, decision)  # [Patch AH] 편입모멘텀 역행차단
 
         # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
         if decision.action in ["long", "short"]:
@@ -2446,6 +2457,7 @@ class AutoTrader:
             h["ejected_at"] = now.isoformat()
             h["eject_count"] = int(h.get("eject_count", 0)) + 1
             h["last_eject_reason"] = reason
+            self._momentum_dirs.pop(sym, None)  # [Patch AH] 재편입 시 방향 재기록
             ejected.append((sym, reason, n, wr, net))
             logger.info(f"[Rotation] 🔻 퇴출 {sym} — {reason} (데이터 보존, 재편입 쿨다운 {cooldown_days:.0f}일)")
 
@@ -2476,8 +2488,29 @@ class AutoTrader:
             self.tier_manager.symbol_overrides.setdefault("paper", []).append(sym)
             hist.setdefault(sym, {"eject_count": 0})["added_at"] = now.isoformat()
             hist[sym].pop("ejected_at", None)
+            # [Patch AH, 2026-07-29] 편입 당시 모멘텀 방향 기록 → 이후 그 방향으로만 진입 허용.
+            # 근거: 손실은 롱/숏이 아니라 '편입 사유였던 추세와 반대로 들어간 것'에서 발생.
+            #   LAB 숏 +$1,983 vs LAB 롱 −$402 / HYPE 롱 +$2,819 vs HYPE 숏 −$2,973
+            hist[sym]["momentum_dir"] = "long" if c["pct"] >= 0 else "short"
+            hist[sym]["admit_pct"] = round(float(c["pct"]), 2)
+            self._momentum_dirs[sym] = hist[sym]["momentum_dir"]
             added.append(c)
             room -= 1
+
+        # [Patch AH] 기존 편입 종목 중 방향 미기록분 백필 (현재 24h 모멘텀 기준)
+        for sym in self.dynamic_symbols:
+            if sym in self._momentum_dirs:
+                continue
+            ti = tinfo.get(sym) or {}
+            if not ti:
+                continue
+            d = "long" if float(ti.get("pct", 0)) >= 0 else "short"
+            self._momentum_dirs[sym] = d
+            h = hist.setdefault(sym, {"eject_count": 0, "added_at": now.isoformat()})
+            h["momentum_dir"] = d
+            h["admit_pct"] = round(float(ti.get("pct", 0)), 2)
+            h["dir_backfilled"] = True
+            logger.info(f"[Rotation] {sym} 편입모멘텀 백필 → {d} ({ti.get('pct', 0):+.1f}%)")
 
         if added or ejected:
             self._save_dynamic_symbols()
@@ -2501,6 +2534,24 @@ class AutoTrader:
             logger.info(f"[TrendScanner] 스캔 {scanned} | 퇴출 {[s.split('/')[0] for s,*_ in ejected]} | 편입 {[c['base'] for c in added]}")
         except Exception as e:
             logger.debug(f"[TrendScanner] 보고 실패: {e}")
+
+    def _block_counter_momentum(self, symbol: str, decision) -> None:
+        """[Patch AH, 2026-07-29] 편입 모멘텀 역행 차단 — 동적 편입 종목 전용.
+
+        트렌드 스크리너가 편입한 종목은 '그 방향 추세'가 편입 사유다.
+        반대 방향 진입은 곧 fade(역추세)이고, 실측상 손실의 주원인이었다:
+          LAB 숏 +$1,983 / LAB 롱 −$402  ·  HYPE 롱 +$2,819 / HYPE 숏 −$2,973
+        기존 고정 심볼(BTC/ETH 등)은 편입 사유가 없으므로 이 게이트 미적용.
+        """
+        act = getattr(decision, "action", None)
+        if act not in ("long", "short") or symbol not in self.dynamic_symbols:
+            return
+        want = self._momentum_dirs.get(symbol)
+        if want and act != want:
+            decision.action = "hold"
+            decision.size = 0.0
+            decision.confidence = 0.0
+            decision.reason = (getattr(decision, "reason", "") or "") + f" | 편입모멘텀 역행차단(AH: {want}전용)"
 
     def _block_hype_short(self, symbol: str, decision) -> None:
         """[Patch AD, 2026-06-30] HYPE 숏 전면 차단 — 사용자 강행규칙('HYPE 숏 치지마').
@@ -2631,6 +2682,7 @@ class AutoTrader:
                 ohlcv_df=df,
             )
             self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단
+            self._block_counter_momentum(symbol, decision)  # [Patch AH] 편입모멘텀 역행차단
 
             # === [Patch O, 2026-05-22] Pattern Bank Decision Fusion (Phase 2) ===
             # 데이터 근거 (24일 운영): ML 모델 WR 17%, ML-Pattern 일치율 35.7%.
@@ -3598,6 +3650,7 @@ class AutoTrader:
                 ohlcv_df=df,
             )
             self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단 (shadow도)
+            self._block_counter_momentum(symbol, decision)  # [Patch AH] 편입모멘텀 역행차단 (shadow도)
 
             # MTF 필터 — primary와 동일 로직 (양쪽 동일 적용해야 macro 차이만 분리됨)
             if decision.action in ["long", "short"]:
@@ -3664,10 +3717,18 @@ class AutoTrader:
                 fb.get_kelly_stats(regime=adaptive_params["regime"], side=decision.action)
                 if kelly_enabled else None
             )
+            # [Patch AH-2, 2026-07-29] 섀도우(MACRO_OFF) 사이즈 축소 — A/B 결론 반영.
+            # 실측: 매크로차단 ON이 명확히 우월 (누적 ON −$6,001 vs OFF −$7,802,
+            # 로테이션기 ON −$492 vs OFF −$3,021). 7월 출혈의 69%가 섀도우 몫.
+            # 대조군은 유지하되(A/B 관측 지속) 비용을 절반으로.
+            _shadow_scale = float(
+                (self.config.get("trading", {}) or {}).get("shadow_size_mult", 0.5)
+            )
             size = self.risk_manager.calculate_position_size(
                 pt.equity, decision.confidence, volatility,
                 adaptive_params["position_scale"] * fb_scale * quant_risk_scale
-                * self._symbol_perf_scale(symbol),  # [Patch AF-2] 종목별 성과 사이징
+                * self._symbol_perf_scale(symbol)  # [Patch AF-2] 종목별 성과 사이징
+                * _shadow_scale,                   # [Patch AH-2] 섀도우 축소
                 kelly_enabled=kelly_enabled,
                 kelly_fraction=float(kelly_fraction),
                 kelly_stats=kelly_stats,
