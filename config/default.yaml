@@ -20,24 +20,22 @@ trading:
   # === Mode별 심볼 오버라이드 (2026-04-18) ===
   # PAPER: 4종목 풀 활성화 (2026-04-25) — 데이터 수집 극대화 모드.
   # 이전: BTC/ETH 2종목으로 신호 ½ 손실. 이제 LIVE와 동일 4종목으로 운영.
+  # === [Patch AI, 2026-07-30] 유니버스 6종목으로 축소 (사용자 지시) ===
+  # 사유: 12종목으로 늘자 재학습이 종목마다 전체 히스토리를 재수집(종목당 ~50분)하며
+  #       메인 루프를 몇 시간씩 블로킹 → 거래 정지. 6종목일 땐 정상 작동했음.
+  # 고정 코어는 2종목만 유지하고 나머지 4석은 로테이션(퇴출·편입)이 채운다.
+  #   유지: HYPE(로테이션기 최선 -$130, LIVE 미러 대상), SPCX(누적 최대 수익원 +$1,635)
+  #   퇴출: BTC(-$817 WR19%) ETH(-$742 WR16%) SOL(-$372) DOGE — 만성적자, 사용자 원칙
+  #        ("승률 낮고 손실 많은 건 퇴출") 그대로 적용.
+  #   ※ BTC는 트레이너의 cross-asset 참조로 별도 수집되므로 피처는 유지됨.
   paper_symbols_override:
-    - "BTC/USDT:USDT"
-    - "ETH/USDT:USDT"
-    - "SOL/USDT:USDT"
-    - "DOGE/USDT:USDT"
-    # [Patch P, 2026-05-22] HYPE 추가 — 차세대 탈중앙 거래소(Hyperliquid)
-    # 토큰. PAPER 트래킹 우선, 데이터 누적 후 LIVE 검토.
     - "HYPE/USDT:USDT"
-    # [Patch V, 2026-06-13] SPCX — SpaceX pre-IPO 무기한 (5/21 Binance 상장,
-    # 24h $5.9B 유동성). 사용자 지시: PAPER 학습 전용, 거래 검토는 데이터 누적 후.
     - "SPCX/USDT:USDT"
   # LIVE: 엣지 검증된 메이저만 (수학적 최적화 2026-04-20)
   #   알트 투기 제거 — whitelist와 동일
+  # [Patch AI] LIVE도 축소 — union_symbols(live ∪ paper)에 포함되므로 여기가 크면
+  # 유니버스가 다시 불어남. LIVE는 HYPE 미러가 유일한 활성 전략이라 HYPE만 유지.
   live_symbols_override:
-    - "BTC/USDT:USDT"
-    - "ETH/USDT:USDT"
-    - "SOL/USDT:USDT"
-    - "DOGE/USDT:USDT"
     # [Patch V, 2026-06-13] HYPE LIVE 투입 — 사용자 승인. 근거: PAPER 숏차단 후
     # WR 51.6% +$75(5종목 1위), min_notional $5(소액시드 안전), LIVE는 롱 전용이라
     # HYPE 약점(숏 페이드) 원천 차단. conf 0.62/quant 0.25 게이트는 그대로.
@@ -151,7 +149,8 @@ trading:
     min_volume_usd: 300000000       # 유동성 바닥 $300M (거래량 붙는 종목만)
     min_momentum_pct: 5.0           # |24h 변동| ≥5% (추세/네러티브 타는 종목)
     max_auto_add: 3                 # 1회 스캔당 PAPER 자동편입 최대
-    max_total_dynamic: 6            # 동적 심볼 총 상한 (부하 고려 — 로테이션으로 회전)
+    max_total_dynamic: 4            # [Patch AI] 6→4. 고정코어 2 + 동적 4 = 유니버스 6종목 고정.
+                                    # 12종목에서 재학습이 루프를 몇 시간 블로킹한 사고 재발방지.
     interval_hours: 12              # 스캔 주기
     top_n_report: 12
     # === [Patch AF-1, 2026-07-02] 로테이션(퇴출·재편입) — 나스닥100식 리밸런싱 ===
