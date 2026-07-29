@@ -866,6 +866,13 @@ class AutoTrader:
         timeframes = self.config["trading"]["timeframes"]  # 멀티타임프레임
         primary_tf = timeframes[0]  # 메인 타임프레임 (5m)
 
+        # [Patch AG, 2026-07-29] 루프 정체 워치독 — 메인 루프가 막혀도 독립 감지.
+        # 사고: 7/24~7/29 수집 무한재시도로 루프가 5일 멈췄는데 아무 알림도 없었음
+        # (heartbeat은 루프 '끝'에 기록돼 루프가 막히면 갱신 자체가 안 됨 = 자기 죽음 못 알림).
+        # 이 워치독은 별도 태스크라 메인 루프가 막혀도 살아서 텔레그램으로 통지한다.
+        self._loop_progress_ts = datetime.utcnow()
+        asyncio.create_task(self._loop_stall_watchdog())
+
         # 자기학습 트레이너 (tier_manager + meta/hmm 주입 → Walk-Forward CV + Meta/HMM 자동 학습)
         trainer = SelfLearningTrainer(
             self.collector, self.storage, self.ensemble, self.rl_agent, self.config,
@@ -1472,6 +1479,7 @@ class AutoTrader:
                 # === [Patch W] 가동 감시 — 매 루프 alive 기록 + dead-man switch ping ===
                 hb.write_alive_marker({"loop": loop_count, "equity": round(getattr(self, "equity", 0.0), 2)})
                 hb.ping_healthcheck()
+                self._loop_progress_ts = datetime.utcnow()  # [Patch AG] 워치독용 진행 표시
 
                 # 대기
                 await asyncio.sleep(30)
@@ -2253,6 +2261,36 @@ class AutoTrader:
     # =========================================================================
     # 집중 매매 모드 메서드 (concentration_mode=true)
     # =========================================================================
+
+    async def _loop_stall_watchdog(self) -> None:
+        """[Patch AG] 메인 루프 정체 감지 — 독립 태스크로 5분마다 진행 여부 확인.
+        stall_alert_minutes(기본 30분) 이상 루프가 진척 없으면 텔레그램 경고.
+        루프가 막혀도 이 태스크는 살아있으므로 '자기 죽음'을 알릴 수 있다."""
+        cfg = (self.config.get("trading", {}) or {}).get("stall_watchdog", {}) or {}
+        threshold = float(cfg.get("alert_minutes", 30)) * 60
+        notified_at = None
+        while self.is_running:
+            try:
+                await asyncio.sleep(300)  # 5분마다 점검
+                idle = (datetime.utcnow() - self._loop_progress_ts).total_seconds()
+                if idle > threshold:
+                    # 동일 정체에 대해 1시간에 1번만 통지 (스팸 방지)
+                    if notified_at is None or (datetime.utcnow() - notified_at).total_seconds() > 3600:
+                        notified_at = datetime.utcnow()
+                        logger.error(f"[Watchdog] 🚨 메인 루프 정체 {idle/60:.0f}분 — 거래 중단 상태")
+                        tg_notify(
+                            f"🚨 <b>루프 정체 감지</b>\n"
+                            f"━━━━━━━━━━━━━\n"
+                            f"메인 트레이딩 루프가 <b>{idle/60:.0f}분</b> 동안 진척이 없습니다.\n"
+                            f"거래·학습이 중단된 상태일 수 있습니다 (재시작 권장)."
+                        )
+                        hb.ping_healthcheck("/fail")
+                else:
+                    notified_at = None
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[Watchdog] 점검 실패(무시): {e}")
 
     def _load_dynamic_symbols(self) -> list[str]:
         try:

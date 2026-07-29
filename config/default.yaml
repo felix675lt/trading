@@ -162,6 +162,11 @@ trading:
     readmit_cooldown_days: 7        # 퇴출 후 재편입 금지 기간
     readmit_bar_mult: 1.5           # 재편입 상향기준 — 모멘텀·거래량 1.5배 (플립플롭 방지)
 
+  # === [Patch AG, 2026-07-29] 루프 정체 워치독 ===
+  # 메인 루프가 막혀도 독립 태스크가 감지해 텔레그램 통지 (7/24~29 5일 무단정지 재발방지)
+  stall_watchdog:
+    alert_minutes: 30
+
   # === [Patch AF-3, 2026-07-02] ATR 비례 트레일링 — 변동성 적응형 ===
   # 실측: 고정값(activate 2.5%/distance 1.5%)은 BTC(5m ATR 0.24%)엔 10배로 너무 멀고
   # HYPE/TAC(0.6%+)엔 4배로 너무 좁았음. 종목 변동성에 비례시켜 저변동=빠른 수익확보,

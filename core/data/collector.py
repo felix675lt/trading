@@ -62,13 +62,31 @@ class DataCollector:
         target_ts = int(datetime.utcnow().timestamp() * 1000)
         all_data = []
         batch_count = 0
+        # [Patch AG, 2026-07-29] 무한 재시도 차단 — 재시도 상한 + 지수 백오프.
+        # 사고: 7/28 02:30부터 동일 요청이 16,925회(약 40시간) 반복되며 트레이딩 전면 정지.
+        # 원인: except 블록이 상한 없이 continue만 수행 → 영구 루프(다음 단계 진입 불가).
+        # 수정: MAX_RETRIES 초과 시 포기하고 그때까지 모은 부분 데이터로 진행(루프 생존 우선).
+        MAX_RETRIES = 5
+        retries = 0
 
         while True:
             try:
                 ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+                retries = 0  # 성공 시 카운터 리셋
             except Exception as e:
-                logger.warning(f"[DataCollect] {symbol} 수집 중 에러 (재시도): {e}")
-                await asyncio.sleep(5)
+                retries += 1
+                if retries > MAX_RETRIES:
+                    logger.error(
+                        f"[DataCollect] {symbol} {timeframe} 수집 {MAX_RETRIES}회 연속 실패 → 중단 "
+                        f"(부분 데이터 {len(all_data):,}개로 진행): {type(e).__name__}: {e}"
+                    )
+                    break
+                backoff = min(5 * (2 ** (retries - 1)), 60)  # 5→10→20→40→60초
+                logger.warning(
+                    f"[DataCollect] {symbol} 수집 에러 (재시도 {retries}/{MAX_RETRIES}, "
+                    f"{backoff}s 대기): {type(e).__name__}: {e}"
+                )
+                await asyncio.sleep(backoff)
                 continue
 
             if not ohlcv:
