@@ -49,19 +49,56 @@ class DataCollector:
         df.set_index("timestamp", inplace=True)
         return df
 
+    _TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+                   "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440}
+
     async def fetch_all_ohlcv(
         self,
         exchange_name: str,
         symbol: str,
         timeframe: str,
         days: int = 90,
+        storage=None,
     ) -> pd.DataFrame:
-        """지정 기간 전체 OHLCV 데이터를 페이지네이션으로 수집"""
+        """지정 기간 전체 OHLCV 데이터를 수집.
+
+        [Patch AJ, 2026-07-30] DB 캐시 우선 — storage를 넘기면 이미 저장된 캔들을
+        읽고 '부족한 최신 구간만' 거래소에서 받는다(증분 수집).
+        기존: 학습 사이클마다 lookback_days(2400일=6.6년, 종목당 약 69만 캔들)를
+              통째로 재수집 → 종목당 수십 분, 12종목에서 메인 루프 수 시간 블로킹.
+              DB에 저장은 했지만 다시 읽지 않는 write-only 구조였음.
+        """
         exchange = self.exchanges[exchange_name]
         since = int((datetime.utcnow() - timedelta(days=days)).timestamp() * 1000)
+        window_start = since
         target_ts = int(datetime.utcnow().timestamp() * 1000)
         all_data = []
         batch_count = 0
+
+        # === DB 캐시 로드 → 갭만 수집 ===
+        cached_df = None
+        if storage is not None:
+            try:
+                tf_min = self._TF_MINUTES.get(timeframe, 5)
+                need = int(days * 1440 / tf_min) + 100
+                cached_df = storage.load_candles(exchange_name, symbol, timeframe, limit=need)
+                if cached_df is not None and not cached_df.empty:
+                    cached_df = cached_df[~cached_df.index.duplicated(keep="last")].sort_index()
+                    last_ts = int(cached_df.index[-1].timestamp() * 1000)
+                    if last_ts > since:
+                        since = last_ts + 1  # 캐시 이후 구간만 요청
+                    gap_min = max(0, (target_ts - last_ts) / 60000)
+                    logger.info(
+                        f"[DataCollect] {symbol} {timeframe} DB 캐시 {len(cached_df):,}개 활용 "
+                        f"→ 최근 {gap_min:.0f}분 갭만 수집"
+                    )
+                    if since >= target_ts:  # 이미 최신
+                        return cached_df[cached_df.index >= pd.to_datetime(window_start, unit="ms")]
+                else:
+                    cached_df = None
+            except Exception as e:
+                logger.warning(f"[DataCollect] {symbol} 캐시 로드 실패 → 전체 수집: {e}")
+                cached_df = None
         # [Patch AG, 2026-07-29] 무한 재시도 차단 — 재시도 상한 + 지수 백오프.
         # 사고: 7/28 02:30부터 동일 요청이 16,925회(약 40시간) 반복되며 트레이딩 전면 정지.
         # 원인: except 블록이 상한 없이 continue만 수행 → 영구 루프(다음 단계 진입 불가).
@@ -112,6 +149,24 @@ class DataCollector:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         df.set_index("timestamp", inplace=True)
         df = df[~df.index.duplicated(keep="last")]
+
+        # [Patch AJ] 신규분만 DB에 저장 후 캐시와 병합 (증분 수집)
+        if storage is not None and not df.empty:
+            try:
+                storage.save_candles(exchange_name, symbol, timeframe, df)
+            except Exception as e:
+                logger.warning(f"[DataCollect] {symbol} 증분 저장 실패(무시): {e}")
+        if cached_df is not None and not cached_df.empty:
+            new_cnt = len(df)
+            df = pd.concat([cached_df, df]) if not df.empty else cached_df
+            df = df[~df.index.duplicated(keep="last")].sort_index()
+            df = df[df.index >= pd.to_datetime(window_start, unit="ms")]
+            logger.info(
+                f"{symbol} {timeframe} 수집 완료: 캐시 {len(cached_df):,} + 신규 {new_cnt:,} "
+                f"→ 총 {len(df):,}개 캔들"
+            )
+            return df
+
         logger.info(f"{symbol} {timeframe} 데이터 수집 완료: {len(df)}개 캔들")
         return df
 

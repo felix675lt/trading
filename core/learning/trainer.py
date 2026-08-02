@@ -132,8 +132,11 @@ class SelfLearningTrainer:
         실제 시계열로 덮어써서 XGBoost가 의미있는 split을 생성하도록.
         """
         lookback = self.config.get("ml", {}).get("lookback_days", 90)
-        df = await self.collector.fetch_all_ohlcv(exchange_name, symbol, timeframe, days=lookback)
-        self.storage.save_candles(exchange_name, symbol, timeframe, df)
+        # [Patch AJ, 2026-07-30] DB 캐시 우선 — storage 전달 시 갭만 증분 수집.
+        # (신규분 저장도 collector 내부에서 처리하므로 여기서 전체 재저장하지 않음)
+        df = await self.collector.fetch_all_ohlcv(
+            exchange_name, symbol, timeframe, days=lookback, storage=self.storage
+        )
         df = self.feature_engineer.generate(df)
 
         # === 통찰 #3: 역사적 파생 스냅샷 조인 ===
@@ -209,8 +212,8 @@ class SelfLearningTrainer:
             # BTC raw OHLCV (피처 없이, 순수 OHLCV + 기본 returns/rsi만 계산)
             lookback = self.config.get("ml", {}).get("lookback_days", 90)
             btc_raw = await self.collector.fetch_all_ohlcv(
-                exchange_name, btc_symbol, timeframe, days=lookback
-            )
+                exchange_name, btc_symbol, timeframe, days=lookback, storage=self.storage
+            )  # [Patch AJ] BTC cross-asset 참조도 캐시 활용
             # 최소한의 선행 피처만 계산 (전체 feature 생성은 과중)
             import ta
             btc_raw["returns_1"] = btc_raw["close"].pct_change(1)
