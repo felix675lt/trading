@@ -56,6 +56,11 @@ class StrategyManager:
         self.long_only = config.get("long_only", False)
         self.live_long_only = config.get("live_long_only", False)
 
+        # [Patch AK, 2026-08-22] RL 영향력 축소 — RL 보상이 -0.15→-0.349로 악화되어
+        # 의사결정에 해를 끼칠 가능성. 모델 학습은 유지하되 투표 가중치/임계만 조정.
+        self.rl_vote_weight = float(config.get("rl_vote_weight", 1.0))
+        self.rl_min_confidence = float(config.get("rl_min_confidence", 0.3))
+
         # === Smart Regime-Conditional SHORT Filter (2026-04-24) ===
         # 특정 레짐에서만 숏 차단 — 실측 WR < 30%인 레짐 자동 거부.
         # PAPER 학습 데이터에서 통계적으로 유의하게 실패한 레짐(예: strong_uptrend×SHORT n=23 WR 0%)만
@@ -386,10 +391,10 @@ class StrategyManager:
                 votes["short"].append(("ML_val", min(abs(ml_signal_val) * 2, 0.6) * wmult("ml")))
 
         # 2. RL 에이전트 투표 (confidence > 0.3 — was 0.4)
-        if rl_direction == "long" and rl_confidence > 0.3:
-            votes["long"].append(("RL", rl_confidence * wmult("rl")))
-        elif rl_direction == "short" and rl_confidence > 0.3:
-            votes["short"].append(("RL", rl_confidence * wmult("rl")))
+        if rl_direction == "long" and rl_confidence > self.rl_min_confidence:
+            votes["long"].append(("RL", rl_confidence * wmult("rl") * self.rl_vote_weight))
+        elif rl_direction == "short" and rl_confidence > self.rl_min_confidence:
+            votes["short"].append(("RL", rl_confidence * wmult("rl") * self.rl_vote_weight))
 
         # 3. 모멘텀 투표 (strength > 0.15 — was 0.2)
         if mom_direction == "long" and abs(mom_strength) > 0.15:

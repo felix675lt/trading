@@ -69,6 +69,10 @@ class RiskManager:
         )
         self.atr_sl_mult: float = float(atr_cfg.get("sl_atr_mult", 1.5))  # SL = 1.5×ATR 가정
         self.atr_min_pct: float = float(atr_cfg.get("atr_min_pct", 0.003))  # 0.3% 미만이면 사이즈 폭주 방지
+        # [Patch AK, 2026-08-22] notional 상한 — 저ATR 구간에서 사이즈가 max_position_pct(0.95)
+        # 까지 폭주해 평균 13배 포지션이 생기고, 그 2건이 3주 손실의 55%(-$1,715)를 냈음.
+        # equity 대비 notional 절대 상한으로 아웃라이어를 원천 차단.
+        self.max_notional_pct: float = float(config.get("max_notional_pct", 0.25))
         self._last_atr_size: dict = {"used": False, "notional": 0.0, "size": 0.0}
 
         # === Risk Gate Mode (2026-04-25 — Manus v3 부분 채택) ===
@@ -465,7 +469,7 @@ class RiskManager:
                     f"f*={kelly_raw:.3f} → f={fractional:.3f} "
                     f"size=${final_size:.2f} (conf=${sized:.2f}, 채택={min(sized, kelly_size)/equity:.1%})"
                 )
-                return final_size
+                return self._cap_notional(final_size, equity, leverage)
             else:
                 self._last_kelly = {
                     "used": False,
@@ -475,7 +479,25 @@ class RiskManager:
         else:
             self._last_kelly = {"used": False, "reason": "disabled", "size": round(sized, 2)}
 
-        return sized
+        return self._cap_notional(sized, equity, leverage)
+
+    def _cap_notional(self, size: float, equity: float, leverage) -> float:
+        """[Patch AK] notional = size × leverage 가 equity × max_notional_pct 를 넘지 않도록 캡."""
+        try:
+            lev = float(leverage) if leverage else 1.0
+            if lev <= 0 or equity <= 0 or self.max_notional_pct <= 0:
+                return size
+            max_notional = equity * self.max_notional_pct
+            max_margin = max_notional / lev
+            if size > max_margin:
+                logger.info(
+                    f"[SizeCap] 사이즈 축소 ${size:.0f} → ${max_margin:.0f} "
+                    f"(notional 상한 {self.max_notional_pct:.0%} × equity ${equity:.0f})"
+                )
+                return max_margin
+        except Exception:
+            pass
+        return size
 
     def check_cvar_limit(
         self,

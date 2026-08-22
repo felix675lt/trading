@@ -1632,6 +1632,7 @@ class AutoTrader:
         )
         self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단
         self._block_counter_momentum(symbol, decision)  # [Patch AH] 편입모멘텀 역행차단
+        self._block_ranging(adaptive_params["regime"], decision)  # [Patch AK] ranging 차단
 
         # 5.1. MTF 합류 필터 - 상위 타임프레임과 반대면 진입 차단
         if decision.action in ["long", "short"]:
@@ -2535,6 +2536,21 @@ class AutoTrader:
         except Exception as e:
             logger.debug(f"[TrendScanner] 보고 실패: {e}")
 
+    def _block_ranging(self, regime: str, decision) -> None:
+        """[Patch AK, 2026-08-22] ranging 레짐 진입 전면 차단 — 사용자 지시("쓸 이유가 없다").
+
+        누적 실측: ranging n=351 WR 70.7% net -$5,816 — 최대 손실 레짐.
+        승률이 높은데도 최대 적자 = 잔익 다수 + 대손 소수(손익비 역전의 진원지).
+        6/19에 사이즈 0.3배로 줄였으나 여전히 1위 손실원이라 진입 자체를 차단.
+        """
+        if not getattr(self, "_block_ranging_enabled", True):
+            return
+        if regime == "ranging" and getattr(decision, "action", None) in ("long", "short"):
+            decision.action = "hold"
+            decision.size = 0.0
+            decision.confidence = 0.0
+            decision.reason = (getattr(decision, "reason", "") or "") + " | ranging 진입차단(AK)"
+
     def _block_counter_momentum(self, symbol: str, decision) -> None:
         """[Patch AH, 2026-07-29] 편입 모멘텀 역행 차단 — 동적 편입 종목 전용.
 
@@ -2683,6 +2699,7 @@ class AutoTrader:
             )
             self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단
             self._block_counter_momentum(symbol, decision)  # [Patch AH] 편입모멘텀 역행차단
+            self._block_ranging(adaptive_params["regime"], decision)  # [Patch AK] ranging 차단
 
             # === [Patch O, 2026-05-22] Pattern Bank Decision Fusion (Phase 2) ===
             # 데이터 근거 (24일 운영): ML 모델 WR 17%, ML-Pattern 일치율 35.7%.
@@ -3651,6 +3668,7 @@ class AutoTrader:
             )
             self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단 (shadow도)
             self._block_counter_momentum(symbol, decision)  # [Patch AH] 편입모멘텀 역행차단 (shadow도)
+            self._block_ranging(adaptive_params["regime"], decision)  # [Patch AK] ranging 차단
 
             # MTF 필터 — primary와 동일 로직 (양쪽 동일 적용해야 macro 차이만 분리됨)
             if decision.action in ["long", "short"]:
