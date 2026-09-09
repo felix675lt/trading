@@ -1,6 +1,7 @@
 """LSTM 기반 시계열 예측 모델"""
 
 import gc
+import os
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +35,10 @@ class LSTMPredictor:
     """LSTM 시계열 패턴 → 방향 예측"""
 
     # 메모리 보호: 최대 시퀀스 수 제한 (OOM 방지)
-    MAX_SEQUENCES = 80000
+    # [Patch AL, 2026-09-09] OOM 대책 — 80000 → 40000.
+    # 9/8 03:53 LSTM 워크포워드 학습 중 프로세스 사망(메모리 여유 68MB).
+    # seq=60, feat~55에서 배열 1.06GB + 리스트복사 → 피크 2.1GB, 3-fold라 반복 발생.
+    MAX_SEQUENCES = int(os.getenv("LSTM_MAX_SEQUENCES", "40000"))
     # 5분봉을 1시간봉으로 다운샘플링하는 배수
     DOWNSAMPLE_RATIO = 12
 
@@ -77,8 +81,12 @@ class LSTMPredictor:
         else:
             indices = np.arange(total_n)
 
-        # 시퀀스 생성 (float32로 메모리 절약)
-        Xs = np.stack([X[i:i + self.seq_length] for i in indices]).astype(np.float32)
+        # [Patch AL] 사전할당 후 in-place 채우기 — 기존 리스트+np.stack은 중간 리스트로
+        # 동일 크기 메모리를 한 번 더 잡아 피크가 2배였음(1.06GB → 2.1GB).
+        n_feat = X.shape[1] if X.ndim > 1 else 1
+        Xs = np.empty((len(indices), self.seq_length, n_feat), dtype=np.float32)
+        for k, i in enumerate(indices):
+            Xs[k] = X[i:i + self.seq_length]
         ys = y[indices + self.seq_length].astype(np.int64)
 
         gc.collect()

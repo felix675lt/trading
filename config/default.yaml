@@ -411,6 +411,12 @@ capital_tiers:
   paper_virtual_seed: 15000
   paper_use_virtual: true     # false면 PAPER 실 equity로 티어 결정
 
+  # [Patch AM, 2026-09-09] 티어별 PAPER 다계정 — 티어 기능(메타라벨링·HMM·CVaR·HRP)
+  # 실효성을 병렬 비교 검증. 각 시드가 서로 다른 티어를 활성화한다.
+  #   $1K→small(기본) $3K→mid(+메타라벨링·CVaR) $10K→large(+HMM) $50K→pro(+HRP·통계차익)
+  # MACRO_OFF A/B는 무승부(Welch p=0.2235)로 종료하고 이 실험이 대체.
+  paper_tier_accounts: [1000, 3000, 10000, 50000]
+
   tiers:
     - name: micro
       min: 0

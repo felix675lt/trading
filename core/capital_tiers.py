@@ -276,22 +276,29 @@ class CapitalTierManager:
     # 조회 API
     # ---------------------------------------------------------------------
 
-    def get_tier(self, mode: str = "live") -> CapitalTier:
-        """mode별 현재 티어 반환 (mode in {'live', 'paper'})"""
+    def get_tier(self, mode: str = "live", equity: float | None = None) -> CapitalTier:
+        """mode별 현재 티어 반환 (mode in {'live', 'paper'}).
+
+        [Patch AM, 2026-09-09] equity 오버라이드 추가 — PAPER 티어별 다계정 실험용.
+        기존엔 paper_virtual_seed 전역값 하나로만 판정해서, 시드가 다른 계정들도
+        전부 같은 티어를 받아 티어별 기능 비교가 불가능했음.
+        """
+        if equity is not None:
+            return self._tier_for(float(equity))
         if mode == "live":
             return self._tier_for(self.live_equity)
         # paper
         eq = self.paper_virtual_seed if self.paper_use_virtual else self.paper_equity
         return self._tier_for(eq)
 
-    def feature_enabled(self, feature: str, mode: str = "live") -> bool:
+    def feature_enabled(self, feature: str, mode: str = "live", equity: float | None = None) -> bool:
         """기능 on/off — 현재 mode 티어에서 해당 기능이 활성화됐는가?"""
-        tier = self.get_tier(mode)
+        tier = self.get_tier(mode, equity=equity)
         return bool(tier.features.get(feature, False))
 
-    def get_feature(self, feature: str, mode: str = "live", default: Any = None) -> Any:
+    def get_feature(self, feature: str, mode: str = "live", default: Any = None, equity: float | None = None) -> Any:
         """기능 값 조회 (bool/list/dict/float 모두 지원)"""
-        tier = self.get_tier(mode)
+        tier = self.get_tier(mode, equity=equity)
         return tier.features.get(feature, default)
 
     def get_symbols(self, mode: str = "live") -> list[str]:

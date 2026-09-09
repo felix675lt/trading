@@ -186,6 +186,43 @@ class AutoTrader:
         self.paper_trader.trailing_atr_cfg = _ta_cfg
         self.paper_trader_off.trailing_atr_cfg = _ta_cfg
 
+        # === [Patch AM, 2026-09-09] 티어별 PAPER 4계정 (사용자 승인) ===
+        # 목적: 자본 티어별 기능(메타라벨링·HMM·CVaR·HRP)의 실효성을 처음으로 비교 검증.
+        # 지금까지 PAPER는 한 번에 한 티어만 돌아 이 기능들의 효과가 미검증 상태였음.
+        # 4계정은 같은 신호를 공유하고 시드/티어만 다름 → 사이징·티어기능 실험.
+        # MACRO_OFF A/B는 종료(Welch p=0.2235, 무승부)하고 이 실험이 그 자리를 대체.
+        tier_seeds = self.config.get("capital_tiers", {}).get(
+            "paper_tier_accounts", [1000, 3000, 10000, 50000]
+        )
+        self.tier_accounts: list[dict] = []
+        for _seed in tier_seeds:
+            _v = f"PAPER_T{int(_seed/1000)}K"
+            _tr = PaperTrader(
+                initial_capital=float(_seed),
+                commission=self.config.get("backtest", {}).get("commission_pct", 0.0004),
+                trailing_config=self.config.get("trailing_stop", {}),
+                trade_profiles=self.config.get("trade_profiles", {}),
+                variant=_v,
+            )
+            _tr.set_auto_close_callback(self._on_paper_auto_close)
+            _tr.trailing_atr_cfg = _ta_cfg
+            self.tier_accounts.append({
+                "variant": _v,
+                "seed": float(_seed),
+                "trader": _tr,
+                "feedback": TradeFeedbackAnalyzer(variant=_v.lower()),
+                "optimizer": StrategyOptimizer(),
+            })
+        if self.tier_accounts:
+            logger.info(
+                f"[TierAccounts] {len(self.tier_accounts)}개 계정 활성: "
+                + ", ".join(
+                    f"{a['variant']}(${a['seed']:,.0f}/"
+                    f"{self.tier_manager.get_tier('paper', equity=a['seed']).name})"
+                    for a in self.tier_accounts
+                )
+            )
+
         # === BTC Treasury Reserve (2026-04-18) ===
         # 선물 실현수익의 일부를 현물 BTC로 자동 적립. 티어별 적립률 적용.
         # collector는 initialize()에서 생성되므로 여기선 None으로 만들고 나중에 주입.
@@ -2249,24 +2286,27 @@ class AutoTrader:
                 _local = locals()
                 _q_regime_obj = _local.get("quant_regime", {})
                 _q_regime_name = _q_regime_obj.get("regime", "?") if isinstance(_q_regime_obj, dict) else "?"
-                await self._run_shadow_macro_off(
-                    symbol=symbol,
-                    exchange_name=exchange_name,
-                    df=df,
-                    ml_signal=ml_signal,
-                    rl_action=rl_action,
-                    rl_confidence=rl_confidence,
-                    ext_signal=ext_signal,
-                    momentum_signal=momentum_signal,
-                    mtf_signal=mtf_signal,
-                    quant_score=_local.get("quant_score", 0.0),
-                    quant_regime_name=_q_regime_name,
-                    quant_risk_scale=_local.get("quant_risk_scale", 1.0),
-                    adaptive_params=adaptive_params,
-                    funding_rate=funding_rate,
-                    atr_pct=_local.get("atr_pct", 0.0),
-                    volatility=_local.get("volatility", 0.01),
-                )
+                # [Patch AM] 티어 4계정 순회 — 같은 신호, 시드/티어만 다름
+                for _acc in self.tier_accounts:
+                    await self._run_shadow_macro_off(
+                        symbol=symbol,
+                        exchange_name=exchange_name,
+                        df=df,
+                        ml_signal=ml_signal,
+                        rl_action=rl_action,
+                        rl_confidence=rl_confidence,
+                        ext_signal=ext_signal,
+                        momentum_signal=momentum_signal,
+                        mtf_signal=mtf_signal,
+                        quant_score=_local.get("quant_score", 0.0),
+                        quant_regime_name=_q_regime_name,
+                        quant_risk_scale=_local.get("quant_risk_scale", 1.0),
+                        adaptive_params=adaptive_params,
+                        funding_rate=funding_rate,
+                        atr_pct=_local.get("atr_pct", 0.0),
+                        volatility=_local.get("volatility", 0.01),
+                        account=_acc,
+                    )
             except Exception as e:
                 logger.warning(f"[A/B-Shadow] {symbol} 실행 생략: {e}")
 
@@ -2449,7 +2489,10 @@ class AutoTrader:
                 po.remove(sym)
             # 열린 PAPER 포지션 정리 (좀비 방지 — 유니버스에서 빠지면 모니터링 중단됨)
             last_px = float(ti.get("last", 0))
-            for pt in (self.paper_trader, self.paper_trader_off):
+            _all_pts = [self.paper_trader, self.paper_trader_off] + [
+                a["trader"] for a in getattr(self, "tier_accounts", [])
+            ]
+            for pt in _all_pts:  # [Patch AM] 티어계정 포지션도 함께 정리
                 try:
                     if pt and sym in pt.positions and last_px > 0:
                         pt.close_position(sym, last_px, f"로테이션 퇴출: {reason}")
@@ -2959,24 +3002,27 @@ class AutoTrader:
             # primary가 hold여도 shadow는 독립 결정 → 매 tick 병렬 관측
             if self.mode in ("paper", "dual"):
                 try:
-                    await self._run_shadow_macro_off(
-                        symbol=symbol,
-                        exchange_name=exchange_name,
-                        df=df,
-                        ml_signal=ml_signal,
-                        rl_action=rl_action,
-                        rl_confidence=rl_confidence,
-                        ext_signal=ext_signal,
-                        momentum_signal=momentum_signal,
-                        mtf_signal=mtf_signal,
-                        quant_score=quant_score,
-                        quant_regime_name=quant_regime.get("regime", "?") if isinstance(quant_regime, dict) else "?",
-                        quant_risk_scale=quant_risk_scale,
-                        adaptive_params=adaptive_params,
-                        funding_rate=funding_rate,
-                        atr_pct=atr_pct,
-                        volatility=volatility,
-                    )
+                    # [Patch AM] 티어 4계정 순회 — 같은 신호, 시드/티어만 다름
+                    for _acc in self.tier_accounts:
+                        await self._run_shadow_macro_off(
+                            symbol=symbol,
+                            exchange_name=exchange_name,
+                            df=df,
+                            ml_signal=ml_signal,
+                            rl_action=rl_action,
+                            rl_confidence=rl_confidence,
+                            ext_signal=ext_signal,
+                            momentum_signal=momentum_signal,
+                            mtf_signal=mtf_signal,
+                            quant_score=quant_score,
+                            quant_regime_name=quant_regime.get("regime", "?") if isinstance(quant_regime, dict) else "?",
+                            quant_risk_scale=quant_risk_scale,
+                            adaptive_params=adaptive_params,
+                            funding_rate=funding_rate,
+                            atr_pct=atr_pct,
+                            volatility=volatility,
+                            account=_acc,
+                        )
                 except Exception as e:
                     logger.warning(f"[A/B-Shadow-집중] {symbol} 실행 생략: {e}")
 
@@ -3545,7 +3591,9 @@ class AutoTrader:
             reason = trade.get("reason", "auto")
             side = trade.get("side", "")
             variant = trade.get("variant", "PAPER_MACRO_ON")
-            is_shadow = (variant == "PAPER_MACRO_OFF")
+            # [Patch AM] 티어계정 라우팅 — variant로 해당 계정의 feedback/optimizer 선택
+            _acct = next((a for a in getattr(self, "tier_accounts", []) if a["variant"] == variant), None)
+            is_shadow = (variant == "PAPER_MACRO_OFF") or (_acct is not None)
 
             # DB 저장 — variant 명시 태그
             self._save_trade_with_context({
@@ -3560,7 +3608,10 @@ class AutoTrader:
 
             # 학습 기록 — variant별 격리
             regime = self.adaptive.current_regime if hasattr(self, 'adaptive') else "unknown"
-            target_feedback = self.feedback_off if is_shadow else self.feedback
+            target_feedback = (
+                _acct["feedback"] if _acct is not None
+                else (self.feedback_off if is_shadow else self.feedback)
+            )
             target_feedback.record_trade(
                 {"pnl": pnl, "side": side, "symbol": symbol},
                 {"regime": regime, "signal": 0, "confidence": 0,
@@ -3578,7 +3629,10 @@ class AutoTrader:
                     self.strategy_manager.record_win()
 
             # StrategyOptimizer 기록 — variant별 격리
-            target_opt = self.strategy_optimizer_paper_off if is_shadow else self.strategy_optimizer_paper
+            target_opt = (
+                _acct["optimizer"] if _acct is not None
+                else (self.strategy_optimizer_paper_off if is_shadow else self.strategy_optimizer_paper)
+            )
             p_hash = target_opt._config_to_hash(target_opt.current_config)
             target_opt.record_trade(p_hash, {
                 "pnl": pnl, "timestamp": datetime.utcnow(),
@@ -3625,8 +3679,9 @@ class AutoTrader:
         funding_rate: float,
         atr_pct: float,
         volatility: float,
+        account: dict | None = None,
     ) -> None:
-        """A/B 섀도우 variant (MACRO_OFF) 실행.
+        """섀도우 계정 실행 — account 지정 시 티어계정(Patch AM), 미지정 시 MACRO_OFF A/B.
 
         수학적 격리 원칙 (2026-04-21):
             - 같은 시장 입력(ML/RL/EXT/MTF/Quant/ATR/Vol)을 primary와 동일하게 수용
@@ -3641,9 +3696,17 @@ class AutoTrader:
             return
         try:
             price = float(df["close"].iloc[-1])
-            pt = self.paper_trader_off
-            fb = self.feedback_off
-            opt = self.strategy_optimizer_paper_off
+            # [Patch AM] account 지정 시 티어계정 (시드/티어만 다르고 정책은 primary 동일)
+            if account is not None:
+                pt = account["trader"]; fb = account["feedback"]; opt = account["optimizer"]
+                _variant = account["variant"]; _tier_eq = account["seed"]
+                _vo = None                      # 매크로 정책 primary와 동일 (A/B 아님)
+            else:
+                pt = self.paper_trader_off
+                fb = self.feedback_off
+                opt = self.strategy_optimizer_paper_off
+                _variant = "PAPER_MACRO_OFF"; _tier_eq = None
+                _vo = {"disable_macro_block": True}
 
             # ATR 슬리피지 모델 갱신 + 가격 업데이트(SL/TP 자동체크)
             try:
@@ -3663,7 +3726,7 @@ class AutoTrader:
                 feedback_blacklist=fb_blacklist,
                 funding_rate=funding_rate,
                 mode="paper",
-                variant_override={"disable_macro_block": True},
+                variant_override=_vo,
                 ohlcv_df=df,
             )
             self._block_hype_short(symbol, decision)  # [Patch AD] HYPE 숏 전면차단 (shadow도)
@@ -3710,7 +3773,7 @@ class AutoTrader:
             if decision.action not in ("long", "short", "close"):
                 return
 
-            # Sizing — shadow equity 독립, feedback_off의 Kelly stats 사용
+            # Sizing — shadow equity 독립. [Patch AM] 티어 기능은 계정 시드 기준 판정
             ext_agrees = (
                 (decision.action == "long" and ext_signal.get("direction") == "bullish") or
                 (decision.action == "short" and ext_signal.get("direction") == "bearish")
@@ -3729,8 +3792,8 @@ class AutoTrader:
                 dynamic_lev, sl_pct_for_cap, max_risk_pct
             )
             fb_scale = fb.get_position_scale(adaptive_params["regime"], decision.action)
-            kelly_enabled = self.tier_manager.feature_enabled("kelly_enabled", mode="paper")
-            kelly_fraction = self.tier_manager.get_feature("kelly_fraction", mode="paper", default=0.25) or 0.25
+            kelly_enabled = self.tier_manager.feature_enabled("kelly_enabled", mode="paper", equity=_tier_eq)
+            kelly_fraction = self.tier_manager.get_feature("kelly_fraction", mode="paper", default=0.25, equity=_tier_eq) or 0.25
             kelly_stats = (
                 fb.get_kelly_stats(regime=adaptive_params["regime"], side=decision.action)
                 if kelly_enabled else None
@@ -3797,7 +3860,7 @@ class AutoTrader:
                         "exchange": exchange_name, "symbol": symbol, "side": result.get("side", "close"),
                         "price": price, "amount": result["size"], "pnl": pnl,
                         "fee": result["fee"], "strategy": "hybrid_shadow",
-                        "mode": "PAPER", "variant": "PAPER_MACRO_OFF",
+                        "mode": "PAPER", "variant": _variant,
                     })
                     fb.record_trade(result, {
                         "regime": adaptive_params["regime"],
@@ -3837,7 +3900,7 @@ class AutoTrader:
                             "exchange": exchange_name, "symbol": symbol, "side": result.get("side", "close"),
                             "price": price, "amount": result["size"], "pnl": pnl,
                             "fee": result["fee"], "strategy": "auto_close_shadow",
-                            "mode": "PAPER", "variant": "PAPER_MACRO_OFF",
+                            "mode": "PAPER", "variant": _variant,
                         })
                         fb.record_trade(result, {
                             "regime": adaptive_params["regime"],
